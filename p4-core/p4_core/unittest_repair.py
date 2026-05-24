@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -7,6 +8,116 @@ def _looks_like_test_path(path: str) -> bool:
     normalized = str(path or "").replace("\\", "/")
     name = normalized.rsplit("/", 1)[-1]
     return normalized.startswith("tests/") or "/tests/" in normalized or name.startswith("test_")
+
+
+def unittest_failure_signature_body(output: str) -> str:
+    """Extract the semantic failure body and ignore stdout/demo noise."""
+
+    interesting: list[str] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("FAIL:", "ERROR:")):
+            interesting.append(line)
+            continue
+        if line.startswith("File "):
+            interesting.append(line)
+            continue
+        if re.search(r"\bself\.assert[A-Za-z0-9_]*\b|\bassert[A-Z][A-Za-z0-9_]*\b", line):
+            interesting.append(line)
+            continue
+        if re.match(
+            r"^(AssertionError|SyntaxError|ImportError|ModuleNotFoundError|NameError|TypeError|ValueError|"
+            r"IndexError|KeyError|AttributeError|RuntimeError|Exception|Error):",
+            line,
+        ):
+            interesting.append(line)
+    return "\n".join(interesting) if interesting else str(output or "")
+
+
+def unittest_output_looks_like_test_value_assertion(output: str) -> bool:
+    text = str(output or "")
+    if "AssertionError" not in text:
+        return False
+    value_failure_markers = (
+        " != ",
+        "Lists differ:",
+        "Tuples differ:",
+        "Dictionaries differ:",
+        "not equal",
+        "False is not true",
+        "True is not false",
+        "unexpectedly None",
+        "not raised",
+    )
+    return any(marker in text for marker in value_failure_markers)
+
+
+def unittest_output_return_shape_hint(output: str) -> str:
+    text = str(output or "")
+    if "AssertionError" not in text or " != " not in text:
+        return ""
+
+    examples: list[str] = []
+    for match in re.finditer(r"AssertionError:\s*([^\n]+?)\s+!=\s+([^\n]+)", text):
+        left = match.group(1).strip()
+        right = match.group(2).strip()
+        shapes = {_unittest_value_shape(left), _unittest_value_shape(right)}
+        if shapes == {"scalar", "container"}:
+            examples.append(f"{left} != {right}")
+        if len(examples) >= 3:
+            break
+    if not examples:
+        return ""
+
+    return (
+        "返却shape/API契約不一致の疑いがあります。unittestがscalar値とsequence/containerを比較しています"
+        f"（例: {'; '.join(examples)}）。"
+        "アルゴリズム本体を書き換える前に、公開関数のdocstring/仕様、test側のunpack順序、"
+        "reference/brute_force/oracle helperの戻り値shapeを同一契約に揃えてください。"
+        "関数がtupleを返す場合は、実装・test・oracleのすべてで戻り値の順序を一致させてください。"
+    )
+
+
+def unittest_output_missing_name_details(output: str) -> dict[str, str]:
+    """Extract a NameError symbol and traceback location from unittest output."""
+
+    text = str(output or "")
+    if not text.strip():
+        return {}
+    name_match = re.search(r"NameError:\s+name ['\"]([^'\"]+)['\"] is not defined", text)
+    if not name_match:
+        return {}
+
+    source_file = ""
+    source_line = ""
+    source_scope = ""
+    file_matches = list(re.finditer(r'File "([^"]+\.py)", line (\d+), in ([^\n]+)', text))
+    if file_matches:
+        latest = file_matches[-1]
+        source_file = latest.group(1).replace("\\", "/").rsplit("/", 1)[-1]
+        source_line = latest.group(2)
+        source_scope = latest.group(3).strip()
+    return {
+        "name": name_match.group(1),
+        "source_file": source_file,
+        "source_line": source_line,
+        "source_scope": source_scope,
+    }
+
+
+def _unittest_value_shape(value: str) -> str:
+    stripped = value.strip()
+    if stripped.startswith(("[", "(", "{")):
+        return "container"
+    if re.match(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$", stripped):
+        return "scalar"
+    if stripped in {"True", "False", "None"}:
+        return "scalar"
+    if len(stripped) >= 2 and stripped[0] in {"'", '"'} and stripped[-1] == stripped[0]:
+        return "scalar"
+    return "unknown"
 
 
 @dataclass(frozen=True)

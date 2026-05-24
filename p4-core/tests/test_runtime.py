@@ -7,6 +7,7 @@ from pathlib import Path
 
 from p4_core.runtime import AgentRuntime
 from p4_core.schemas import FIRST_ACTION_CONTENT_MAX_LENGTH, PLAN_RECORD_SCHEMA, tool_action_schema
+from p4_core.unittest_repair import unittest_output_return_shape_hint
 from p4_core.workspace import bootstrap_workspace, enqueue_message, read_jsonl
 
 
@@ -1698,14 +1699,13 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertEqual(state_after_edit["allowed_next_actions"], ["run_command python3 -m unittest discover -s tests"])
 
     def test_unittest_return_shape_hint_detects_scalar_container_assertion(self) -> None:
-        runtime = self.runtime()
         output = (
             "FAIL: test_sample (test_solver.TestSolver.test_sample)\n"
             "AssertionError: 0 != []\n"
             "AssertionError: 17 != [(2, 5, 6), (5, 8, 11)]\n"
         )
 
-        hint = runtime._unittest_output_return_shape_hint(output)
+        hint = unittest_output_return_shape_hint(output)
 
         self.assertIn("返却shape/API契約不一致", hint)
         self.assertIn("docstring", hint)
@@ -2684,6 +2684,65 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertIsNone(targeted_replace)
+
+    def test_failed_unittest_name_error_suggests_small_test_import_repair(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで二分探索を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def binary_search(arr, target):\n    return 0 if target in arr else -1\n"
+        test = (
+            "import unittest\n\n"
+            "class TestBinarySearch(unittest.TestCase):\n"
+            "    def test_target_found(self):\n"
+            "        arr = [1, 2, 3]\n"
+            "        target = 2\n"
+            "        result = binary_search(arr, target)\n"
+            "        self.assertEqual(result, 1)\n"
+        )
+        test_path = runtime.execution_root / "tests" / "test_binary_search.py"
+        stderr = (
+            "E\n"
+            "======================================================================\n"
+            "ERROR: test_target_found (test_binary_search.TestBinarySearch.test_target_found)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{test_path}\", line 7, in test_target_found\n"
+            "    result = binary_search(arr, target)\n"
+            "             ^^^^^^^^^^^^^\n"
+            "NameError: name 'binary_search' is not defined\n"
+        )
+        steps = [
+            tool_step("write_file", "binary_search.py", content=impl),
+            tool_step("write_file", "tests/test_binary_search.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_binary_search.py", content=test),
+        ]
+        (runtime.execution_root / "binary_search.py").write_text(impl, encoding="utf-8")
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertEqual(
+            state["latest_unittest_missing_name"],
+            {
+                "name": "binary_search",
+                "source_file": "test_binary_search.py",
+                "source_line": "7",
+                "source_scope": "test_target_found",
+            },
+        )
+        self.assertTrue(
+            any(
+                "from binary_search import binary_search" in hint
+                and "先頭importだけ" in hint
+                for hint in state["unittest_repair_hints"]
+            ),
+            state["unittest_repair_hints"],
+        )
 
     def test_failed_unittest_after_reads_blocks_broad_replace_text(self) -> None:
         runtime = self.runtime()
@@ -3667,6 +3726,24 @@ class GenericRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(profile["strategy"], "state_space_search")
         self.assertEqual(phase, "PLANNING_REQUIRED")
+
+    def test_problem_profile_does_not_treat_binary_search_as_state_space_search(self) -> None:
+        runtime = self.runtime()
+        messages = [
+            "Pythonで二分探索を実装し、unittestで検証し、サンプル入力で実行して結果を表示して",
+            "Implement binary search in Python, verify it with unittest, then run a sample and show the output.",
+        ]
+
+        for user_message in messages:
+            with self.subTest(user_message=user_message):
+                profile = runtime._planning_profile_for_message(user_message)
+
+                self.assertEqual(profile["strategy"], "direct_implementation")
+                self.assertIn("implementation_request", profile["signals"])
+                self.assertFalse(
+                    any(str(item).startswith("state_space:") for item in profile["signals"]),
+                    profile["signals"],
+                )
 
     def test_problem_profile_prefers_explicit_dynamic_programming_over_weak_scheduling_word(self) -> None:
         runtime = self.runtime()
@@ -8365,6 +8442,32 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIsNotNone(recovery)
         self.assertEqual(recovery["reason_code"], "completion_contract_stdout_recovery")
         self.assertEqual(recovery["tool_args"]["command"], "python3 math_tools.py")
+
+        blocked_demo_edit_before_observation = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={
+                "path": "math_tools.py",
+                "content": impl + "\n# display tweak\n",
+            },
+            steps=audited_steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_demo_edit_before_observation["reason_code"],
+            "implementation_task_result_display_requires_run_command_first",
+        )
+
+        allowed_demo_run = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="run_command",
+            tool_args={"command": "python3 math_tools.py"},
+            steps=audited_steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_demo_run)
 
         displayed_steps = [
             *audited_steps,

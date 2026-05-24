@@ -17,11 +17,12 @@ from typing import Any, Iterable
 from p4_core.frames import FrameManager
 from p4_core.config_defaults import DEFAULT_TOOL_CONTENT_CHUNK_BYTES
 from p4_core.implementation_contracts import (
-    DYNAMIC_PROGRAMMING_ORACLE_TOKENS,
+    constraint_satisfaction_source_contract_issues,
+    constraint_satisfaction_test_contract_issues,
     dynamic_programming_independent_oracle_seen,
-    dynamic_programming_callable_names,
-    python_call_name,
-    test_calls_implementation_callable,
+    dynamic_programming_source_contract_issues,
+    dynamic_programming_test_contract_issues,
+    test_artifact_contract_guidance,
 )
 from p4_core.models import ModelRouter
 from p4_core.ollama_client import OllamaChatClient
@@ -29,6 +30,11 @@ from p4_core.output_contract import stdout_looks_like_user_visible_result
 from p4_core.progress_block import ProgressBlockDecision
 from p4_core.repo_map import build_repo_map, format_repo_map_for_prompt
 from p4_core.schema_validation import validate_json_schema
+from p4_core.state_space_contracts import (
+    state_space_search_replay_verifier_repair_hints,
+    state_space_search_source_contract_issues,
+    state_space_search_test_contract_issues,
+)
 from p4_core.planning import (
     CONSTRAINT_SATISFACTION_REQUIRED_CONTRACT,
     DYNAMIC_PROGRAMMING_REQUIRED_CONTRACT,
@@ -150,7 +156,13 @@ from p4_core.terminal import (
     _terminal_answer_is_direct_evidence,
     run_terminal_agent,
 )
-from p4_core.unittest_repair import build_unittest_failed_allowed_actions
+from p4_core.unittest_repair import (
+    build_unittest_failed_allowed_actions,
+    unittest_failure_signature_body,
+    unittest_output_missing_name_details,
+    unittest_output_looks_like_test_value_assertion,
+    unittest_output_return_shape_hint,
+)
 
 
 _UNSET = object()
@@ -1720,11 +1732,16 @@ class AgentRuntime:
         plan_context = self._plan_record_execution_context()
         plan_strategy = str(plan_context.get("plan_strategy") or "")
         if plan_strategy == "state_space_search":
-            issues.extend(self._state_space_search_source_contract_issues(text))
+            issues.extend(state_space_search_source_contract_issues(text))
         elif plan_strategy == "dynamic_programming":
-            issues.extend(self._dynamic_programming_source_contract_issues(text, user_message=user_message))
+            issues.extend(
+                dynamic_programming_source_contract_issues(
+                    text,
+                    requested_names=self._requested_top_level_function_names(user_message),
+                )
+            )
         elif plan_strategy == "constraint_satisfaction":
-            issues.extend(self._constraint_satisfaction_source_contract_issues(text))
+            issues.extend(constraint_satisfaction_source_contract_issues(text))
         requested_function_names = self._requested_top_level_function_names(user_message)
         if requested_function_names:
             try:
@@ -1779,854 +1796,6 @@ class AgentRuntime:
             issues.append(f"未完成のpass文または次工程前提の実装が残っています: {label}。")
         return issues
 
-    def _dynamic_programming_source_contract_issues(self, source: str, *, user_message: str = "") -> list[str]:
-        """Return generic source issues for dynamic-programming PlanRecords."""
-
-        text = str(source or "")
-        if not text.strip():
-            return []
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            return []
-        requested_function_names = {
-            name.lower()
-            for name in self._requested_top_level_function_names(user_message)
-        }
-        has_solverish_callable = bool(
-            dynamic_programming_callable_names(text, requested_names=requested_function_names)
-        )
-        lowered = text.lower()
-        has_memo_or_table = any(
-            token in lowered
-            for token in ("memo", "cache", "lru_cache", "dp[", "table", "tabulat", "dynamic programming")
-        )
-        has_indexed_state_assignment = False
-        has_recursive_call = False
-        current_function = ""
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = []
-                if isinstance(node, ast.Assign):
-                    targets = list(node.targets)
-                else:
-                    targets = [node.target]
-                if any(isinstance(target, ast.Subscript) for target in targets):
-                    has_indexed_state_assignment = True
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                current_function = node.name
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == current_function:
-                        has_recursive_call = True
-                        break
-        has_base_case = bool(
-            re.search(r"\b(base|base_case|initial|seed)\b", lowered)
-            or "基底" in text
-            or "初期" in text
-        )
-        if not has_base_case:
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Assign):
-                    if any(isinstance(target, ast.Subscript) for target in node.targets):
-                        slice_text = ast.unparse(node.targets[0].slice) if hasattr(ast, "unparse") else ""
-                        if re.search(r"\b0\b|\b1\b", slice_text):
-                            has_base_case = True
-                            break
-                if isinstance(node, ast.If):
-                    if any(isinstance(child, ast.Return) for child in ast.walk(node)):
-                        condition_text = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
-                        if re.search(r"\b0\b|\b1\b|\bnot\b", condition_text):
-                            has_base_case = True
-                            break
-        has_recurrence_or_transition = bool(
-            re.search(r"\b(recurrence|transition|subproblem|state transition)\b", lowered)
-            or "漸化" in text
-            or "遷移" in text
-            or has_recursive_call
-            or has_memo_or_table
-            or has_indexed_state_assignment
-        )
-        issues: list[str] = []
-        if not has_solverish_callable:
-            issues.append(
-                "PlanRecord strategy=dynamic_programming ですが、subproblemを計算するprogrammatic callableが見つかりません。"
-                "ユーザー指定のtop-level API、またはDP表やmemoizationを実行して結果を返すsolve/compute/count/optimize系callableを実装してください。"
-            )
-        if not has_base_case:
-            issues.append(
-                "dynamic_programming PlanRecordのbase_case_verifier義務に対し、base caseまたは初期状態を表す実装経路が観測できません。"
-                "最小subproblemの戻り値、初期DP表、またはbase caseを明示してください。"
-            )
-        if not has_recurrence_or_transition:
-            issues.append(
-                "dynamic_programming PlanRecordのrecurrence_verifier義務に対し、recurrence/transition/memoization/table更新が観測できません。"
-                "部分問題から次状態を導く漸化式またはDP表更新を実装してください。"
-            )
-        return issues
-
-    def _constraint_satisfaction_source_contract_issues(self, source: str) -> list[str]:
-        """Return generic source issues for constraint-satisfaction PlanRecords."""
-
-        text = str(source or "")
-        if not text.strip():
-            return []
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            return []
-        callable_names = [
-            node.name.lower()
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        ]
-        solverish_tokens = ("solve", "search", "assign", "backtrack", "satisfy", "csp")
-        checker_tokens = ("constraint", "consistent", "valid", "validate", "check", "satisf")
-        solution_tokens = ("solution", "assignment", "validate", "verify", "check")
-        has_solverish_callable = any(any(token in name for token in solverish_tokens) for name in callable_names)
-        has_constraint_checker = any(any(token in name for token in checker_tokens) for name in callable_names)
-        has_solution_validator = any(any(token in name for token in solution_tokens) for name in callable_names)
-        lowered = text.lower()
-        has_constraint_model = any(
-            token in lowered
-            for token in ("variables", "domains", "constraints", "assignment", "constraint")
-        ) or any(token in text for token in ("変数", "ドメイン", "制約", "割当"))
-        issues: list[str] = []
-        if not has_solverish_callable:
-            issues.append(
-                "PlanRecord strategy=constraint_satisfaction ですが、assignmentを探索するprogrammatic solver/search/backtrack callableが見つかりません。"
-                "変数・ドメイン・制約から候補割当を生成するsolve/search/assign系callableを実装してください。"
-            )
-        if not has_constraint_model:
-            issues.append(
-                "constraint_satisfaction PlanRecordのvariables/domains/constraints義務に対し、制約モデルがsource上で観測できません。"
-                "変数、ドメイン、制約を入力または内部モデルとして明示してください。"
-            )
-        if not has_constraint_checker:
-            issues.append(
-                "constraint_satisfaction PlanRecordのconstraint_checker義務に対し、各制約を検査するcheck/valid/constraint系callableが不足しています。"
-                "候補割当が制約を満たすかを独立に判定する経路を実装してください。"
-            )
-        if not has_solution_validator:
-            issues.append(
-                "constraint_satisfaction PlanRecordのsolution_validator義務に対し、最終assignment全体を検証するvalidate/verify/check_solution系callableが不足しています。"
-                "solverの戻り値を受け取り、完全性と全制約充足を確認する検証経路を実装してください。"
-            )
-        return issues
-
-    def _state_space_search_source_contract_issues(self, source: str) -> list[str]:
-        """Return generic source issues for state-space-search PlanRecords."""
-
-        text = str(source or "")
-        if not text.strip():
-            return []
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            return []
-        callable_names: list[str] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                callable_names.append(node.name.lower())
-        solverish_tokens = ("solve", "solver", "search", "astar", "a_star", "bfs", "dfs", "plan", "path")
-        verifierish_tokens = ("verify", "validator", "legal", "goal", "replay")
-        replay_verifier_tokens = ("verify", "validate", "replay", "check_solution", "final_verifier")
-        state_predicate_names = {"is_solved", "solved", "is_goal", "goal_reached", "is_goal_state"}
-        has_solverish_callable = any(
-            name not in state_predicate_names and any(token in name for token in solverish_tokens)
-            for name in callable_names
-        )
-        has_verifierish_callable = any(
-            any(token in name for token in verifierish_tokens)
-            for name in callable_names
-        )
-        has_replay_verifier_callable = any(
-            any(token in name for token in replay_verifier_tokens)
-            for name in callable_names
-        )
-        has_manual_input_loop = bool(re.search(r"\binput\s*\(", text))
-        issues: list[str] = []
-        nondeterministic_fixture_helpers: list[str] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            function_name = node.name.lower()
-            if not any(token in function_name for token in ("fixture", "near_goal", "near", "scramble")):
-                continue
-            for child in ast.walk(node):
-                if isinstance(child, ast.Import):
-                    if any(alias.name == "random" or alias.name.startswith("random.") for alias in child.names):
-                        nondeterministic_fixture_helpers.append(node.name)
-                        break
-                if isinstance(child, ast.ImportFrom) and child.module == "random":
-                    nondeterministic_fixture_helpers.append(node.name)
-                    break
-                if isinstance(child, ast.Call):
-                    func = child.func
-                    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "random":
-                        nondeterministic_fixture_helpers.append(node.name)
-                        break
-                    if isinstance(func, ast.Name) and func.id in {"choice", "sample", "shuffle", "randint", "randrange"}:
-                        nondeterministic_fixture_helpers.append(node.name)
-                        break
-        if not has_solverish_callable:
-            issues.append(
-                "PlanRecord strategy=state_space_search ですが、action列を返すprogrammatic solver/search callableが見つかりません。"
-                "手動UIやmove helperだけではなく、状態からゴールまでの探索結果を返すsolve/search/path系callableを実装してください。"
-            )
-        if has_manual_input_loop and not has_solverish_callable:
-            issues.append(
-                "state_space_search PlanRecordでは manual input loop alone は実装義務を満たしません。"
-                "CLI入力は補助に留め、runtime/testから呼べるsolver/search callableを追加してください。"
-            )
-        if not has_verifierish_callable:
-            issues.append(
-                "state_space_search PlanRecordのfinal_verifier義務に対し、legal move validator / goal check / replay verifier を表すcallableが不足しています。"
-                "返されたaction列を合法手としてreplayできる検証経路を実装してください。"
-            )
-        elif not has_replay_verifier_callable:
-            issues.append(
-                "state_space_search PlanRecordのfinal_verifier義務に対し、solver/searchが返したaction列を独立にreplay/verifyするcallableが不足しています。"
-                "is_legal_move や is_goal_state だけではfinal_verifierになりません。solve/searchの戻り値を受け取り、合法手を順に適用してgoal到達を返す verify/replay/validate 系callableを追加してください。"
-            )
-        if nondeterministic_fixture_helpers:
-            helpers = ", ".join(sorted(set(nondeterministic_fixture_helpers))[:4])
-            issues.append(
-                "state_space_search fixture helperが random/shuffle に依存しています: "
-                + helpers
-                + "。near-goalやfixture生成は決定的でなければなりません。"
-                "既知の基準stateから固定順のlegal transitionを短く適用し、直前の逆操作だけを避けるなど、"
-                "同じ入力から常に同じstart stateを作る実装にしてください。"
-            )
-        return issues
-
-    def _state_space_search_replay_verifier_repair_hints(
-        self,
-        *,
-        source: str,
-        issues: list[str],
-    ) -> list[dict[str, Any]]:
-        issue_text = "\n".join(str(issue) for issue in issues)
-        if "final_verifier" not in issue_text and "replay/verify" not in issue_text:
-            return []
-        return [
-            {
-                "suggested_action": "add_state_space_replay_verifier",
-                "current_text": "solver/search action output has no independent replay verifier",
-                "reason": (
-                    "state_space_search の finish 証拠は、solver/search が返した action 列を "
-                    "initial_state から合法性確認しながら適用し、goal 到達を boolean で返す callable です。"
-                ),
-                "suggested_new_text": self._state_space_search_replay_verifier_template(source),
-            }
-        ]
-
-    @staticmethod
-    def _state_space_search_preferred_symbol(names: set[str], preferred: tuple[str, ...], tokens: tuple[str, ...]) -> str:
-        for name in preferred:
-            if name in names:
-                return name
-        for name in sorted(names):
-            lowered = name.lower()
-            if tokens and any(token in lowered for token in tokens):
-                return name
-        return ""
-
-    @staticmethod
-    def _state_space_search_legal_check_lines(symbol: str, *, receiver: str = "", indent: str = "        ") -> str:
-        lowered = str(symbol or "").lower()
-        call = f"{receiver}{symbol}"
-        if lowered.startswith("get_") or "moves" in lowered or "actions" in lowered:
-            return (
-                f"{indent}if action not in list({call}(current_state)):\n"
-                f"{indent}    return False\n"
-            )
-        return (
-            f"{indent}if not {call}(current_state, action):\n"
-            f"{indent}    return False\n"
-        )
-
-    def _state_space_search_replay_verifier_template(self, source: str) -> str:
-        """Return a generic replay-verifier repair template adapted to visible helper names."""
-
-        try:
-            tree = ast.parse(str(source or ""))
-        except SyntaxError:
-            tree = None
-        if tree is not None:
-            for class_node in [node for node in tree.body if isinstance(node, ast.ClassDef)]:
-                method_names = {
-                    node.name
-                    for node in class_node.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                }
-                legal_method = self._state_space_search_preferred_symbol(
-                    method_names,
-                    ("is_valid_move", "is_legal_move", "validate_move", "get_legal_moves", "legal_moves", "legal_actions"),
-                    ("legal", "valid", "validate", "moves", "actions"),
-                )
-                transition_method = self._state_space_search_preferred_symbol(
-                    method_names,
-                    ("make_move", "apply_move", "apply_action", "transition", "next_state"),
-                    ("apply", "transition", "next_state", "make_move"),
-                )
-                goal_attrs: set[str] = set()
-                for node in ast.walk(class_node):
-                    if (
-                        isinstance(node, ast.Attribute)
-                        and isinstance(node.value, ast.Name)
-                        and node.value.id == "self"
-                        and isinstance(getattr(node, "ctx", None), ast.Store)
-                    ):
-                        goal_attrs.add(node.attr)
-                goal_attr = (
-                    "goal_state"
-                    if "goal_state" in goal_attrs or "goal_state" in str(source or "")
-                    else sorted(goal_attrs)[0]
-                    if goal_attrs
-                    else "goal_state"
-                )
-                if legal_method and transition_method:
-                    legal_check = self._state_space_search_legal_check_lines(
-                        legal_method,
-                        receiver="self.",
-                        indent="            ",
-                    )
-                    return (
-                        f"    def verify_solution(self, initial_state, actions):\n"
-                        f"        if actions is None:\n"
-                        f"            return False\n"
-                        f"        current_state = initial_state\n"
-                        f"        for action in actions:\n"
-                        f"{legal_check}"
-                        f"            current_state = self.{transition_method}(current_state, action)\n"
-                        f"        return current_state == self.{goal_attr}\n"
-                    )
-            function_names = {
-                node.name
-                for node in tree.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            }
-            legal_function = self._state_space_search_preferred_symbol(
-                function_names,
-                ("is_valid_move", "is_legal_move", "validate_move", "get_legal_moves", "legal_moves", "legal_actions"),
-                ("legal", "valid", "validate", "moves", "actions"),
-            )
-            transition_function = self._state_space_search_preferred_symbol(
-                function_names,
-                ("make_move", "apply_move", "apply_action", "transition", "next_state"),
-                ("apply", "transition", "next_state", "make_move"),
-            )
-            goal_function = self._state_space_search_preferred_symbol(
-                function_names,
-                ("is_goal_state", "is_goal", "goal_reached", "is_solved"),
-                ("goal", "solved"),
-            )
-            if legal_function and transition_function:
-                goal_line = (
-                    f"    return {goal_function}(current_state, goal_state)\n"
-                    if goal_function
-                    else "    return current_state == goal_state\n"
-                )
-                legal_check = self._state_space_search_legal_check_lines(legal_function, indent="        ")
-                return (
-                    "def verify_solution(initial_state, goal_state, actions):\n"
-                    "    if actions is None:\n"
-                    "        return False\n"
-                    "    current_state = initial_state\n"
-                    "    for action in actions:\n"
-                    f"{legal_check}"
-                    f"        current_state = {transition_function}(current_state, action)\n"
-                    f"{goal_line}"
-                )
-        return (
-            "def verify_solution(initial_state, goal_state, actions, legal_move_validator, transition):\n"
-            "    if actions is None:\n"
-            "        return False\n"
-            "    current_state = initial_state\n"
-            "    for action in actions:\n"
-            "        if not legal_move_validator(current_state, action):\n"
-            "            return False\n"
-            "        current_state = transition(current_state, action)\n"
-            "    return current_state == goal_state\n"
-        )
-
-    def _state_space_search_test_contract_issues(self, test_sources: list[tuple[str, str]]) -> list[str]:
-        """Return generic test-artifact issues for state-space-search plans."""
-
-        if str(self._plan_record_execution_context().get("plan_strategy") or "") != "state_space_search":
-            return []
-        solverish_tokens = ("solve", "solver", "search", "astar", "a_star", "bfs", "dfs", "plan", "path")
-        verifierish_tokens = (
-            "verify",
-            "verifier",
-            "replay",
-            "legal",
-            "valid",
-            "apply",
-            "make_move",
-            "goal",
-            "solved",
-            "is_solved",
-        )
-
-        def call_name(call: ast.Call) -> str:
-            func = call.func
-            if isinstance(func, ast.Name):
-                return func.id.lower()
-            if isinstance(func, ast.Attribute):
-                return func.attr.lower()
-            return ""
-
-        def is_solver_execution_call(call: ast.Call) -> bool:
-            name = call_name(call)
-            if not name:
-                return False
-            if name in {"solver", "set_start_state", "set_goal_state", "is_solvable", "solvable"}:
-                return False
-            execution_tokens = (
-                "solve",
-                "search",
-                "astar",
-                "a_star",
-                "bfs",
-                "dfs",
-                "find_path",
-                "shortest_path",
-                "plan_path",
-            )
-            return any(token in name for token in execution_tokens)
-
-        def solver_call_has_explicit_bound(call: ast.Call, test_source_lower: str) -> bool:
-            bound_tokens = (
-                "max_depth",
-                "max_steps",
-                "max_nodes",
-                "max_iterations",
-                "depth_limit",
-                "node_limit",
-                "step_limit",
-                "timeout",
-                "time_limit",
-                "budget",
-                "cutoff",
-                "bound",
-                "limit",
-            )
-            for keyword in call.keywords:
-                keyword_name = str(keyword.arg or "").lower()
-                if keyword_name and any(token in keyword_name for token in bound_tokens):
-                    return True
-            return any(token in test_source_lower for token in bound_tokens)
-
-        def assertion_expects_none_from_solver(call: ast.Call, solver_result_names: set[str]) -> bool:
-            if call_name(call) not in {"assertisnone", "assert_is_none"}:
-                return False
-            if not call.args:
-                return False
-            target = call.args[0]
-            if isinstance(target, ast.Name) and target.id in solver_result_names:
-                return True
-            return isinstance(target, ast.Call) and is_solver_execution_call(target)
-
-        def target_names(target: ast.AST) -> list[str]:
-            if isinstance(target, ast.Name):
-                return [target.id]
-            if isinstance(target, (ast.Tuple, ast.List)):
-                names: list[str] = []
-                for item in target.elts:
-                    names.extend(target_names(item))
-                return names
-            return []
-
-        def literal_container_len(node: ast.AST) -> int:
-            if isinstance(node, (ast.List, ast.Tuple)):
-                return len(node.elts)
-            return 0
-
-        def is_small_literal_action_item(node: ast.AST) -> bool:
-            if isinstance(node, ast.Constant):
-                return isinstance(node.value, (str, int, float, bool, type(None)))
-            if isinstance(node, (ast.List, ast.Tuple)):
-                return all(is_small_literal_action_item(item) for item in node.elts)
-            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-                return is_small_literal_action_item(node.operand)
-            return False
-
-        def is_handwritten_action_sequence_literal(node: ast.AST) -> bool:
-            if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 4:
-                return False
-            return all(is_small_literal_action_item(item) for item in node.elts)
-
-        action_fixture_name_tokens = ("action", "actions", "move", "moves", "solution", "path", "route", "plan")
-        start_fixture_name_tokens = ("start", "initial")
-        goal_fixture_name_tokens = ("goal", "target")
-
-        issues: list[str] = []
-        solver_test_seen = False
-        replaying_solver_test_seen = False
-        solver_tests_with_pass: list[str] = []
-        randomized_or_broad_solver_tests: list[str] = []
-        unbounded_no_solution_solver_tests: list[str] = []
-        handwritten_action_fixture_tests: list[str] = []
-        literal_near_goal_fixture_tests: list[str] = []
-        for path, source in test_sources:
-            try:
-                tree = ast.parse(str(source or ""))
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if not node.name.startswith("test"):
-                    continue
-                calls = [call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
-                has_solver_call = any(
-                    any(token in name for token in solverish_tokens)
-                    for name in calls
-                    if name
-                )
-                if not has_solver_call:
-                    continue
-                solver_test_seen = True
-                test_source = ast.get_source_segment(str(source or ""), node) or ""
-                test_source_lower = test_source.lower()
-                solver_result_names: set[str] = set()
-                solver_execution_calls: list[ast.Call] = []
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Assign) and isinstance(child.value, ast.Call) and is_solver_execution_call(child.value):
-                        solver_execution_calls.append(child.value)
-                        for target in child.targets:
-                            if isinstance(target, ast.Name):
-                                solver_result_names.add(target.id)
-                    elif isinstance(child, ast.Call) and is_solver_execution_call(child):
-                        solver_execution_calls.append(child)
-                if (
-                    "shuffle(" in test_source_lower
-                    or "make_random_move(" in test_source_lower
-                    or "random." in test_source_lower
-                    or any(name in {"choice", "sample", "randint", "randrange"} for name in calls)
-                ):
-                    randomized_or_broad_solver_tests.append(f"{path}:{node.name}")
-                if any(isinstance(stmt, ast.Pass) for stmt in ast.walk(node)):
-                    solver_tests_with_pass.append(f"{path}:{node.name}")
-                has_replay_or_verifier = any(
-                    any(token in name for token in verifierish_tokens)
-                    for name in calls
-                    if name
-                )
-                if has_replay_or_verifier:
-                    replaying_solver_test_seen = True
-                no_solution_named_test = any(
-                    token in node.name.lower()
-                    for token in ("unsolvable", "no_solution", "no_path", "unreachable", "impossible")
-                )
-                no_solution_assert = any(
-                    isinstance(child, ast.Call) and assertion_expects_none_from_solver(child, solver_result_names)
-                    for child in ast.walk(node)
-                )
-                if (no_solution_named_test or no_solution_assert) and solver_execution_calls:
-                    if not any(solver_call_has_explicit_bound(call, test_source_lower) for call in solver_execution_calls):
-                        unbounded_no_solution_solver_tests.append(f"{path}:{node.name}")
-                near_goal_claimed = any(
-                    token in node.name.lower() or token in test_source_lower
-                    for token in ("near_goal", "near-goal", "near goal")
-                )
-                literal_start_lines: list[int | str] = []
-                literal_goal_lines: list[int | str] = []
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Assign):
-                        names = [
-                            name.lower()
-                            for target in child.targets
-                            for name in target_names(target)
-                        ]
-                        if (
-                            names
-                            and any(any(token in name for token in action_fixture_name_tokens) for name in names)
-                            and is_handwritten_action_sequence_literal(child.value)
-                        ):
-                            size = literal_container_len(child.value)
-                            label = "/".join(names[:3])
-                            handwritten_action_fixture_tests.append(
-                                f"{path}:{node.name}:line {getattr(child, 'lineno', '?')}:{label}[{size}]"
-                            )
-                        if (
-                            names
-                            and any("near" in name and "goal" in name for name in names)
-                            and isinstance(child.value, (ast.List, ast.Tuple))
-                        ):
-                            literal_near_goal_fixture_tests.append(
-                                f"{path}:{node.name}:line {getattr(child, 'lineno', '?')}"
-                            )
-                        if near_goal_claimed and names and is_small_literal_action_item(child.value):
-                            if any(any(token in name for token in start_fixture_name_tokens) for name in names):
-                                literal_start_lines.append(getattr(child, "lineno", "?"))
-                            if any(any(token in name for token in goal_fixture_name_tokens) for name in names):
-                                literal_goal_lines.append(getattr(child, "lineno", "?"))
-                    elif isinstance(child, ast.Call):
-                        name = call_name(child)
-                        if not any(token in name for token in verifierish_tokens):
-                            continue
-                        for arg in child.args:
-                            if is_handwritten_action_sequence_literal(arg):
-                                handwritten_action_fixture_tests.append(
-                                    f"{path}:{node.name}:line {getattr(child, 'lineno', '?')}:verifier_arg[{literal_container_len(arg)}]"
-                                )
-                if near_goal_claimed and literal_start_lines and literal_goal_lines:
-                    literal_near_goal_fixture_tests.append(
-                        f"{path}:{node.name}:literal start/goal lines "
-                        f"{literal_start_lines[0]}/{literal_goal_lines[0]}"
-                    )
-        if not solver_test_seen:
-            issues.append(
-                "state_space_search test artifact が solver/search callableを直接呼んでいません。"
-                "PlanRecordの実行証拠として、探索結果のaction列を生成するテストを追加してください。"
-            )
-        elif not replaying_solver_test_seen:
-            issues.append(
-                "state_space_search test artifact が solver/searchの戻り値を legal move replay / final_verifier / goal assertion で検証していません。"
-                "solution is not None だけでは不十分です。返されたaction列を合法手として再生し、goal到達をassertしてください。"
-            )
-        if solver_tests_with_pass:
-            issues.append(
-                "state_space_search solver test内に pass が残っています: "
-                + ", ".join(solver_tests_with_pass[:4])
-                + "。未検証ループで成功扱いにせず、各actionをreplayしてassertしてください。"
-            )
-        if randomized_or_broad_solver_tests:
-            issues.append(
-                "state_space_search solver testが random/shuffle に依存した広いfixtureで探索を実行しています: "
-                + ", ".join(randomized_or_broad_solver_tests[:4])
-                + "。unit testは決定的なnear-goal fixtureに縮小してください。"
-                "goalまたは既知の基準stateから短い合法transitionで導出できるstart stateを明示し、solver/searchを1回だけ呼び、"
-                "返ったaction列をfinal_verifier/legal replayへ渡してgoal到達をassertしてください。"
-            )
-        if unbounded_no_solution_solver_tests:
-            issues.append(
-                "state_space_search no-solution/unsolvable testが境界なしでsolver/searchを実行しています: "
-                + ", ".join(unbounded_no_solution_solver_tests[:4])
-                + "。no-solution系は状態空間全探索でtimeoutしやすいため、unit testでは"
-                "solvability_checkを単体検証するか、max_depth/max_nodes/timeout等の明示境界付きでsolver/searchを呼んでください。"
-                "全体unittestで広い不可解fixtureを無制限探索させてはいけません。"
-            )
-        if handwritten_action_fixture_tests:
-            issues.append(
-                "state_space_search solver testが長い手書きaction/path/solution fixtureを正解として埋め込んでいます: "
-                + ", ".join(handwritten_action_fixture_tests[:4])
-                + "。unit testは長い解列をテスト内で固定せず、solver/searchの戻り値をそのまま"
-                "legal move replay / final_verifierへ渡してください。start fixtureは短い合法遷移で導出できる"
-                "小さいnear-goalに縮小し、期待するのは具体的な経路列ではなくgoal到達です。"
-            )
-        if literal_near_goal_fixture_tests:
-            issues.append(
-                "state_space_search test artifact に literal near-goal fixture があります: "
-                + ", ".join(literal_near_goal_fixture_tests[:4])
-                + "。near-goalと名付けるfixtureは任意の値を直書きせず、goalや既知の基準stateから短いlegal move/transitionを"
-                "適用して導出してください。runtimeはタスク専用oracleを持たないため、fixtureの由来を"
-                "テストコード上で観測できる形にしてください。"
-            )
-        return issues
-
-    def _dynamic_programming_test_contract_issues(
-        self,
-        test_sources: list[tuple[str, str]],
-        *,
-        user_message: str = "",
-    ) -> list[str]:
-        """Return generic test-artifact issues for dynamic-programming plans."""
-
-        if str(self._plan_record_execution_context().get("plan_strategy") or "") != "dynamic_programming":
-            return []
-
-        requested_function_names = {
-            name.lower()
-            for name in self._requested_top_level_function_names(user_message)
-        }
-        assertion_names = {
-            "assertequal",
-            "assertnotequal",
-            "asserttrue",
-            "assertfalse",
-            "assertisnone",
-            "assertisnotnone",
-            "assertgreater",
-            "assertgreaterequal",
-            "assertless",
-            "assertlessequal",
-        }
-        solver_test_seen = test_calls_implementation_callable(
-            test_sources,
-            requested_names=requested_function_names,
-        )
-        independent_oracle_seen = dynamic_programming_independent_oracle_seen(
-            test_sources,
-            requested_names=requested_function_names,
-        )
-        assertion_count = 0
-        base_seen = False
-        recurrence_or_sample_seen = False
-        for _path, source in test_sources:
-            try:
-                tree = ast.parse(str(source or ""))
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if not node.name.startswith("test"):
-                    continue
-                test_source = ast.get_source_segment(str(source or ""), node) or ""
-                lowered = test_source.lower()
-                calls = [python_call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
-                assertion_count += sum(1 for name in calls if name in assertion_names)
-                if (
-                    any(token in lowered for token in ("base", "base_case", "initial"))
-                    or any(token in test_source for token in ("基底", "初期", "期待値"))
-                ):
-                    base_seen = True
-                if (
-                    any(token in lowered for token in ("recurrence", "transition", "subproblem", "memo", "table", "dp", "sample", "oracle"))
-                    or any(token in test_source for token in ("漸化", "遷移", "部分問題"))
-                    or any(
-                        any(token in name for token in DYNAMIC_PROGRAMMING_ORACLE_TOKENS)
-                        for name in calls
-                        if name
-                    )
-                ):
-                    recurrence_or_sample_seen = True
-        issues: list[str] = []
-        if not solver_test_seen:
-            issues.append(
-                "dynamic_programming test artifact が solver/compute callableを直接呼んでいません。"
-                "PlanRecordの実行証拠として、DP本体を呼び出し期待値と比較するunittestを追加してください。"
-            )
-        if assertion_count < 2 or not base_seen or not recurrence_or_sample_seen:
-            issues.append(
-                "dynamic_programming test artifact は base case と recurrence/sample oracle の両方を観測可能に検証していません。"
-                "最小subproblemの期待値と、漸化式またはDP表更新で導かれるsampleケースを別々にassertしてください。"
-            )
-        if not independent_oracle_seen:
-            issues.append(
-                "dynamic_programming test artifact が小さい入力用の独立reference/brute-force oracleを持っていません。"
-                "runtimeは自己生成hardcoded expectedを正本扱いしないため、実装本体を呼ばない"
-                "brute_force/reference/oracle helperで期待値を導出し、その結果とDP本体を比較してください。"
-            )
-        return issues
-
-    def _test_artifact_contract_guidance(
-        self,
-        *,
-        issue_text: str,
-        plan_strategy: str,
-    ) -> dict[str, str]:
-        """Return prompt/action guidance derived from the same test issue.
-
-        Runtime must not reject a candidate for one contract violation and then
-        guide the model with an unrelated generic repair. The blocked message,
-        suggested_fix, and next_required_action are one control contract.
-        """
-
-        issue = str(issue_text or "")
-        strategy = str(plan_strategy or "")
-        if strategy == "dynamic_programming" and "独立reference/brute-force oracle" in issue:
-            guidance = (
-                "tests/test_*.py に、実装本体を呼ばない brute_force/reference/oracle helper を追加してください。"
-                "小さい入力だけを対象に全列挙または単純な基準実装で期待値を導出し、"
-                "その結果とDP本体の戻り値を比較するunittestにしてください。"
-            )
-            return {
-                "suggested_fix": guidance,
-                "next_required_action": (
-                    "rewrite the test artifact with an independent brute_force/reference/oracle helper "
-                    "that does not call the implementation under test"
-                ),
-            }
-        if strategy == "dynamic_programming":
-            guidance = (
-                "base case と recurrence/sample oracle を別々にassertし、"
-                "DP本体のprogrammatic callableを直接呼ぶunittestにしてください。"
-            )
-            return {
-                "suggested_fix": guidance,
-                "next_required_action": "rewrite the test artifact so it directly validates the DP callable contract",
-            }
-        if strategy == "constraint_satisfaction":
-            guidance = (
-                "solverの戻り値をconstraint checker / solution validatorへ渡し、"
-                "valid assignment成功とinvalid/negative assignment拒否をassertするunittestにしてください。"
-            )
-            return {
-                "suggested_fix": guidance,
-                "next_required_action": "rewrite the test artifact around a constraint validator and negative fixture",
-            }
-        guidance = (
-            "solver/searchの戻り値をlegal move replayまたはfinal_verifierへ渡し、goal到達をassertするunittestにしてください。"
-        )
-        return {
-            "suggested_fix": guidance,
-            "next_required_action": "rewrite the test artifact around legal replay or final_verifier evidence",
-        }
-
-    def _constraint_satisfaction_test_contract_issues(self, test_sources: list[tuple[str, str]]) -> list[str]:
-        """Return generic test-artifact issues for constraint-satisfaction plans."""
-
-        if str(self._plan_record_execution_context().get("plan_strategy") or "") != "constraint_satisfaction":
-            return []
-
-        def call_name(call: ast.Call) -> str:
-            func = call.func
-            if isinstance(func, ast.Name):
-                return func.id.lower()
-            if isinstance(func, ast.Attribute):
-                return func.attr.lower()
-            return ""
-
-        solverish_tokens = ("solve", "search", "assign", "backtrack", "satisfy", "csp")
-        validator_tokens = ("constraint", "consistent", "valid", "validate", "verify", "check", "satisf")
-        solver_test_seen = False
-        validator_test_seen = False
-        negative_case_seen = False
-        for _path, source in test_sources:
-            try:
-                tree = ast.parse(str(source or ""))
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if not node.name.startswith("test"):
-                    continue
-                test_source = ast.get_source_segment(str(source or ""), node) or ""
-                lowered = test_source.lower()
-                calls = [call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
-                if any(any(token in name for token in solverish_tokens) for name in calls if name):
-                    solver_test_seen = True
-                if any(any(token in name for token in validator_tokens) for name in calls if name):
-                    validator_test_seen = True
-                if (
-                    any(token in lowered for token in ("negative", "invalid", "reject", "unsatisfied", "violate"))
-                    or any(token in test_source for token in ("不正", "違反", "失敗", "拒否"))
-                    or any(name in {"assertfalse", "assertraises", "assertisnone"} for name in calls)
-                ):
-                    negative_case_seen = True
-        issues: list[str] = []
-        if not solver_test_seen:
-            issues.append(
-                "constraint_satisfaction test artifact が solver/search/backtrack callableを直接呼んでいません。"
-                "PlanRecordの実行証拠として、候補assignmentを生成するテストを追加してください。"
-            )
-        if not validator_test_seen:
-            issues.append(
-                "constraint_satisfaction test artifact が constraint checker / solution validator を直接検証していません。"
-                "solverの戻り値をvalidate/checkし、全制約充足をassertしてください。"
-            )
-        if not negative_case_seen:
-            issues.append(
-                "constraint_satisfaction test artifact に invalid/negative assignment rejection の検証がありません。"
-                "不正な割当がconstraint_checkerまたはsolution_validatorで拒否されることをassertしてください。"
-            )
-        return issues
-
     def _test_source_contract_issues(
         self,
         *,
@@ -2639,13 +1808,23 @@ class AgentRuntime:
         for issue in self._test_source_contradictory_predicate_expectation_issues(test_sources):
             if issue not in issues:
                 issues.append(issue)
-        for issue in self._state_space_search_test_contract_issues(test_sources):
+        for issue in state_space_search_test_contract_issues(
+            test_sources,
+            plan_strategy=str(self._plan_record_execution_context().get("plan_strategy") or ""),
+        ):
             if issue not in issues:
                 issues.append(issue)
-        for issue in self._dynamic_programming_test_contract_issues(test_sources, user_message=user_message):
+        for issue in dynamic_programming_test_contract_issues(
+            test_sources,
+            plan_strategy=str(self._plan_record_execution_context().get("plan_strategy") or ""),
+            requested_names=self._requested_top_level_function_names(user_message),
+        ):
             if issue not in issues:
                 issues.append(issue)
-        for issue in self._constraint_satisfaction_test_contract_issues(test_sources):
+        for issue in constraint_satisfaction_test_contract_issues(
+            test_sources,
+            plan_strategy=str(self._plan_record_execution_context().get("plan_strategy") or ""),
+        ):
             if issue not in issues:
                 issues.append(issue)
         return issues
@@ -2889,7 +2068,7 @@ class AgentRuntime:
             )
             if plan_test_issues:
                 plan_strategy = str(self._plan_record_execution_context().get("plan_strategy") or "")
-                guidance = self._test_artifact_contract_guidance(
+                guidance = test_artifact_contract_guidance(
                     issue_text=plan_test_issues[0],
                     plan_strategy=plan_strategy,
                 )
@@ -6475,7 +5654,7 @@ class AgentRuntime:
         output = re.sub(r'File "([^"]+)"', lambda match: f'File "{Path(match.group(1)).name}"', output)
         output = re.sub(r", line \d+", ", line <n>", output)
         output = re.sub(r"line \d+", "line <n>", output)
-        output = self._unittest_failure_signature_body(output)
+        output = unittest_failure_signature_body(output)
         payload = json.dumps(
             {"command": command, "output": output[-4000:]},
             ensure_ascii=False,
@@ -6483,89 +5662,6 @@ class AgentRuntime:
             separators=(",", ":"),
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-
-    def _unittest_failure_signature_body(self, output: str) -> str:
-        """Extract the semantic failure body and ignore stdout/demo noise."""
-
-        interesting: list[str] = []
-        for raw_line in str(output or "").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith(("FAIL:", "ERROR:")):
-                interesting.append(line)
-                continue
-            if line.startswith("File "):
-                interesting.append(line)
-                continue
-            if re.search(r"\bself\.assert[A-Za-z0-9_]*\b|\bassert[A-Z][A-Za-z0-9_]*\b", line):
-                interesting.append(line)
-                continue
-            if re.match(
-                r"^(AssertionError|SyntaxError|ImportError|ModuleNotFoundError|NameError|TypeError|ValueError|"
-                r"IndexError|KeyError|AttributeError|RuntimeError|Exception|Error):",
-                line,
-            ):
-                interesting.append(line)
-        return "\n".join(interesting) if interesting else str(output or "")
-
-    def _unittest_output_looks_like_test_value_assertion(self, output: str) -> bool:
-        text = str(output or "")
-        if "AssertionError" not in text:
-            return False
-        value_failure_markers = (
-            " != ",
-            "Lists differ:",
-            "Tuples differ:",
-            "Dictionaries differ:",
-            "not equal",
-            "False is not true",
-            "True is not false",
-            "unexpectedly None",
-            "not raised",
-        )
-        return any(marker in text for marker in value_failure_markers)
-
-    def _unittest_output_return_shape_hint(self, output: str) -> str:
-        text = str(output or "")
-        if "AssertionError" not in text or " != " not in text:
-            return ""
-
-        def value_shape(value: str) -> str:
-            stripped = value.strip()
-            if stripped.startswith(("[", "(", "{")):
-                return "container"
-            if re.match(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$", stripped):
-                return "scalar"
-            if stripped in {"True", "False", "None"}:
-                return "scalar"
-            if (
-                len(stripped) >= 2
-                and stripped[0] in {"'", '"'}
-                and stripped[-1] == stripped[0]
-            ):
-                return "scalar"
-            return "unknown"
-
-        examples: list[str] = []
-        for match in re.finditer(r"AssertionError:\s*([^\n]+?)\s+!=\s+([^\n]+)", text):
-            left = match.group(1).strip()
-            right = match.group(2).strip()
-            shapes = {value_shape(left), value_shape(right)}
-            if shapes == {"scalar", "container"}:
-                examples.append(f"{left} != {right}")
-            if len(examples) >= 3:
-                break
-        if not examples:
-            return ""
-
-        return (
-            "返却shape/API契約不一致の疑いがあります。unittestがscalar値とsequence/containerを比較しています"
-            f"（例: {'; '.join(examples)}）。"
-            "アルゴリズム本体を書き換える前に、公開関数のdocstring/仕様、test側のunpack順序、"
-            "reference/brute_force/oracle helperの戻り値shapeを同一契約に揃えてください。"
-            "関数がtupleを返す場合は、実装・test・oracleのすべてで戻り値の順序を一致させてください。"
-        )
 
     def _repo_map_excerpt_for_workspace(self, turn_workspace: Path | None) -> str:
         if turn_workspace is None:
@@ -6756,7 +5852,7 @@ class AgentRuntime:
                 *self._python_source_recursive_destructive_state_repair_hints(
                     latest_impl_source,
                 ),
-                *self._state_space_search_replay_verifier_repair_hints(
+                *state_space_search_replay_verifier_repair_hints(
                     source=latest_impl_source,
                     issues=implementation_source_issues,
                 ),
@@ -6842,6 +5938,7 @@ class AgentRuntime:
             latest_unittest_triage_result = latest_any_unittest_result
         latest_unittest_output_for_triage = ""
         latest_unittest_missing_import = {}
+        latest_unittest_missing_name = {}
         if latest_unittest_triage_result is not None and not bool(latest_unittest_triage_result.get("ok")):
             latest_unittest_output_for_triage = "\n".join(
                 str(latest_unittest_triage_result.get(key) or "")
@@ -6850,6 +5947,9 @@ class AgentRuntime:
             )
             latest_unittest_missing_import = self._unittest_missing_import_details(
                 output=latest_unittest_output_for_triage,
+            )
+            latest_unittest_missing_name = unittest_output_missing_name_details(
+                latest_unittest_output_for_triage,
             )
             latest_failed_unittest_paths = self._extract_unittest_failure_paths(
                 output=latest_unittest_output_for_triage,
@@ -6928,10 +6028,10 @@ class AgentRuntime:
             for item in latest_failed_unittest_paths
             if _artifact_path_is_python_implementation(str(item).replace("\\", "/"))
         ]
-        latest_unittest_test_value_assertion = self._unittest_output_looks_like_test_value_assertion(
+        latest_unittest_test_value_assertion = unittest_output_looks_like_test_value_assertion(
             latest_unittest_output_for_triage,
         )
-        latest_unittest_return_shape_hint = self._unittest_output_return_shape_hint(
+        latest_unittest_return_shape_hint = unittest_output_return_shape_hint(
             latest_unittest_output_for_triage,
         )
         return_shape_contract_mismatch = bool(latest_unittest_return_shape_hint)
@@ -7508,6 +6608,40 @@ class AgentRuntime:
                         f"{location}。stderrに不足symbol名が出ているため、"
                         "implementationをread済みなら同じreadを繰り返さず編集へ進んでください。"
                     )
+            if latest_unittest_missing_name:
+                missing_name = str(latest_unittest_missing_name.get("name") or "")
+                source_file = str(latest_unittest_missing_name.get("source_file") or "")
+                source_line = str(latest_unittest_missing_name.get("source_line") or "")
+                location = f"{source_file}:{source_line}" if source_file and source_line else source_file
+                impl_module = Path(str(latest_impl_path)).stem if latest_impl_path else ""
+                target_test_path = latest_test_path or source_file or "tests/test_*.py"
+                impl_exports_missing_name = bool(
+                    missing_name
+                    and latest_impl_source
+                    and re.search(
+                        rf"(?m)^\s*(?:def|class)\s+{re.escape(missing_name)}\b",
+                        latest_impl_source,
+                    )
+                )
+                if impl_module and impl_exports_missing_name:
+                    unittest_repair_hints.append(
+                        "NameErrorはtest artifact内の未定義名です: "
+                        f"{missing_name}"
+                        + (f" at {location}" if location else "")
+                        + "。実装artifactには同名の公開APIが存在するため、"
+                        "test全体を書き直さず、先頭importだけを小さいreplace_textで追加してください。"
+                        f" 例: replace_text {target_test_path} "
+                        f"old_text='import unittest\\n' "
+                        f"new_text='import unittest\\nfrom {impl_module} import {missing_name}\\n'。"
+                    )
+                else:
+                    unittest_repair_hints.append(
+                        "NameErrorはtest artifact内の未定義名です: "
+                        f"{missing_name}"
+                        + (f" at {location}" if location else "")
+                        + "。test側のimport漏れ、またはimplementation側の公開API名不足を切り分け、"
+                        "読了済みartifactに対する小さいreplace_textで修正してください。"
+                    )
             if latest_failed_unittest_paths and all(
                 _artifact_path_is_test(str(item).replace("\\", "/"))
                 for item in latest_failed_unittest_paths
@@ -7703,6 +6837,7 @@ class AgentRuntime:
             "latest_unittest_failure_signature": latest_unittest_failure_signature,
             "unittest_repair_hints": unittest_repair_hints,
             "latest_unittest_missing_import": latest_unittest_missing_import,
+            "latest_unittest_missing_name": latest_unittest_missing_name,
             "latest_edit_blocked": self._latest_edit_blocked_details(session_id=session_id),
             "previous_same_unittest_failure_index": previous_same_unittest_failure_index,
             "latest_failed_unittest_index": latest_failed_unittest_index,
@@ -9786,7 +8921,26 @@ class AgentRuntime:
                     }
                 return None
             if tool_name in {"replace_text", "write_file", "append_file"} and latest_impl and path == latest_impl:
-                return None
+                if empty_stdout_commands:
+                    return None
+                return {
+                    "reason_code": "implementation_task_result_display_requires_run_command_first",
+                    "phase": phase,
+                    "path": path,
+                    "message": (
+                        "実装とunittestは成功しています。stdout_displayed はまず非対話run_commandで観測してください。"
+                        "表示目的だけでimplementationを編集すると、検証済みartifactと表示用artifactの境界が曖昧になります。"
+                    ),
+                    "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                    "suggested_fix": (
+                        "python -c/import で実装関数を呼び出して結果をprintするか、"
+                        "既に__main__がある場合は python3 <implementation>.py を実行してください。"
+                        "artifact編集は、直前の表示コマンドが空stdoutだった場合だけ許可します。"
+                    ),
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": "run a non-unittest command that prints a concrete sample result",
+                    "state": state,
+                }
             return {
                 "reason_code": "implementation_task_phase_requires_result_display",
                 "phase": phase,

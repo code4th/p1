@@ -99,6 +99,58 @@ def _has_word(text: str, marker: str) -> bool:
     return bool(re.search(rf"(?<![a-z0-9_]){re.escape(marker)}(?![a-z0-9_])", text))
 
 
+def _state_space_profile_match(text: str) -> tuple[bool, list[str], list[str]]:
+    """Classify state-space planning without letting generic search terms dominate.
+
+    A word like "探索" or "search" is too weak by itself: binary search,
+    code search, and other named algorithms are not state-space planning
+    problems. State-space contracts are justified only when the request names
+    a state/action/goal model or a puzzle-like domain.
+    """
+
+    explicit_markers = (
+        "状態空間",
+        "状態探索",
+        "state space",
+        "state-space",
+        "合法手",
+        "legal move",
+        "パズル",
+        "puzzle",
+    )
+    model_markers = (
+        "状態",
+        "ゴール",
+        "手順",
+        "手数",
+        "手を",
+        "moves",
+        "move sequence",
+        "state",
+        "goal",
+    )
+    search_markers = (
+        "探索方針",
+        "探索",
+        "経路",
+        "最短",
+        "path",
+        "shortest",
+        "search",
+        "bfs",
+        "a*",
+        "ida*",
+    )
+
+    explicit = _contains_any(text, explicit_markers)
+    model = _contains_any(text, model_markers)
+    search = _contains_any(text, search_markers)
+    strong_enough = bool(explicit) or (len(model) >= 2 and bool(search))
+    signals = [f"state_space:{item}" for item in (explicit + model + search)[:8]]
+    weak_signals = [f"search_weak:{item}" for item in search[:4]]
+    return strong_enough, signals, weak_signals
+
+
 def profile_problem(user_message: str) -> dict[str, Any]:
     """Derive a generic planning profile from the user's request.
 
@@ -110,30 +162,6 @@ def profile_problem(user_message: str) -> dict[str, Any]:
     text = original.lower()
     signals: list[str] = []
 
-    state_markers = (
-        "状態",
-        "手順",
-        "手数",
-        "手を",
-        "経路",
-        "最短",
-        "ゴール",
-        "合法手",
-        "探索",
-        "パズル",
-        "puzzle",
-        "moves",
-        "move sequence",
-        "path",
-        "shortest",
-        "state",
-        "goal",
-        "legal move",
-        "search",
-        "bfs",
-        "a*",
-        "ida*",
-    )
     dp_markers = (
         "動的計画",
         "dp",
@@ -200,10 +228,12 @@ def profile_problem(user_message: str) -> dict[str, Any]:
     )
 
     strategy = "direct_implementation"
-    matched = _contains_any(text, state_markers)
-    if matched:
+    state_space_matched, state_space_signals, weak_search_signals = _state_space_profile_match(text)
+    if state_space_matched:
         strategy = "state_space_search"
-        signals.extend(f"state_space:{item}" for item in matched[:8])
+        signals.extend(state_space_signals)
+    else:
+        signals.extend(weak_search_signals)
     matched = _contains_any(text, graph_generic_markers)
     if matched:
         signals.extend(f"graph:{item}" for item in matched[:6])
