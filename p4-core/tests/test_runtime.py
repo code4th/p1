@@ -1697,6 +1697,182 @@ class GenericRuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(state_after_edit["allowed_next_actions"], ["run_command python3 -m unittest discover -s tests"])
 
+    def test_unittest_return_shape_hint_detects_scalar_container_assertion(self) -> None:
+        runtime = self.runtime()
+        output = (
+            "FAIL: test_sample (test_solver.TestSolver.test_sample)\n"
+            "AssertionError: 0 != []\n"
+            "AssertionError: 17 != [(2, 5, 6), (5, 8, 11)]\n"
+        )
+
+        hint = runtime._unittest_output_return_shape_hint(output)
+
+        self.assertIn("返却shape/API契約不一致", hint)
+        self.assertIn("docstring", hint)
+        self.assertIn("unpack", hint)
+        self.assertIn("oracle", hint)
+
+    def test_unittest_return_shape_hint_reaches_repair_prompt(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで最適化アルゴリズムを実装し、unittestで検証してください。"
+        impl = (
+            "def solve(items):\n"
+            "    \"\"\"Return (score, selected_items).\"\"\"\n"
+            "    return 0, []\n"
+        )
+        test = (
+            "import unittest\n"
+            "from solver import solve\n\n"
+            "class TestSolver(unittest.TestCase):\n"
+            "    def test_sample(self):\n"
+            "        selected, score = solve([])\n"
+            "        self.assertEqual(selected, [])\n"
+            "        self.assertEqual(score, 0)\n"
+        )
+        stderr = (
+            "FAIL: test_sample (test_solver.TestSolver.test_sample)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_solver.py'}\", line 7, in test_sample\n"
+            "    self.assertEqual(selected, [])\n"
+            "AssertionError: 0 != []\n"
+        )
+        steps = [
+            tool_step("write_file", "solver.py", content=impl),
+            tool_step("write_file", "tests/test_solver.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_solver.py", content=test),
+            tool_step("read_file", "solver.py", content=impl),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertTrue(state["return_shape_contract_mismatch"])
+        self.assertNotIn("write_file solver.py", state["allowed_next_actions"])
+        self.assertIn("replace_text solver.py with a small unique old_text", state["allowed_next_actions"])
+        self.assertIn("write_file tests/test_solver.py", state["allowed_next_actions"])
+        hints = "\n".join(state["unittest_repair_hints"])
+        self.assertIn("返却shape/API契約不一致", hints)
+        self.assertIn("reference/brute_force/oracle", hints)
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("返却shape/API契約不一致", prompt)
+        self.assertIn("公開関数のdocstring/仕様", prompt)
+        self.assertIn("返却shape/API修復契約", prompt)
+        self.assertIn("アルゴリズム全面再実装", prompt)
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="replace_text",
+            tool_args={
+                "path": "solver.py",
+                "old_text": impl + ("# stale whole-file filler\n" * 80),
+                "new_text": impl.replace("return 0, []", "return [], 0") + ("# stale whole-file filler\n" * 80),
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_blocks_broad_replace_text")
+        self.assertIn("返却shape/API契約の修復", blocked["suggested_fix"])
+        self.assertNotIn("write_file solver.py", blocked["allowed_next_actions"])
+        self.assertIn("write_file tests/test_solver.py", blocked["allowed_next_actions"])
+
+    def test_return_shape_impl_broad_replace_removes_impl_from_next_actions(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで最適化アルゴリズムを実装し、unittestで検証してください。"
+        impl = (
+            "def solve(items):\n"
+            "    \"\"\"Return (score, selected_items).\"\"\"\n"
+            "    return 0, []\n"
+        )
+        test = (
+            "import unittest\n"
+            "from solver import solve\n\n"
+            "def brute_force_solve(items):\n"
+            "    return [], 0\n\n"
+            "class TestSolver(unittest.TestCase):\n"
+            "    def test_sample(self):\n"
+            "        selected, score = solve([])\n"
+            "        expected_selected, expected_score = brute_force_solve([])\n"
+            "        self.assertEqual(selected, expected_selected)\n"
+            "        self.assertEqual(score, expected_score)\n"
+        )
+        stderr = (
+            "FAIL: test_sample (test_solver.TestSolver.test_sample)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_solver.py'}\", line 10, in test_sample\n"
+            "    self.assertEqual(selected, expected_selected)\n"
+            "AssertionError: 0 != []\n"
+        )
+        steps = [
+            tool_step("write_file", "solver.py", content=impl),
+            tool_step("write_file", "tests/test_solver.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_solver.py", content=test),
+            tool_step("read_file", "solver.py", content=impl),
+        ]
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_broad_replace_text",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_broad_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "solver.py",
+                },
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["return_shape_contract_mismatch"])
+        self.assertEqual(state["return_shape_impl_blocked_paths"], ["solver.py"])
+        self.assertNotIn("replace_text solver.py with a small unique old_text", state["allowed_next_actions"])
+        self.assertNotIn("write_file solver.py", state["allowed_next_actions"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            [
+                "replace_text tests/test_solver.py with a small unique old_text",
+                "write_file tests/test_solver.py",
+            ],
+        )
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="replace_text",
+            tool_args={
+                "path": "solver.py",
+                "old_text": impl,
+                "new_text": impl.replace("return 0, []", "return [], 0"),
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNotNone(blocked)
+        self.assertEqual(
+            blocked["reason_code"],
+            "implementation_task_failed_unittest_prioritizes_return_shape_surface",
+        )
+        self.assertIn("test/oracle", blocked["suggested_fix"])
+        blocked_actions = "\n".join(blocked["allowed_next_actions"])
+        self.assertNotIn("write_file solver.py", blocked_actions)
+        self.assertNotIn("replace_text solver.py ", blocked_actions)
+
     def test_failed_unittest_after_one_recovery_read_requires_remaining_traceback_read(self) -> None:
         runtime = self.runtime()
         message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
@@ -3505,6 +3681,28 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIn("dynamic_programming:動的計画", profile["signals"])
         self.assertIn("constraint_weak:scheduling", profile["signals"])
 
+    def test_problem_profile_does_not_treat_display_or_generic_graph_as_dp(self) -> None:
+        runtime = self.runtime()
+        user_message = "Pythonでトポロジカルソートを実装し、unittestで検証し、サンプルグラフで実行して並び順を表示して"
+
+        profile = runtime._planning_profile_for_message(user_message)
+
+        self.assertEqual(profile["strategy"], "direct_implementation")
+        self.assertIn("graph:グラフ", profile["signals"])
+        self.assertNotIn("dynamic_programming:表", profile["signals"])
+
+    def test_problem_profile_selects_graph_shortest_path_only_for_shortest_path_requests(self) -> None:
+        runtime = self.runtime()
+        user_message = "Pythonでグラフの最短経路をDijkstraで解く実装と検証を作ってください。"
+
+        profile = runtime._planning_profile_for_message(user_message)
+
+        self.assertEqual(profile["strategy"], "graph_shortest_path")
+        self.assertIn("graph:グラフ", profile["signals"])
+        self.assertTrue(
+            any(str(item).startswith("graph_shortest_path:") for item in profile["signals"])
+        )
+
     def test_stale_plan_record_before_latest_user_message_does_not_bypass_planning_required(self) -> None:
         runtime = self.runtime()
         old_message = "古い状態空間探索タスクを作ってください。"
@@ -4862,6 +5060,11 @@ class GenericRuntimeContractTests(unittest.TestCase):
         test_source = (
             "import unittest\n"
             "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "def brute_force_weighted_interval_scheduling(intervals):\n"
+            "    total = 0\n"
+            "    for item in intervals:\n"
+            "        total += item[2]\n"
+            "    return total\n\n"
             "class TestDP(unittest.TestCase):\n"
             "    def test_base_case(self):\n"
             "        result = weighted_interval_scheduling([])\n"
@@ -4869,7 +5072,7 @@ class GenericRuntimeContractTests(unittest.TestCase):
             "    def test_recurrence_sample_oracle(self):\n"
             "        intervals = [(1, 2, 5, 'a'), (3, 4, 7, 'b')]\n"
             "        result = weighted_interval_scheduling(intervals)\n"
-            "        self.assertEqual(result['max_weight'], 12)\n"
+            "        self.assertEqual(result['max_weight'], brute_force_weighted_interval_scheduling(intervals))\n"
         )
 
         issues = runtime._test_source_contract_issues(
@@ -4878,6 +5081,685 @@ class GenericRuntimeContractTests(unittest.TestCase):
         )
 
         self.assertNotIn("solver/compute callableを直接呼んでいません", "\n".join(issues))
+
+    def test_dynamic_programming_source_contract_accepts_structural_callable_without_explicit_api(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成して実行して表示して。"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def weighted_interval_scheduling(intervals):\n"
+            "    if not intervals:\n"
+            "        return 0, []\n"
+            "    intervals = sorted(intervals, key=lambda item: item[1])\n"
+            "    dp = [0] * len(intervals)\n"
+            "    dp[0] = intervals[0][2]\n"
+            "    for index in range(1, len(intervals)):\n"
+            "        include_weight = intervals[index][2]\n"
+            "        dp[index] = max(dp[index - 1], include_weight)\n"
+            "    return dp[-1], []\n"
+        )
+
+        issues = runtime._implementation_source_contract_issues(
+            user_message=user_message,
+            source=implementation_source,
+        )
+
+        self.assertNotIn("programmatic callableが見つかりません", "\n".join(issues))
+
+    def test_dynamic_programming_test_contract_accepts_imported_domain_callable_without_solver_name(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成して実行して表示して。"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "def reference_weighted_interval_scheduling(intervals):\n"
+            "    total = 0\n"
+            "    for item in intervals:\n"
+            "        total += item[2]\n"
+            "    return total\n\n"
+            "class TestWeightedIntervalScheduling(unittest.TestCase):\n"
+            "    def test_empty_intervals_base_case(self):\n"
+            "        result = weighted_interval_scheduling([])\n"
+            "        self.assertEqual(result, (0, []))\n\n"
+            "    def test_sample_oracle_two_non_overlapping_intervals(self):\n"
+            "        intervals = [(1, 2, 5), (3, 4, 10)]\n"
+            "        result = weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(result[0], reference_weighted_interval_scheduling(intervals))\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message=user_message,
+            test_sources=[("tests/test_weighted_interval_scheduling.py", test_source)],
+        )
+
+        self.assertNotIn("solver/compute callableを直接呼んでいません", "\n".join(issues))
+        self.assertNotIn("base case と recurrence/sample oracle", "\n".join(issues))
+
+    def test_dynamic_programming_test_contract_treats_oracle_call_as_sample_evidence(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成して実行して表示して。"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "def brute_force_weighted_interval_scheduling(intervals):\n"
+            "    best = 0\n"
+            "    for mask in range(1 << len(intervals)):\n"
+            "        total = 0\n"
+            "        for index, item in enumerate(intervals):\n"
+            "            if mask & (1 << index):\n"
+            "                total += item[2]\n"
+            "        best = max(best, total)\n"
+            "    return best\n\n"
+            "class TestWeightedIntervalScheduling(unittest.TestCase):\n"
+            "    def test_base_case(self):\n"
+            "        result = weighted_interval_scheduling([])\n"
+            "        self.assertEqual(result[0], 0)\n\n"
+            "    def test_small_case(self):\n"
+            "        intervals = [(1, 2, 5), (3, 4, 7)]\n"
+            "        result = weighted_interval_scheduling(intervals)\n"
+            "        expected = brute_force_weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(result[0], expected)\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message=user_message,
+            test_sources=[("tests/test_weighted_interval_scheduling.py", test_source)],
+        )
+
+        self.assertNotIn("base case と recurrence/sample oracle", "\n".join(issues))
+        self.assertNotIn("独立reference/brute-force oracle", "\n".join(issues))
+
+    def test_dynamic_programming_test_contract_rejects_hardcoded_expected_without_independent_oracle(self) -> None:
+        runtime = self.runtime()
+        user_message = "動的計画法で最適化問題を解くPython実装とunittestを作ってください。"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        test_source = (
+            "import unittest\n"
+            "from optimizer import compute_optimum\n\n"
+            "class TestDP(unittest.TestCase):\n"
+            "    def test_base_case(self):\n"
+            "        self.assertEqual(compute_optimum([]), 0)\n\n"
+            "    def test_sample_oracle_case(self):\n"
+            "        values = [5, 6, 4]\n"
+            "        self.assertEqual(compute_optimum(values), 10)\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message=user_message,
+            test_sources=[("tests/test_optimizer.py", test_source)],
+        )
+
+        self.assertIn("独立reference/brute-force oracle", "\n".join(issues))
+
+    def test_dynamic_programming_oracle_block_gives_matching_repair_guidance(self) -> None:
+        runtime = self.runtime()
+        user_message = "動的計画法で最適化問題を解くPython実装とunittestを作ってください。"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        test_source = (
+            "import unittest\n"
+            "from optimizer import compute_optimum\n\n"
+            "class TestDP(unittest.TestCase):\n"
+            "    def test_base_case(self):\n"
+            "        self.assertEqual(compute_optimum([]), 0)\n\n"
+            "    def test_sample_oracle_case(self):\n"
+            "        values = [5, 6, 4]\n"
+            "        self.assertEqual(compute_optimum(values), 10)\n"
+        )
+
+        issue = runtime._python_artifact_contract_issue(
+            user_message=user_message,
+            tool_name="write_file",
+            tool_args={"path": "tests/test_optimizer.py", "content": test_source},
+        )
+
+        self.assertIsNotNone(issue)
+        assert issue is not None
+        self.assertIn("独立reference/brute-force oracle", issue["message"])
+        self.assertIn("brute_force/reference/oracle helper", issue["suggested_fix"])
+        self.assertIn("independent brute_force/reference/oracle helper", issue["next_required_action"])
+
+        runtime._append_session_event(
+            runtime.root,
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": f"write_file がブロックされました: {issue['message']}",
+                "code": "edit_blocked",
+                "reason_code": issue["reason_code"],
+                "details": {
+                    "blocked_tool": "write_file",
+                    "path": "tests/test_optimizer.py",
+                    "suggested_fix": issue["suggested_fix"],
+                    "next_required_action": issue["next_required_action"],
+                },
+            },
+        )
+        state = runtime._implementation_task_progress_state(user_message=user_message, steps=[], session_id="main")
+        prompt = runtime._implementation_task_progress_prompt(state)
+
+        self.assertIn("brute_force/reference/oracle helper", prompt)
+        self.assertIn("hardcoded expected", prompt)
+        self.assertNotIn("None と not None", prompt)
+
+    def test_unittest_failure_signature_ignores_stdout_demo_noise(self) -> None:
+        runtime = self.runtime()
+        stderr = (
+            "FF\n"
+            "======================================================================\n"
+            "FAIL: test_sample (test_solver.TestSolver.test_sample)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_solver.py\", line 10, in test_sample\n"
+            "    self.assertEqual(result[0], 13)\n"
+            "AssertionError: 18 != 13\n"
+        )
+        first = run_step(
+            "python3 -m unittest discover -s tests",
+            ok=False,
+            stderr=stderr,
+            stdout="Selected intervals: [(1, 4, 5)]\nMaximum weight: 15\n",
+        )["tool_result"]
+        second = run_step(
+            "python3 -m unittest discover -s tests",
+            ok=False,
+            stderr=stderr,
+            stdout="",
+        )["tool_result"]
+
+        self.assertEqual(
+            runtime._unittest_failure_signature(first),
+            runtime._unittest_failure_signature(second),
+        )
+
+    def test_dynamic_programming_repeated_self_test_assertion_prioritizes_test_fixture(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成し、サンプルデータで実行して、選ばれた区間と最大重みを表示して"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "def weighted_interval_scheduling(intervals):\n"
+            "    if not intervals:\n"
+            "        return 0, []\n"
+            "    intervals = sorted(intervals, key=lambda item: item[1])\n"
+            "    dp = [0] * len(intervals)\n"
+            "    dp[0] = intervals[0][2]\n"
+            "    for i in range(1, len(intervals)):\n"
+            "        include_weight = intervals[i][2]\n"
+            "        for j in range(i - 1, -1, -1):\n"
+            "            if intervals[j][1] <= intervals[i][0]:\n"
+            "                include_weight += dp[j]\n"
+            "                break\n"
+            "        dp[i] = max(dp[i - 1], include_weight)\n"
+            "    return dp[-1], []\n"
+        )
+        changed_implementation_source = implementation_source + "\n"
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "class TestWeightedIntervalScheduling(unittest.TestCase):\n"
+            "    def test_base_case_empty(self):\n"
+            "        self.assertEqual(weighted_interval_scheduling([])[0], 0)\n\n"
+            "    def test_sample_oracle_case(self):\n"
+            "        intervals = [(1, 2, 5), (3, 5, 6), (6, 7, 3), (8, 9, 4)]\n"
+            "        result = weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(result[0], 13)\n"
+        )
+        stderr = (
+            "F\n"
+            "======================================================================\n"
+            "FAIL: test_sample_oracle_case (test_weighted_interval_scheduling.TestWeightedIntervalScheduling.test_sample_oracle_case)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_weighted_interval_scheduling.py\", line 11, in test_sample_oracle_case\n"
+            "    self.assertEqual(result[0], 13)\n"
+            "AssertionError: 18 != 13\n"
+        )
+        steps = [
+            tool_step("write_file", "weighted_interval_scheduling.py", content=implementation_source),
+            tool_step("write_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr, stdout="demo output\n"),
+            tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            tool_step("read_file", "weighted_interval_scheduling.py", content=implementation_source),
+            tool_step("write_file", "weighted_interval_scheduling.py", content=changed_implementation_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr, stdout=""),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["repeated_unittest_failure_signature"])
+        self.assertTrue(state["algorithmic_test_fixture_value_suspected"])
+        self.assertIn("weighted_interval_scheduling.py", state["test_fixture_value_impl_blocked_paths"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            [
+                "replace_text tests/test_weighted_interval_scheduling.py with a small unique old_text",
+                "write_file tests/test_weighted_interval_scheduling.py",
+            ],
+        )
+
+        after_test_read = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=[*steps, tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source)],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            after_test_read["allowed_next_actions"],
+            [
+                "replace_text tests/test_weighted_interval_scheduling.py with a small unique old_text",
+                "write_file tests/test_weighted_interval_scheduling.py",
+            ],
+        )
+        self.assertTrue(any("自己生成test fixture" in hint for hint in after_test_read["unittest_repair_hints"]))
+
+        block = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            steps=[*steps, tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source)],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            tool_args={"path": "weighted_interval_scheduling.py", "content": changed_implementation_source},
+        )
+        self.assertIsNotNone(block)
+        self.assertEqual(block["reason_code"], "implementation_task_failed_unittest_prioritizes_test_fixture_oracle")
+
+    def test_dynamic_programming_noop_impl_edit_prioritizes_test_fixture_oracle(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成し、サンプルデータで実行して、選ばれた区間と最大重みを表示して"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "def weighted_interval_scheduling(intervals):\n"
+            "    if not intervals:\n"
+            "        return 0, []\n"
+            "    intervals = sorted(intervals, key=lambda item: item[1])\n"
+            "    dp = [0] * len(intervals)\n"
+            "    dp[0] = intervals[0][2]\n"
+            "    for i in range(1, len(intervals)):\n"
+            "        include_weight = intervals[i][2]\n"
+            "        for j in range(i - 1, -1, -1):\n"
+            "            if intervals[j][1] <= intervals[i][0]:\n"
+            "                include_weight += dp[j]\n"
+            "                break\n"
+            "        dp[i] = max(dp[i - 1], include_weight)\n"
+            "    return dp[-1], []\n"
+        )
+        api_aligned_source = implementation_source.replace("return 0, []", "return [], 0").replace(
+            "return dp[-1], []",
+            "return [], dp[-1]",
+        )
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "class TestWeightedIntervalScheduling(unittest.TestCase):\n"
+            "    def test_base_case_empty(self):\n"
+            "        self.assertEqual(weighted_interval_scheduling([]), ([], 0))\n\n"
+            "    def test_recurrence_case(self):\n"
+            "        intervals = [(1, 2, 5), (3, 5, 6), (6, 7, 3), (8, 9, 4)]\n"
+            "        result = weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(result[1], 13)\n"
+        )
+        initial_stderr = (
+            "FF\n"
+            "======================================================================\n"
+            "FAIL: test_base_case_empty (test_weighted_interval_scheduling.TestWeightedIntervalScheduling.test_base_case_empty)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_weighted_interval_scheduling.py\", line 6, in test_base_case_empty\n"
+            "    self.assertEqual(weighted_interval_scheduling([]), ([], 0))\n"
+            "AssertionError: Tuples differ: (0, []) != ([], 0)\n"
+            "======================================================================\n"
+            "FAIL: test_recurrence_case (test_weighted_interval_scheduling.TestWeightedIntervalScheduling.test_recurrence_case)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_weighted_interval_scheduling.py\", line 11, in test_recurrence_case\n"
+            "    self.assertEqual(result[1], 13)\n"
+            "AssertionError: [] != 13\n"
+        )
+        latest_stderr = (
+            "F\n"
+            "======================================================================\n"
+            "FAIL: test_recurrence_case (test_weighted_interval_scheduling.TestWeightedIntervalScheduling.test_recurrence_case)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_weighted_interval_scheduling.py\", line 11, in test_recurrence_case\n"
+            "    self.assertEqual(result[1], 13)\n"
+            "AssertionError: 18 != 13\n"
+        )
+        steps = [
+            tool_step("write_file", "weighted_interval_scheduling.py", content=implementation_source),
+            tool_step("write_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=initial_stderr),
+            tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            tool_step("read_file", "weighted_interval_scheduling.py", content=implementation_source),
+            tool_step("write_file", "weighted_interval_scheduling.py", content=api_aligned_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=latest_stderr),
+            tool_step("read_file", "weighted_interval_scheduling.py", content=api_aligned_source),
+            tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            tool_step(
+                "write_file",
+                "weighted_interval_scheduling.py",
+                content=api_aligned_source,
+                ok=False,
+                failure_type="no_op_edit",
+            ),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertFalse(state["repeated_unittest_failure_signature"])
+        self.assertTrue(state["implementation_noop_after_failed_unittest"])
+        self.assertTrue(state["algorithmic_test_fixture_value_suspected"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            [
+                "replace_text tests/test_weighted_interval_scheduling.py with a small unique old_text",
+                "write_file tests/test_weighted_interval_scheduling.py",
+            ],
+        )
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            tool_args={"path": "weighted_interval_scheduling.py", "content": api_aligned_source},
+        )
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_prioritizes_test_fixture_oracle")
+
+    def test_dynamic_programming_broad_impl_replace_block_prioritizes_test_fixture_oracle(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成し、サンプルデータで実行して、選ばれた区間と最大重みを表示して"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "def weighted_interval_scheduling(intervals):\n"
+            "    if not intervals:\n"
+            "        return 0, []\n"
+            "    intervals = sorted(intervals, key=lambda item: item[1])\n"
+            "    dp = [0] * len(intervals)\n"
+            "    dp[0] = intervals[0][2]\n"
+            "    for i in range(1, len(intervals)):\n"
+            "        include_weight = intervals[i][2]\n"
+            "        for j in range(i - 1, -1, -1):\n"
+            "            if intervals[j][1] <= intervals[i][0]:\n"
+            "                include_weight += dp[j]\n"
+            "                break\n"
+            "        dp[i] = max(dp[i - 1], include_weight)\n"
+            "    return dp[-1], []\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "class TestWeightedIntervalScheduling(unittest.TestCase):\n"
+            "    def test_recurrence_case(self):\n"
+            "        intervals = [(1, 2, 5), (3, 5, 6), (6, 7, 5)]\n"
+            "        result = weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(result[0], 10)\n"
+        )
+        stderr = (
+            "F\n"
+            "======================================================================\n"
+            "FAIL: test_recurrence_case (test_weighted_interval_scheduling.TestWeightedIntervalScheduling.test_recurrence_case)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_weighted_interval_scheduling.py\", line 8, in test_recurrence_case\n"
+            "    self.assertEqual(result[0], 10)\n"
+            "AssertionError: 16 != 10\n"
+        )
+        steps = [
+            tool_step("write_file", "weighted_interval_scheduling.py", content=implementation_source),
+            tool_step("write_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            tool_step("read_file", "weighted_interval_scheduling.py", content=implementation_source),
+        ]
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_broad_replace_text",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_broad_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "weighted_interval_scheduling.py",
+                },
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["implementation_replace_blocked_after_failed_unittest"])
+        self.assertTrue(state["algorithmic_test_fixture_value_suspected"])
+        self.assertNotIn("write_file weighted_interval_scheduling.py", state["allowed_next_actions"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            [
+                "replace_text tests/test_weighted_interval_scheduling.py with a small unique old_text",
+                "write_file tests/test_weighted_interval_scheduling.py",
+            ],
+        )
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            tool_args={"path": "weighted_interval_scheduling.py", "content": implementation_source},
+        )
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_prioritizes_test_fixture_oracle")
+
+    def test_dynamic_programming_independent_oracle_failure_allows_implementation_repair(self) -> None:
+        runtime = self.runtime()
+        user_message = "weighted interval scheduling を解く Python プログラムを作成し、サンプルデータで実行して、選ばれた区間と最大重みを表示して"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "def weighted_interval_scheduling(intervals):\n"
+            "    if not intervals:\n"
+            "        return 0, []\n"
+            "    intervals = sorted(intervals, key=lambda item: item[1])\n"
+            "    dp = [0] * len(intervals)\n"
+            "    dp[0] = intervals[0][2]\n"
+            "    for index in range(1, len(intervals)):\n"
+            "        include_weight = intervals[index][2]\n"
+            "        dp[index] = max(dp[index - 1], include_weight)\n"
+            "    return dp[-1], list(intervals)\n"
+        )
+        repaired_source = implementation_source.replace("return dp[-1], list(intervals)", "return dp[-1], [intervals[-1]]")
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "def brute_force_weighted_interval_scheduling(intervals):\n"
+            "    best_weight = 0\n"
+            "    best_items = []\n"
+            "    for item in intervals:\n"
+            "        if item[2] > best_weight:\n"
+            "            best_weight = item[2]\n"
+            "            best_items = [item]\n"
+            "    return best_weight, best_items\n\n"
+            "class TestWeightedIntervalScheduling(unittest.TestCase):\n"
+            "    def test_base_case_empty(self):\n"
+            "        self.assertEqual(weighted_interval_scheduling([]), (0, []))\n\n"
+            "    def test_sample_oracle_case(self):\n"
+            "        intervals = [(1, 3, 5), (2, 5, 6)]\n"
+            "        actual_weight, actual_items = weighted_interval_scheduling(intervals)\n"
+            "        expected_weight, expected_items = brute_force_weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(actual_weight, expected_weight)\n"
+            "        self.assertEqual(len(actual_items), len(expected_items))\n"
+        )
+        stderr = (
+            "F\n"
+            "======================================================================\n"
+            "FAIL: test_sample_oracle_case (test_weighted_interval_scheduling.TestWeightedIntervalScheduling.test_sample_oracle_case)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_weighted_interval_scheduling.py\", line 20, in test_sample_oracle_case\n"
+            "    self.assertEqual(len(actual_items), len(expected_items))\n"
+            "AssertionError: 2 != 1\n"
+        )
+        steps = [
+            tool_step("write_file", "weighted_interval_scheduling.py", content=implementation_source),
+            tool_step("write_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_weighted_interval_scheduling.py", content=test_source),
+            tool_step("read_file", "weighted_interval_scheduling.py", content=implementation_source),
+        ]
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_broad_replace_text",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_broad_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "weighted_interval_scheduling.py",
+                },
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["algorithmic_independent_oracle_seen"])
+        self.assertFalse(state["algorithmic_test_fixture_value_suspected"])
+        self.assertIn("write_file weighted_interval_scheduling.py", state["allowed_next_actions"])
+
+        allowed = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            tool_args={"path": "weighted_interval_scheduling.py", "content": repaired_source},
+        )
+        self.assertIsNone(allowed)
 
     def test_constraint_satisfaction_tests_require_validator_and_negative_case(self) -> None:
         runtime = self.runtime()
@@ -5648,12 +6530,18 @@ class GenericRuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(state["phase"], "unittest_failed_needs_fix")
         self.assertTrue(state["repair_generation_repetitive_output"])
+        allowed_actions = "\n".join(state["allowed_next_actions"])
+        self.assertIn("replace_text tests/test_puzzle_solver.py", allowed_actions)
+        self.assertIn("replace_text puzzle_solver.py", allowed_actions)
+        self.assertNotIn("write_file tests/test_puzzle_solver.py", allowed_actions)
         hints = "\n".join(state["unittest_repair_hints"])
         self.assertIn("返却値・例外・入力検証契約", hints)
         self.assertIn("根拠がある側だけを小さく修正", hints)
 
         prompt = runtime._implementation_task_progress_prompt(state)
         self.assertIn("直近のrepair生成は repetitive_output", prompt)
+        self.assertIn("全文再生成失敗", prompt)
+        self.assertIn("write_fileでファイル全体を再出力せず", prompt)
         self.assertIn("old_textは失敗行に関係する1つの関数または数行だけ", prompt)
         self.assertIn("class全体", prompt)
         self.assertIn("失敗signatureを変える最小編集", prompt)
@@ -7056,6 +7944,115 @@ class GenericRuntimeContractTests(unittest.TestCase):
         )
         self.assertIsNone(allowed_impl)
 
+    def test_failed_unittest_implementation_exception_does_not_switch_to_test_repair(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonでグラフ処理を実装し、unittestで検証し、サンプルで実行して表示してください。"
+        impl = (
+            "def order_graph(graph):\n"
+            "    queue = [node for node in graph if not graph[node]]\n"
+            "    result = []\n"
+            "    while queue:\n"
+            "        node = queue.pop(0)\n"
+            "        result.append(node)\n"
+            "    if len(result) != len(graph):\n"
+            "        raise ValueError('graph cycle')\n"
+            "    return result\n"
+        )
+        fixed_impl = (
+            "def order_graph(graph):\n"
+            "    result = []\n"
+            "    temporary = set()\n"
+            "    permanent = set()\n"
+            "\n"
+            "    def visit(node):\n"
+            "        if node in permanent:\n"
+            "            return\n"
+            "        if node in temporary:\n"
+            "            raise ValueError('graph cycle')\n"
+            "        temporary.add(node)\n"
+            "        for dependency in graph.get(node, []):\n"
+            "            visit(dependency)\n"
+            "        temporary.remove(node)\n"
+            "        permanent.add(node)\n"
+            "        result.append(node)\n"
+            "\n"
+            "    for node in graph:\n"
+            "        visit(node)\n"
+            "    return result\n"
+        )
+        test = (
+            "import unittest\n"
+            "from graph_tools import order_graph\n\n"
+            "class TestGraphTools(unittest.TestCase):\n"
+            "    def test_dependency_order(self):\n"
+            "        graph = {'a': ['b'], 'b': ['c'], 'c': []}\n"
+            "        self.assertEqual(order_graph(graph), ['c', 'b', 'a'])\n"
+        )
+        stderr = (
+            "E\n"
+            "======================================================================\n"
+            "ERROR: test_dependency_order (test_graph_tools.TestGraphTools.test_dependency_order)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_graph_tools.py'}\", line 7, in test_dependency_order\n"
+            "    self.assertEqual(order_graph(graph), ['c', 'b', 'a'])\n"
+            f"  File \"{runtime.execution_root / 'graph_tools.py'}\", line 7, in order_graph\n"
+            "    raise ValueError('graph cycle')\n"
+            "ValueError: graph cycle\n"
+        )
+        steps = [
+            tool_step("write_file", "graph_tools.py", content=impl),
+            tool_step("write_file", "tests/test_graph_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_graph_tools.py", content=test),
+            tool_step("read_file", "graph_tools.py", content=impl),
+            tool_step("write_file", "graph_tools.py", content=impl, ok=False, failure_type="no_op_edit"),
+            tool_step("write_file", "graph_tools.py", content=impl, ok=False, failure_type="no_op_edit"),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["latest_unittest_points_to_implementation_exception"])
+        self.assertEqual(state["failed_unittest_repair_target_paths"], ["graph_tools.py"])
+        self.assertEqual(state["failed_unittest_repeated_noop_paths"], ["graph_tools.py"])
+        self.assertEqual(state["failed_unittest_noop_blocked_paths"], [])
+        self.assertEqual(state["allowed_next_actions"], ["write_file graph_tools.py"])
+        self.assertNotIn("write_file tests/test_graph_tools.py", state["allowed_next_actions"])
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("implementation traceback修復契約", prompt)
+
+        blocked_test_rewrite = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={
+                "path": "tests/test_graph_tools.py",
+                "content": test.replace("['c', 'b', 'a']", "['a']"),
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_test_rewrite["reason_code"],
+            "implementation_task_failed_unittest_requires_write_after_no_match",
+        )
+        self.assertEqual(blocked_test_rewrite["allowed_next_actions"], ["write_file graph_tools.py"])
+
+        allowed_impl_rewrite = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "graph_tools.py", "content": fixed_impl},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_impl_rewrite)
+
     def test_failed_unittest_no_match_still_allows_unread_traceback_file_read(self) -> None:
         runtime = self.runtime()
         message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
@@ -7321,6 +8318,170 @@ class GenericRuntimeContractTests(unittest.TestCase):
         state = runtime._implementation_task_progress_state(user_message=message, steps=audited_steps)
         self.assertEqual(state["phase"], "external_contract_satisfied")
         self.assertEqual(state["allowed_next_actions"], ["finish"])
+
+    def test_unittest_success_with_display_request_requires_stdout_result(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証し、実行して表示してください。"
+        impl = (
+            "def add_one(value):\n"
+            "    return value + 1\n\n"
+            "if __name__ == '__main__':\n"
+            "    print(add_one(1))\n"
+        )
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        audited_steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=True, stderr=".\nOK\n"),
+            run_step("python3 -m unittest discover -s tests", ok=True, stderr=".\nOK\n"),
+        ]
+
+        state = runtime._implementation_task_progress_state(user_message=message, steps=audited_steps)
+
+        self.assertEqual(state["phase"], "result_display_required")
+        self.assertEqual(state["contract_state"], "incomplete")
+        self.assertEqual(state["missing_requirements"], ["stdout_displayed"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            [
+                "run_command <non-interactive demo or verifier command that prints the requested visible result to stdout>"
+            ],
+        )
+
+        recovery = runtime._completion_contract_recovery_action(
+            session_id="main",
+            user_message=message,
+            steps=audited_steps,
+            step_index=4,
+            max_steps=20,
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery["reason_code"], "completion_contract_stdout_recovery")
+        self.assertEqual(recovery["tool_args"]["command"], "python3 math_tools.py")
+
+        displayed_steps = [
+            *audited_steps,
+            run_step("python3 math_tools.py", ok=True, stdout="2\n"),
+        ]
+        state = runtime._implementation_task_progress_state(user_message=message, steps=displayed_steps)
+        self.assertEqual(state["phase"], "external_contract_satisfied")
+        final_answer = runtime._implementation_contract_final_answer(
+            user_message=message,
+            steps=displayed_steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNotNone(final_answer)
+        assert final_answer is not None
+        self.assertIn("表示結果:", final_answer)
+        self.assertIn("2", final_answer)
+        self.assertIn("ユーザー向け表示結果: satisfied", final_answer)
+        self.assertEqual(final_answer.count("- tests/test_math_tools.py"), 1)
+
+    def test_result_display_required_blocks_repeating_empty_stdout_command(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、unittestで検証し、サンプルで実行して表示してください。"
+        impl = "def add_one(value):\n    return value + 1\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=True, stderr=".\nOK\n"),
+            run_step("python3 -m unittest discover -s tests", ok=True, stderr=".\nOK\n"),
+            run_step("python3 math_tools.py", ok=True, stdout=""),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "result_display_required")
+        self.assertEqual(state["successful_empty_stdout_commands"], ["python3 math_tools.py"])
+        self.assertEqual(state["missing_requirements"], ["stdout_displayed"])
+        self.assertIn(
+            "run_command <non-interactive python -c/import command that prints a concrete sample result to stdout>",
+            state["allowed_next_actions"],
+        )
+        self.assertIn(
+            "replace_text math_tools.py with a small unique old_text to add __main__ demo printing sample result",
+            state["allowed_next_actions"],
+        )
+        self.assertIn("write_file math_tools.py", state["allowed_next_actions"])
+        self.assertIn("空stdout実行の反復禁止", runtime._implementation_task_progress_prompt(state))
+
+        blocked_repeat = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="run_command",
+            tool_args={"command": "python3 math_tools.py"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_repeat["reason_code"],
+            "implementation_task_result_display_blocks_repeated_empty_stdout_command",
+        )
+
+        blocked_unittest = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="run_command",
+            tool_args={"command": "python3 -m unittest discover -s tests"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_unittest["reason_code"],
+            "implementation_task_result_display_blocks_unittest_rerun",
+        )
+
+        allowed_demo_command = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="run_command",
+            tool_args={"command": "python3 -c \"from math_tools import add_one; print(add_one(2))\""},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_demo_command)
+
+        allowed_demo_edit = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={
+                "path": "math_tools.py",
+                "content": impl + "\nif __name__ == '__main__':\n    print(add_one(2))\n",
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_demo_edit)
+
+        blocked_finish = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="finish",
+            tool_args={},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(blocked_finish["reason_code"], "implementation_task_phase_requires_result_display")
 
     def test_external_audit_required_blocks_finish_until_second_unittest(self) -> None:
         runtime = self.runtime()

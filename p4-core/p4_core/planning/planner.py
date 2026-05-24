@@ -140,7 +140,7 @@ def profile_problem(user_message: str) -> dict[str, Any]:
         "漸化式",
         "部分問題",
         "最適値",
-        "表",
+        "dp表",
         "テーブル",
         "最適部分構造",
         "memoization",
@@ -148,6 +148,7 @@ def profile_problem(user_message: str) -> dict[str, Any]:
         "recurrence",
         "state transition",
         "transition table",
+        "weighted interval scheduling",
     )
     strong_constraint_markers = (
         "制約",
@@ -162,14 +163,20 @@ def profile_problem(user_message: str) -> dict[str, Any]:
         "scheduling",
         "schedule",
     )
-    graph_markers = (
-        "グラフ",
+    graph_shortest_path_markers = (
         "最短経路",
         "shortest path",
         "dijkstra",
         "astar",
+        "a*",
+    )
+    graph_generic_markers = (
+        "グラフ",
         "network",
         "graph",
+        "トポロジカル",
+        "topological sort",
+        "toposort",
     )
     classical_markers = (
         "pddl",
@@ -197,10 +204,13 @@ def profile_problem(user_message: str) -> dict[str, Any]:
     if matched:
         strategy = "state_space_search"
         signals.extend(f"state_space:{item}" for item in matched[:8])
-    matched = _contains_any(text, graph_markers)
+    matched = _contains_any(text, graph_generic_markers)
+    if matched:
+        signals.extend(f"graph:{item}" for item in matched[:6])
+    matched = _contains_any(text, graph_shortest_path_markers)
     if matched:
         strategy = "graph_shortest_path"
-        signals.extend(f"graph:{item}" for item in matched[:6])
+        signals.extend(f"graph_shortest_path:{item}" for item in matched[:6])
     matched = _contains_any(text, dp_markers)
     if matched:
         strategy = "dynamic_programming"

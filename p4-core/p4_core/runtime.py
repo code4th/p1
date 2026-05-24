@@ -16,6 +16,13 @@ from typing import Any, Iterable
 
 from p4_core.frames import FrameManager
 from p4_core.config_defaults import DEFAULT_TOOL_CONTENT_CHUNK_BYTES
+from p4_core.implementation_contracts import (
+    DYNAMIC_PROGRAMMING_ORACLE_TOKENS,
+    dynamic_programming_independent_oracle_seen,
+    dynamic_programming_callable_names,
+    python_call_name,
+    test_calls_implementation_callable,
+)
 from p4_core.models import ModelRouter
 from p4_core.ollama_client import OllamaChatClient
 from p4_core.output_contract import stdout_looks_like_user_visible_result
@@ -1782,30 +1789,12 @@ class AgentRuntime:
             tree = ast.parse(text)
         except SyntaxError:
             return []
-        callable_names = [
-            node.name.lower()
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        ]
         requested_function_names = {
             name.lower()
             for name in self._requested_top_level_function_names(user_message)
         }
-        solverish_tokens = (
-            "solve",
-            "compute",
-            "count",
-            "optimize",
-            "optimal",
-            "best",
-            "dp",
-            "memo",
-            "tabulate",
-        )
-        has_requested_callable = bool(requested_function_names & set(callable_names))
-        has_solverish_callable = has_requested_callable or any(
-            any(token in name for token in solverish_tokens)
-            for name in callable_names
+        has_solverish_callable = bool(
+            dynamic_programming_callable_names(text, requested_names=requested_function_names)
         )
         lowered = text.lower()
         has_memo_or_table = any(
@@ -2449,25 +2438,6 @@ class AgentRuntime:
         if str(self._plan_record_execution_context().get("plan_strategy") or "") != "dynamic_programming":
             return []
 
-        def call_name(call: ast.Call) -> str:
-            func = call.func
-            if isinstance(func, ast.Name):
-                return func.id.lower()
-            if isinstance(func, ast.Attribute):
-                return func.attr.lower()
-            return ""
-
-        solverish_tokens = (
-            "solve",
-            "compute",
-            "count",
-            "optimize",
-            "optimal",
-            "best",
-            "dp",
-            "memo",
-            "tabulate",
-        )
         requested_function_names = {
             name.lower()
             for name in self._requested_top_level_function_names(user_message)
@@ -2484,10 +2454,17 @@ class AgentRuntime:
             "assertless",
             "assertlessequal",
         }
-        solver_test_seen = False
+        solver_test_seen = test_calls_implementation_callable(
+            test_sources,
+            requested_names=requested_function_names,
+        )
+        independent_oracle_seen = dynamic_programming_independent_oracle_seen(
+            test_sources,
+            requested_names=requested_function_names,
+        )
         assertion_count = 0
-        base_or_sample_seen = False
-        recurrence_or_transition_seen = False
+        base_seen = False
+        recurrence_or_sample_seen = False
         for _path, source in test_sources:
             try:
                 tree = ast.parse(str(source or ""))
@@ -2500,36 +2477,95 @@ class AgentRuntime:
                     continue
                 test_source = ast.get_source_segment(str(source or ""), node) or ""
                 lowered = test_source.lower()
-                calls = [call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
-                if any(name in requested_function_names for name in calls if name) or any(
-                    any(token in name for token in solverish_tokens)
-                    for name in calls
-                    if name
-                ):
-                    solver_test_seen = True
+                calls = [python_call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
                 assertion_count += sum(1 for name in calls if name in assertion_names)
                 if (
-                    any(token in lowered for token in ("base", "base_case", "sample", "oracle", "initial"))
+                    any(token in lowered for token in ("base", "base_case", "initial"))
                     or any(token in test_source for token in ("基底", "初期", "期待値"))
                 ):
-                    base_or_sample_seen = True
+                    base_seen = True
                 if (
-                    any(token in lowered for token in ("recurrence", "transition", "subproblem", "memo", "table", "dp"))
+                    any(token in lowered for token in ("recurrence", "transition", "subproblem", "memo", "table", "dp", "sample", "oracle"))
                     or any(token in test_source for token in ("漸化", "遷移", "部分問題"))
+                    or any(
+                        any(token in name for token in DYNAMIC_PROGRAMMING_ORACLE_TOKENS)
+                        for name in calls
+                        if name
+                    )
                 ):
-                    recurrence_or_transition_seen = True
+                    recurrence_or_sample_seen = True
         issues: list[str] = []
         if not solver_test_seen:
             issues.append(
                 "dynamic_programming test artifact が solver/compute callableを直接呼んでいません。"
                 "PlanRecordの実行証拠として、DP本体を呼び出し期待値と比較するunittestを追加してください。"
             )
-        if assertion_count < 2 or not base_or_sample_seen or not recurrence_or_transition_seen:
+        if assertion_count < 2 or not base_seen or not recurrence_or_sample_seen:
             issues.append(
                 "dynamic_programming test artifact は base case と recurrence/sample oracle の両方を観測可能に検証していません。"
                 "最小subproblemの期待値と、漸化式またはDP表更新で導かれるsampleケースを別々にassertしてください。"
             )
+        if not independent_oracle_seen:
+            issues.append(
+                "dynamic_programming test artifact が小さい入力用の独立reference/brute-force oracleを持っていません。"
+                "runtimeは自己生成hardcoded expectedを正本扱いしないため、実装本体を呼ばない"
+                "brute_force/reference/oracle helperで期待値を導出し、その結果とDP本体を比較してください。"
+            )
         return issues
+
+    def _test_artifact_contract_guidance(
+        self,
+        *,
+        issue_text: str,
+        plan_strategy: str,
+    ) -> dict[str, str]:
+        """Return prompt/action guidance derived from the same test issue.
+
+        Runtime must not reject a candidate for one contract violation and then
+        guide the model with an unrelated generic repair. The blocked message,
+        suggested_fix, and next_required_action are one control contract.
+        """
+
+        issue = str(issue_text or "")
+        strategy = str(plan_strategy or "")
+        if strategy == "dynamic_programming" and "独立reference/brute-force oracle" in issue:
+            guidance = (
+                "tests/test_*.py に、実装本体を呼ばない brute_force/reference/oracle helper を追加してください。"
+                "小さい入力だけを対象に全列挙または単純な基準実装で期待値を導出し、"
+                "その結果とDP本体の戻り値を比較するunittestにしてください。"
+            )
+            return {
+                "suggested_fix": guidance,
+                "next_required_action": (
+                    "rewrite the test artifact with an independent brute_force/reference/oracle helper "
+                    "that does not call the implementation under test"
+                ),
+            }
+        if strategy == "dynamic_programming":
+            guidance = (
+                "base case と recurrence/sample oracle を別々にassertし、"
+                "DP本体のprogrammatic callableを直接呼ぶunittestにしてください。"
+            )
+            return {
+                "suggested_fix": guidance,
+                "next_required_action": "rewrite the test artifact so it directly validates the DP callable contract",
+            }
+        if strategy == "constraint_satisfaction":
+            guidance = (
+                "solverの戻り値をconstraint checker / solution validatorへ渡し、"
+                "valid assignment成功とinvalid/negative assignment拒否をassertするunittestにしてください。"
+            )
+            return {
+                "suggested_fix": guidance,
+                "next_required_action": "rewrite the test artifact around a constraint validator and negative fixture",
+            }
+        guidance = (
+            "solver/searchの戻り値をlegal move replayまたはfinal_verifierへ渡し、goal到達をassertするunittestにしてください。"
+        )
+        return {
+            "suggested_fix": guidance,
+            "next_required_action": "rewrite the test artifact around legal replay or final_verifier evidence",
+        }
 
     def _constraint_satisfaction_test_contract_issues(self, test_sources: list[tuple[str, str]]) -> list[str]:
         """Return generic test-artifact issues for constraint-satisfaction plans."""
@@ -2853,38 +2889,36 @@ class AgentRuntime:
             )
             if plan_test_issues:
                 plan_strategy = str(self._plan_record_execution_context().get("plan_strategy") or "")
-                if plan_strategy == "dynamic_programming":
-                    suggested_fix = (
-                        "base case と recurrence/sample oracle を別々にassertし、DP本体のcompute/solve callableを直接呼ぶunittestにしてください。"
-                    )
-                elif plan_strategy == "constraint_satisfaction":
-                    suggested_fix = (
-                        "solverの戻り値をconstraint checker / solution validatorへ渡し、valid assignment成功とinvalid/negative assignment拒否をassertするunittestにしてください。"
-                    )
-                else:
-                    suggested_fix = (
-                        "solver/searchの戻り値をlegal move replayまたはfinal_verifierへ渡し、goal到達をassertするunittestにしてください。"
-                    )
+                guidance = self._test_artifact_contract_guidance(
+                    issue_text=plan_test_issues[0],
+                    plan_strategy=plan_strategy,
+                )
+                suggested_fix = guidance["suggested_fix"]
+                next_required_action = guidance["next_required_action"]
                 if "contradictory predicate expectations" in plan_test_issues[0]:
                     suggested_fix = (
                         "同じ入力fixtureを同じpredicateでTrue/False両方に期待しています。"
                         "片方の期待値を直すか、not-solved用fixtureとgoal用fixtureを別状態に分けてください。"
                     )
+                    next_required_action = "split solvable and not-solved fixtures so each predicate expectation is consistent"
                 elif "contradictory call-result expectations" in plan_test_issues[0]:
                     suggested_fix = (
                         "同じ入力fixtureを同じcallableでNone/not None両方に期待しています。"
                         "solvable fixtureとno-solution fixtureを別状態に分け、各期待を一貫させてください。"
                     )
+                    next_required_action = "split solvable and no-solution fixtures before retrying the test artifact"
                 elif "no-solution/unsolvable" in plan_test_issues[0]:
                     suggested_fix = (
                         "no-solution系testはsolvability_check単体、またはmax_depth/max_nodes/timeout等の"
                         "明示境界付きsolver呼び出しに縮小してください。"
                     )
+                    next_required_action = "bound the no-solution test or validate solvability separately"
                 return {
                     "reason_code": "test_artifact_contract_incomplete",
                     "message": plan_test_issues[0],
                     "allowed_next_actions": ["write_file", "replace_text"],
                     "suggested_fix": suggested_fix,
+                    "next_required_action": next_required_action,
                 }
             large_fixture_issue = self._test_source_large_fixture_issue(
                 user_message=user_message,
@@ -6441,6 +6475,7 @@ class AgentRuntime:
         output = re.sub(r'File "([^"]+)"', lambda match: f'File "{Path(match.group(1)).name}"', output)
         output = re.sub(r", line \d+", ", line <n>", output)
         output = re.sub(r"line \d+", "line <n>", output)
+        output = self._unittest_failure_signature_body(output)
         payload = json.dumps(
             {"command": command, "output": output[-4000:]},
             ensure_ascii=False,
@@ -6448,6 +6483,89 @@ class AgentRuntime:
             separators=(",", ":"),
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _unittest_failure_signature_body(self, output: str) -> str:
+        """Extract the semantic failure body and ignore stdout/demo noise."""
+
+        interesting: list[str] = []
+        for raw_line in str(output or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(("FAIL:", "ERROR:")):
+                interesting.append(line)
+                continue
+            if line.startswith("File "):
+                interesting.append(line)
+                continue
+            if re.search(r"\bself\.assert[A-Za-z0-9_]*\b|\bassert[A-Z][A-Za-z0-9_]*\b", line):
+                interesting.append(line)
+                continue
+            if re.match(
+                r"^(AssertionError|SyntaxError|ImportError|ModuleNotFoundError|NameError|TypeError|ValueError|"
+                r"IndexError|KeyError|AttributeError|RuntimeError|Exception|Error):",
+                line,
+            ):
+                interesting.append(line)
+        return "\n".join(interesting) if interesting else str(output or "")
+
+    def _unittest_output_looks_like_test_value_assertion(self, output: str) -> bool:
+        text = str(output or "")
+        if "AssertionError" not in text:
+            return False
+        value_failure_markers = (
+            " != ",
+            "Lists differ:",
+            "Tuples differ:",
+            "Dictionaries differ:",
+            "not equal",
+            "False is not true",
+            "True is not false",
+            "unexpectedly None",
+            "not raised",
+        )
+        return any(marker in text for marker in value_failure_markers)
+
+    def _unittest_output_return_shape_hint(self, output: str) -> str:
+        text = str(output or "")
+        if "AssertionError" not in text or " != " not in text:
+            return ""
+
+        def value_shape(value: str) -> str:
+            stripped = value.strip()
+            if stripped.startswith(("[", "(", "{")):
+                return "container"
+            if re.match(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$", stripped):
+                return "scalar"
+            if stripped in {"True", "False", "None"}:
+                return "scalar"
+            if (
+                len(stripped) >= 2
+                and stripped[0] in {"'", '"'}
+                and stripped[-1] == stripped[0]
+            ):
+                return "scalar"
+            return "unknown"
+
+        examples: list[str] = []
+        for match in re.finditer(r"AssertionError:\s*([^\n]+?)\s+!=\s+([^\n]+)", text):
+            left = match.group(1).strip()
+            right = match.group(2).strip()
+            shapes = {value_shape(left), value_shape(right)}
+            if shapes == {"scalar", "container"}:
+                examples.append(f"{left} != {right}")
+            if len(examples) >= 3:
+                break
+        if not examples:
+            return ""
+
+        return (
+            "返却shape/API契約不一致の疑いがあります。unittestがscalar値とsequence/containerを比較しています"
+            f"（例: {'; '.join(examples)}）。"
+            "アルゴリズム本体を書き換える前に、公開関数のdocstring/仕様、test側のunpack順序、"
+            "reference/brute_force/oracle helperの戻り値shapeを同一契約に揃えてください。"
+            "関数がtupleを返す場合は、実装・test・oracleのすべてで戻り値の順序を一致させてください。"
+        )
 
     def _repo_map_excerpt_for_workspace(self, turn_workspace: Path | None) -> str:
         if turn_workspace is None:
@@ -6574,6 +6692,7 @@ class AgentRuntime:
         test_paths = [path for path in artifact_paths if _artifact_path_is_test(path)]
         latest_impl_path = implementation_paths[-1] if implementation_paths else ""
         latest_test_path = test_paths[-1] if test_paths else ""
+        successful_empty_stdout_commands = self._successful_empty_stdout_commands_after_last_artifact_write(steps)
 
         def source_for(path: str) -> str:
             if not path:
@@ -6804,6 +6923,25 @@ class AgentRuntime:
             _artifact_path_is_test(str(item).replace("\\", "/"))
             for item in latest_failed_unittest_paths
         )
+        latest_failed_unittest_impl_paths = [
+            str(item).replace("\\", "/")
+            for item in latest_failed_unittest_paths
+            if _artifact_path_is_python_implementation(str(item).replace("\\", "/"))
+        ]
+        latest_unittest_test_value_assertion = self._unittest_output_looks_like_test_value_assertion(
+            latest_unittest_output_for_triage,
+        )
+        latest_unittest_return_shape_hint = self._unittest_output_return_shape_hint(
+            latest_unittest_output_for_triage,
+        )
+        return_shape_contract_mismatch = bool(latest_unittest_return_shape_hint)
+        latest_unittest_points_to_implementation_exception = (
+            bool(latest_failed_unittest_impl_paths)
+            and not latest_unittest_failed_paths_are_tests
+            and not latest_unittest_test_value_assertion
+            and not return_shape_contract_mismatch
+            and "Traceback" in latest_unittest_output_for_triage
+        )
         state_space_test_impl_contract_suspected = False
         state_space_test_fixture_value_suspected = False
         if plan_strategy == "state_space_search" and latest_unittest_failed_paths_are_tests:
@@ -6862,11 +7000,84 @@ class AgentRuntime:
             and latest_test_path
             and "AssertionError" in latest_unittest_output_for_triage
         )
+        same_signature_nonreducing_edit_path_set = (
+            {
+                str(item).replace("\\", "/")
+                for item in same_signature_nonreducing_edit_paths
+                if str(item).strip()
+            }
+            if repeated_unittest_failure_signature
+            else set()
+        )
         failed_unittest_recovery_read_paths: list[str] = []
+        blocked_failed_unittest_replace_paths = [
+            item
+            for item in self._blocked_failed_unittest_replace_paths(session_id=session_id)
+        ]
+        algorithmic_test_fixture_value_suspected = False
+        algorithmic_test_fixture_value_impl_blocked_paths: list[str] = []
+        algorithmic_test_fixture_strategies = {
+            "dynamic_programming",
+            "constraint_satisfaction",
+            "graph_shortest_path",
+            "classical_planning",
+        }
+        algorithmic_independent_oracle_seen = (
+            dynamic_programming_independent_oracle_seen(
+                latest_test_sources,
+                requested_names=self._requested_top_level_function_names(user_message),
+            )
+            if plan_strategy == "dynamic_programming"
+            else False
+        )
+        implementation_noop_after_failed_unittest = False
+        if latest_failed_unittest_index >= 0 and latest_impl_path:
+            impl_recovery_for_fixture = self._latest_edit_match_failure_recovery(
+                steps=steps,
+                path=latest_impl_path,
+            )
+            implementation_noop_after_failed_unittest = (
+                bool(impl_recovery_for_fixture)
+                and int(impl_recovery_for_fixture.get("failure_index") or -1) > latest_failed_unittest_index
+                and str(impl_recovery_for_fixture.get("failure_type") or "") == "no_op_edit"
+                and not bool(impl_recovery_for_fixture.get("successful_edit_after_failure"))
+                and latest_test_path in latest_read_paths_after_failed_unittest
+                and latest_impl_path in latest_read_paths_after_failed_unittest
+            )
+        implementation_replace_blocked_after_failed_unittest = (
+            latest_failed_unittest_index >= 0
+            and bool(latest_impl_path)
+            and latest_impl_path in blocked_failed_unittest_replace_paths
+            and latest_test_path in latest_read_paths_after_failed_unittest
+            and latest_impl_path in latest_read_paths_after_failed_unittest
+        )
+        return_shape_impl_blocked_paths: list[str] = []
+        if return_shape_contract_mismatch and implementation_replace_blocked_after_failed_unittest and latest_impl_path:
+            return_shape_impl_blocked_paths.append(latest_impl_path)
+        algorithmic_test_fixture_oracle_evidence = (
+            (
+                repeated_unittest_failure_signature
+                and any(_artifact_path_is_python_implementation(path) for path in same_signature_nonreducing_edit_path_set)
+            )
+            or implementation_noop_after_failed_unittest
+            or implementation_replace_blocked_after_failed_unittest
+        )
+        if (
+            plan_strategy in algorithmic_test_fixture_strategies
+            and latest_unittest_failed_paths_are_tests
+            and latest_unittest_test_value_assertion
+            and latest_test_path
+            and not implementation_source_issues
+            and not algorithmic_independent_oracle_seen
+            and algorithmic_test_fixture_oracle_evidence
+        ):
+            algorithmic_test_fixture_value_suspected = True
+            if latest_impl_path:
+                algorithmic_test_fixture_value_impl_blocked_paths.append(latest_impl_path)
         if latest_unittest_triage_result is not None and not bool(latest_unittest_triage_result.get("ok")):
             import_module = str(latest_unittest_missing_import.get("module") or "")
             impl_module = Path(str(latest_impl_path)).stem if latest_impl_path else ""
-            if state_space_test_fixture_repair_mode:
+            if state_space_test_fixture_repair_mode or algorithmic_test_fixture_value_suspected:
                 recovery_read_candidates = [latest_test_path]
             elif (
                 latest_unittest_missing_import
@@ -6888,21 +7099,10 @@ class AgentRuntime:
             item for item in failed_unittest_recovery_read_paths if item in latest_read_paths_after_failed_unittest
         ]
         failed_unittest_recovery_read_consumed = bool(failed_unittest_recovery_read_paths) and not failed_unittest_unread_paths
-        same_signature_nonreducing_edit_path_set = (
-            {
-                str(item).replace("\\", "/")
-                for item in same_signature_nonreducing_edit_paths
-                if str(item).strip()
-            }
-            if repeated_unittest_failure_signature
-            else set()
-        )
         state_space_no_match_exact_replace_paths: list[str] = []
         state_space_fixture_value_impl_blocked_paths: list[str] = []
         blocked_failed_unittest_replace_paths = [
-            item
-            for item in self._blocked_failed_unittest_replace_paths(session_id=session_id)
-            if item in failed_unittest_recovery_read_paths
+            item for item in blocked_failed_unittest_replace_paths if item in failed_unittest_recovery_read_paths
         ]
         if (
             state_space_test_fixture_value_suspected
@@ -6929,12 +7129,33 @@ class AgentRuntime:
             and latest_impl_path not in state_space_fixture_value_impl_blocked_paths
         ):
             state_space_no_match_exact_replace_paths.append(latest_impl_path)
+        test_fixture_value_impl_blocked_paths = [item for item in algorithmic_test_fixture_value_impl_blocked_paths if item]
+        combined_test_fixture_value_impl_blocked_paths = [
+            item
+            for item in [
+                *state_space_fixture_value_impl_blocked_paths,
+                *test_fixture_value_impl_blocked_paths,
+                *return_shape_impl_blocked_paths,
+            ]
+            if item
+        ]
+        if latest_unittest_points_to_implementation_exception:
+            failed_unittest_repair_target_paths = [
+                item
+                for item in failed_unittest_recovery_editable_paths
+                if item in latest_failed_unittest_impl_paths or item == latest_impl_path
+            ]
+            if not failed_unittest_repair_target_paths and latest_impl_path:
+                failed_unittest_repair_target_paths = [latest_impl_path]
+        else:
+            failed_unittest_repair_target_paths = list(failed_unittest_recovery_editable_paths)
         failed_unittest_no_match_write_only_paths: list[str] = []
         for item in blocked_failed_unittest_replace_paths:
             if (
-                item in failed_unittest_recovery_editable_paths
+                item in failed_unittest_repair_target_paths
                 and item not in state_space_no_match_exact_replace_paths
                 and item not in state_space_fixture_value_impl_blocked_paths
+                and item not in combined_test_fixture_value_impl_blocked_paths
                 and item not in same_signature_nonreducing_edit_path_set
                 and item not in failed_unittest_no_match_write_only_paths
             ):
@@ -6952,6 +7173,7 @@ class AgentRuntime:
                     if (
                         item not in state_space_no_match_exact_replace_paths
                         and item not in state_space_fixture_value_impl_blocked_paths
+                        and item not in combined_test_fixture_value_impl_blocked_paths
                         and item not in same_signature_nonreducing_edit_path_set
                         and item not in failed_unittest_no_match_write_only_paths
                     ):
@@ -6972,10 +7194,11 @@ class AgentRuntime:
                 if item not in no_match_evidence_paths:
                     no_match_evidence_paths.append(item)
             if no_match_evidence_paths:
-                for item in failed_unittest_recovery_editable_paths:
+                for item in failed_unittest_repair_target_paths:
                     if (
                         item not in state_space_no_match_exact_replace_paths
                         and item not in state_space_fixture_value_impl_blocked_paths
+                        and item not in combined_test_fixture_value_impl_blocked_paths
                         and item not in same_signature_nonreducing_edit_path_set
                         and item not in failed_unittest_no_match_write_only_paths
                     ):
@@ -6983,7 +7206,7 @@ class AgentRuntime:
 
         failed_unittest_repeated_noop_paths: list[str] = []
         if latest_failed_unittest_index >= 0:
-            for item in failed_unittest_recovery_read_paths:
+            for item in failed_unittest_repair_target_paths:
                 recovery = self._latest_edit_match_failure_recovery(steps=steps, path=item)
                 if not recovery:
                     continue
@@ -6999,10 +7222,11 @@ class AgentRuntime:
                     failed_unittest_repeated_noop_paths.append(item)
         failed_unittest_noop_alternate_paths: list[str] = []
         if failed_unittest_repeated_noop_paths:
-            for item in failed_unittest_recovery_read_paths:
+            for item in failed_unittest_repair_target_paths:
                 if item not in failed_unittest_repeated_noop_paths and item not in failed_unittest_noop_alternate_paths:
                     failed_unittest_noop_alternate_paths.append(item)
-            for item in [latest_impl_path, latest_test_path]:
+            fallback_targets = [] if latest_unittest_points_to_implementation_exception else [latest_impl_path, latest_test_path]
+            for item in fallback_targets:
                 normalized_item = str(item or "").replace("\\", "/")
                 if (
                     normalized_item
@@ -7118,7 +7342,7 @@ class AgentRuntime:
                     latest_read_paths_after_failed_unittest=latest_read_paths_after_failed_unittest,
                     failed_unittest_no_match_write_only_paths=failed_unittest_no_match_write_only_paths,
                     failed_unittest_unread_paths=failed_unittest_unread_paths,
-                    failed_unittest_recovery_editable_paths=failed_unittest_recovery_editable_paths,
+                    failed_unittest_recovery_editable_paths=failed_unittest_repair_target_paths,
                     failed_unittest_recovery_read_paths=failed_unittest_recovery_read_paths,
                     same_signature_nonreducing_edit_paths=same_signature_nonreducing_edit_paths,
                     repeated_unittest_failure_signature=repeated_unittest_failure_signature,
@@ -7126,6 +7350,8 @@ class AgentRuntime:
                     state_space_fixture_value_impl_blocked_paths=state_space_fixture_value_impl_blocked_paths,
                     latest_test_path=latest_test_path or "",
                     latest_impl_path=latest_impl_path or "",
+                    test_fixture_value_impl_blocked_paths=combined_test_fixture_value_impl_blocked_paths,
+                    return_shape_contract_mismatch=return_shape_contract_mismatch,
                 )
             missing_requirements = ["unittest_passed"]
         elif bool(evidence.get("python_artifact_written")) and not bool(evidence.get("tests_written")):
@@ -7165,6 +7391,27 @@ class AgentRuntime:
             phase = "external_audit_required"
             allowed_next_actions = ["run_command python3 -m unittest discover -s tests"]
             missing_requirements = ["external_audit_passed"]
+        elif (
+            bool(evidence.get("unittest_passed"))
+            and "stdout_displayed" in contract
+            and not bool(evidence.get("stdout_displayed"))
+        ):
+            phase = "result_display_required"
+            allowed_next_actions = [
+                "run_command <non-interactive demo or verifier command that prints the requested visible result to stdout>"
+            ]
+            if successful_empty_stdout_commands:
+                allowed_next_actions = [
+                    "run_command <non-interactive python -c/import command that prints a concrete sample result to stdout>"
+                ]
+                if latest_impl_path:
+                    allowed_next_actions.extend(
+                        [
+                            f"replace_text {latest_impl_path} with a small unique old_text to add __main__ demo printing sample result",
+                            f"write_file {latest_impl_path}",
+                        ]
+                    )
+            missing_requirements = ["stdout_displayed"]
         elif bool(evidence.get("unittest_passed")):
             phase = "external_contract_satisfied"
             allowed_next_actions = ["finish"]
@@ -7191,6 +7438,35 @@ class AgentRuntime:
             phase in {"unittest_failed_needs_fix", "implementation_present_needs_semantic_review", "tests_present_needs_semantic_review"}
             and latest_generation_too_large_or_repetitive
         )
+        if repair_generation_repetitive_output and phase == "unittest_failed_needs_fix":
+            repair_targets: list[str] = []
+            for candidate in (
+                list(failed_unittest_recovery_read_paths)
+                + [latest_test_path or "", latest_impl_path or ""]
+            ):
+                normalized = str(candidate or "").replace("\\", "/").strip()
+                if normalized and normalized not in repair_targets:
+                    repair_targets.append(normalized)
+            read_targets = [
+                target
+                for target in repair_targets
+                if target in latest_read_paths_after_failed_unittest
+            ]
+            unread_targets = [
+                target
+                for target in repair_targets
+                if target not in latest_read_paths_after_failed_unittest
+            ]
+            if read_targets:
+                allowed_next_actions = [
+                    f"replace_text {target} with a small unique old_text"
+                    for target in read_targets[:2]
+                ]
+            elif unread_targets:
+                allowed_next_actions = [
+                    f"read_file {target} once"
+                    for target in unread_targets[:2]
+                ]
         if latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")):
             if repeated_unittest_failure_signature:
                 if latest_unittest_timed_out:
@@ -7208,6 +7484,12 @@ class AgentRuntime:
                         "失敗traceback対象: "
                         + ", ".join(str(item) for item in latest_failed_unittest_paths[:6])
                     )
+            if algorithmic_test_fixture_value_suspected:
+                unittest_repair_hints.append(
+                    "自己生成test fixtureの期待値が未検証のまま正本扱いされています。"
+                    "実装契約違反が観測されていない状態でimplementation編集後も同一assert失敗が再発したため、"
+                    "次はimplementationを歪めず、読了済みtest artifactの期待値/fixtureを独立した根拠で見直してください。"
+                )
             if latest_unittest_missing_import:
                 missing_name = str(latest_unittest_missing_import.get("name") or "")
                 missing_module = str(latest_unittest_missing_import.get("module") or "")
@@ -7248,6 +7530,8 @@ class AgentRuntime:
                         "次は失敗行の期待値、ユーザー仕様、実装の公開APIを照合し、根拠がある側だけを小さく修正してください。"
                         "実装契約が明確でないまま期待値へ合わせる大きなrewriteは避けてください。"
                     )
+            if latest_unittest_return_shape_hint:
+                unittest_repair_hints.append(latest_unittest_return_shape_hint)
             if plan_strategy == "state_space_search":
                 unittest_repair_hints.append(
                     "state_space_searchのsolver/search戻り値は、PlanRecordのaction modelに沿ったaction列でなければなりません。"
@@ -7373,6 +7657,9 @@ class AgentRuntime:
             "unittest_passed": bool(evidence.get("unittest_passed")),
             "successful_unittest_run_count": successful_unittest_count,
             "external_audit_passed": successful_unittest_count >= 2,
+            "return_shape_contract_mismatch": return_shape_contract_mismatch,
+            "return_shape_contract_hint": latest_unittest_return_shape_hint,
+            "successful_empty_stdout_commands": successful_empty_stdout_commands,
             "latest_unittest_failed": latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")),
             "latest_unittest_timed_out": latest_unittest_timed_out,
             "latest_unittest_missing_tests_artifact": latest_unittest_missing_tests_artifact,
@@ -7401,9 +7688,17 @@ class AgentRuntime:
                 tail_chars=1200,
             ),
             "latest_unittest_failed_paths": latest_failed_unittest_paths,
+            "latest_failed_unittest_impl_paths": latest_failed_unittest_impl_paths,
+            "latest_unittest_points_to_implementation_exception": latest_unittest_points_to_implementation_exception,
             "state_space_test_fixture_repair_mode": state_space_test_fixture_repair_mode,
             "state_space_test_fixture_value_suspected": state_space_test_fixture_value_suspected,
             "state_space_test_impl_contract_suspected": state_space_test_impl_contract_suspected,
+            "algorithmic_test_fixture_value_suspected": algorithmic_test_fixture_value_suspected,
+            "algorithmic_independent_oracle_seen": algorithmic_independent_oracle_seen,
+            "implementation_noop_after_failed_unittest": implementation_noop_after_failed_unittest,
+            "implementation_replace_blocked_after_failed_unittest": implementation_replace_blocked_after_failed_unittest,
+            "return_shape_impl_blocked_paths": return_shape_impl_blocked_paths,
+            "test_fixture_value_impl_blocked_paths": test_fixture_value_impl_blocked_paths,
             "repeated_unittest_failure_signature": repeated_unittest_failure_signature,
             "latest_unittest_failure_signature": latest_unittest_failure_signature,
             "unittest_repair_hints": unittest_repair_hints,
@@ -7420,6 +7715,7 @@ class AgentRuntime:
             "failed_unittest_recovery_read_paths": failed_unittest_recovery_read_paths,
             "failed_unittest_recovery_read_consumed_paths": sorted(latest_read_paths_after_failed_unittest),
             "failed_unittest_recovery_editable_paths": failed_unittest_recovery_editable_paths,
+            "failed_unittest_repair_target_paths": failed_unittest_repair_target_paths,
             "state_space_no_match_exact_replace_paths": state_space_no_match_exact_replace_paths,
             "state_space_fixture_value_impl_blocked_paths": state_space_fixture_value_impl_blocked_paths,
             "failed_unittest_no_match_write_only_paths": failed_unittest_no_match_write_only_paths,
@@ -7520,8 +7816,21 @@ class AgentRuntime:
         if latest_unittest is None:
             return None
 
-        implementation_paths = [str(path) for path in state.get("implementation_paths") or [] if str(path).strip()]
-        test_paths = [str(path) for path in state.get("test_paths") or [] if str(path).strip()]
+        implementation_paths = list(
+            dict.fromkeys(str(path) for path in state.get("implementation_paths") or [] if str(path).strip())
+        )
+        test_paths = list(dict.fromkeys(str(path) for path in state.get("test_paths") or [] if str(path).strip()))
+        contract = [str(item) for item in state.get("contract") or [] if str(item).strip()]
+        visible_result = ""
+        if "stdout_displayed" in contract:
+            visible_result = (
+                self._deterministic_terminal_final_answer(
+                    goal_text=user_message,
+                    user_message=user_message,
+                    steps=steps,
+                )
+                or ""
+            )
         command = str(latest_unittest.get("command") or "python3 -m unittest discover -s tests").strip()
         output = str(latest_unittest.get("stderr") or latest_unittest.get("stdout") or "OK")
         output_preview = self._output_preview(output, max_lines=4, max_chars=400)
@@ -7535,6 +7844,8 @@ class AgentRuntime:
         lines.extend(["", "検証:", f"- {command}: 成功"])
         if output_preview:
             lines.append(f"- 結果: {output_preview}")
+        if visible_result:
+            lines.extend(["", "表示結果:", visible_result])
         lines.extend(
             [
                 "",
@@ -7545,6 +7856,8 @@ class AgentRuntime:
                 "- 外部audit成功: satisfied",
             ]
         )
+        if "stdout_displayed" in contract:
+            lines.append("- ユーザー向け表示結果: satisfied")
         return "\n".join(lines)
 
     def _extract_unittest_failure_paths(self, *, output: str, turn_workspace: Path | None) -> list[str]:
@@ -7610,6 +7923,7 @@ class AgentRuntime:
                     "tests_present_needs_semantic_review",
                     "unittest_not_run",
                     "unittest_failed_needs_fix",
+                    "result_display_required",
                 }:
                     return f"IMPLEMENTATION_TASK_PROGRESS:{phase}"
             return fallback_phase
@@ -7969,10 +8283,21 @@ class AgentRuntime:
                     "次の write_file は同じcandidateを少し言い換えず、拒否理由を消した完全な tests/test_*.py にしてください。"
                 )
             if reason_code == "test_artifact_contract_incomplete":
-                parts.append(
-                    "- 同じliteral input/fixtureに対して solve/search の None と not None を同時に期待してはいけません。"
-                    "解けるfixtureとno-solution fixtureを別入力に分け、各assertの期待を一貫させてください。"
-                )
+                if "独立reference/brute-force oracle" in message:
+                    parts.append(
+                        "- hardcoded expected だけを書き換えてはいけません。"
+                        "実装本体を呼ばない brute_force/reference/oracle helper で小さい入力の期待値を導出し、"
+                        "DP本体の戻り値をそのhelper結果と比較してください。"
+                    )
+                elif (
+                    "contradictory predicate expectations" in message
+                    or "contradictory call-result expectations" in message
+                    or "no-solution/unsolvable" in message
+                ):
+                    parts.append(
+                        "- 同じliteral input/fixtureに対して solve/search の None と not None を同時に期待してはいけません。"
+                        "解けるfixtureとno-solution fixtureを別入力に分け、各assertの期待を一貫させてください。"
+                    )
         if state.get("latest_unittest_failed"):
             parts.append("unittest失敗後の修正契約:")
             if str(state.get("latest_unittest_failure_type") or "") == "external_audit_failed_after_previous_success":
@@ -8001,8 +8326,27 @@ class AgentRuntime:
                     )
                 else:
                     parts.append("- 次は必ず `run_command python3 -m unittest discover -s tests` だけを実行してください。")
+            if state.get("return_shape_contract_mismatch"):
+                parts.append("返却shape/API修復契約:")
+                parts.append(
+                    "- これはアルゴリズム全面再実装の問題ではなく、公開APIの戻り値shapeと呼び出し側の解釈の不一致です。"
+                )
+                parts.append(
+                    "- 次の編集は function return tuple order / test unpack assignment / reference・brute_force・oracle helper return order / docstring・annotation のどれか1面だけに限定してください。"
+                )
+                parts.append(
+                    "- implementationのdocstringやannotationが戻り値順序を明示している場合は、実装全体を書き換えず、test/oracle側のunpackやhelper戻り値を合わせることを優先してください。"
+                )
+                parts.append(
+                    "- allowed_next_actionsにない implementation write_file は禁止です。小さいreplace_textで契約面だけを変えてください。"
+                )
+                if state.get("return_shape_impl_blocked_paths"):
+                    parts.append(
+                        "- implementation側の広い修復は直前に拒否済みです。次はallowed_next_actionsに出ているtest/oracle側の修復だけを実行してください。"
+                    )
             if state.get("repair_generation_repetitive_output"):
                 parts.append("直近のrepair生成は repetitive_output/stream_char_limit でJSON未完了になりました。次の修復はさらに小さくしてください。")
+                parts.append("- runtimeはこの状態を全文再生成失敗として扱います。write_fileでファイル全体を再出力せず、allowed_next_actionsのread_fileまたは小さいreplace_textだけを使ってください。")
                 parts.append("- replace_textを使う場合、old_textは失敗行に関係する1つの関数または数行だけ、new_textも同じ範囲だけにしてください。")
                 parts.append("- ファイル全体、class全体、長いhelper群、説明コメントをold_text/new_textに入れてはいけません。")
                 parts.append("- 失敗tracebackがtest期待値の誤りを示す場合は、実装を歪めず該当test methodだけを小さく修正してください。")
@@ -8066,6 +8410,34 @@ class AgentRuntime:
                     parts.append("- already_read_for_this_signature: " + json.dumps(read_paths, ensure_ascii=False))
                 parts.append("- 同じ内容のwrite_fileや同じread_fileの反復は禁止です。")
                 parts.append("- 次のwrite_fileはtracebackの具体行と読んだsourceに基づき、失敗signatureを変える修正だけにしてください。")
+            if state.get("algorithmic_test_fixture_value_suspected"):
+                blocked_impls = [
+                    str(item).strip()
+                    for item in state.get("test_fixture_value_impl_blocked_paths") or []
+                    if str(item).strip()
+                ]
+                parts.append("自己生成test fixture期待値のoracle不足:")
+                parts.append("- 実装契約違反が観測されていない状態で、implementation編集後も同一assert失敗が再発しています。")
+                parts.append("- 次はimplementationを書き換えて期待値へ合わせるのではなく、test fixture/expected値がユーザー仕様から導けるかを確認してください。")
+                if blocked_impls:
+                    parts.append("- 一時的にimplementation編集を禁止する対象: " + json.dumps(blocked_impls, ensure_ascii=False))
+                if str(state.get("plan_strategy") or "") == "dynamic_programming" and not bool(state.get("algorithmic_independent_oracle_seen")):
+                    parts.append(
+                        "- dynamic_programmingでは、tests/test_*.py に実装本体を呼ばない brute_force/reference/oracle helper を追加し、"
+                        "小さい入力の期待値をそのhelperから計算してください。hardcoded expectedの値だけを調整する修復は禁止です。"
+                    )
+                parts.append("- allowed_next_actions に出ている tests/test_*.py のread/editだけを使い、必要なら期待値の根拠をtestコメントまたはassert構造に反映してください。")
+            if state.get("latest_unittest_points_to_implementation_exception"):
+                impl_paths = [
+                    str(item).strip()
+                    for item in state.get("latest_failed_unittest_impl_paths") or []
+                    if str(item).strip()
+                ]
+                parts.append("implementation traceback修復契約:")
+                parts.append("- 直近unittestはtest期待値の不一致ではなく、implementation内で例外が発生しています。")
+                if impl_paths:
+                    parts.append("- 修復対象implementation: " + json.dumps(impl_paths, ensure_ascii=False))
+                parts.append("- tests/test_*.py を期待値合わせで変更せず、implementationの実行経路を修正してください。")
             unittest_repair_hints = [
                 str(item).strip()
                 for item in state.get("unittest_repair_hints") or []
@@ -8172,6 +8544,20 @@ class AgentRuntime:
             parts.append("次は python3 -m unittest discover -s tests を実行してください。")
         elif phase == "external_audit_required":
             parts.append("内部unittestは成功済みです。finish前にcontroller側の外部auditとして同じunittestを再実行してください。")
+        elif phase == "result_display_required":
+            parts.append("実装と外部auditは成功済みですが、ユーザー要求の表示結果がまだstdoutにありません。")
+            parts.append("次は成果物または非対話verifierをrun_commandで実行し、選ばれた結果・最大値・到達状態などのユーザー向け結果をstdoutに出してください。")
+            parts.append("unittest成功のstderrだけをfinal evidenceにしてはいけません。")
+            empty_stdout_commands = [
+                str(item).strip()
+                for item in state.get("successful_empty_stdout_commands") or []
+                if str(item).strip()
+            ]
+            if empty_stdout_commands:
+                parts.append("空stdout実行の反復禁止:")
+                parts.append("- 次のコマンドは成功しましたがstdoutが空なので、表示結果の証拠になっていません。")
+                parts.append("- empty_stdout_commands: " + json.dumps(empty_stdout_commands[-4:], ensure_ascii=False))
+                parts.append("- 同じコマンドを再実行せず、python -c/import で具体サンプルをprintするか、implementationに__main__ demoを追加してください。")
         elif phase == "external_contract_satisfied":
             parts.append("実装、意味のあるtests、unittest成功、外部audit成功が揃っています。次はfinishしてください。")
         return "\n".join(parts)
@@ -8336,6 +8722,13 @@ class AgentRuntime:
 
     def _implementation_unittest_repair_target_paths(self, state: dict[str, Any]) -> list[str]:
         targets: list[str] = []
+        explicit_targets = [
+            str(item or "").replace("\\", "/").strip()
+            for item in state.get("failed_unittest_repair_target_paths") or []
+            if str(item or "").strip()
+        ]
+        if explicit_targets:
+            return list(dict.fromkeys(explicit_targets))
         for item in [
             *(state.get("failed_unittest_recovery_read_paths") or []),
             *(state.get("latest_unittest_failed_paths") or []),
@@ -8346,6 +8739,37 @@ class AgentRuntime:
             if normalized and normalized not in targets:
                 targets.append(normalized)
         return targets
+
+    def _successful_empty_stdout_commands_after_last_artifact_write(self, steps: list[dict[str, Any]]) -> list[str]:
+        """Return non-unittest commands that succeeded after the latest artifact edit but printed nothing."""
+
+        last_artifact_write_index = -1
+        for index, step in enumerate(steps):
+            if str(step.get("tool_name") or "") not in {"write_file", "append_file", "replace_text"}:
+                continue
+            result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
+            if bool(result.get("ok")):
+                last_artifact_write_index = index
+
+        commands: list[str] = []
+        seen: set[str] = set()
+        for index, step in enumerate(steps):
+            if index <= last_artifact_write_index:
+                continue
+            if str(step.get("tool_name") or "") != "run_command":
+                continue
+            result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
+            if not bool(result.get("ok")):
+                continue
+            command = str(result.get("command") or "").strip()
+            if not command or "unittest" in command.lower():
+                continue
+            if str(result.get("stdout") or "").strip():
+                continue
+            if command not in seen:
+                seen.add(command)
+                commands.append(command)
+        return commands
 
     def _candidate_source_from_implementation_edit(
         self,
@@ -9318,6 +9742,63 @@ class AgentRuntime:
                 "suggested_fix": "python3 -m unittest discover -s tests を再実行し、独立した検証証拠を追加してください。",
                 "state": state,
             }
+        if phase == "result_display_required":
+            command = str(tool_args.get("command") or "").strip()
+            empty_stdout_commands = {
+                str(item).strip()
+                for item in state.get("successful_empty_stdout_commands") or []
+                if str(item).strip()
+            }
+            latest_impl = str(state.get("latest_implementation_path") or "").replace("\\", "/")
+            if tool_name == "run_command":
+                if command in empty_stdout_commands:
+                    return {
+                        "reason_code": "implementation_task_result_display_blocks_repeated_empty_stdout_command",
+                        "phase": phase,
+                        "path": path,
+                        "message": (
+                            "このコマンドはすでに成功しましたがstdoutが空でした。"
+                            "同じコマンドを再実行しても stdout_displayed は満たされません。"
+                        ),
+                        "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                        "suggested_fix": (
+                            "python -c/import で実装関数を呼び出して結果をprintするか、"
+                            "implementationに __main__ demo を追加してから実行してください。"
+                        ),
+                        "blocked_by": "implementation_task_progress_controller",
+                        "next_required_action": "produce non-empty stdout with a demo/verifier command",
+                        "state": state,
+                    }
+                if "unittest" in command.lower():
+                    return {
+                        "reason_code": "implementation_task_result_display_blocks_unittest_rerun",
+                        "phase": phase,
+                        "path": path,
+                        "message": (
+                            "unittestは成功済みですが、ユーザー要求の表示結果はまだstdoutにありません。"
+                            "unittestを再実行しても表示結果にはなりません。"
+                        ),
+                        "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                        "suggested_fix": "サンプル入力を使って実装関数を呼び出し、結果をstdoutへprintするrun_commandを実行してください。",
+                        "blocked_by": "implementation_task_progress_controller",
+                        "next_required_action": "run a non-unittest command that prints a concrete sample result",
+                        "state": state,
+                    }
+                return None
+            if tool_name in {"replace_text", "write_file", "append_file"} and latest_impl and path == latest_impl:
+                return None
+            return {
+                "reason_code": "implementation_task_phase_requires_result_display",
+                "phase": phase,
+                "path": path,
+                "message": (
+                    "実装とunittestは成功していますが、ユーザー向け表示結果が未達です。"
+                    "finishや無関係な編集ではなく、非空stdoutを生成する操作を行ってください。"
+                ),
+                "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                "suggested_fix": "python -c/import で具体サンプルをprintするか、implementationに__main__ demoを追加してください。",
+                "state": state,
+            }
         if phase == "unittest_failed_needs_fix":
             command = str(tool_args.get("command") or "")
             failed_paths = [str(item).replace("\\", "/") for item in state.get("failed_unittest_recovery_read_paths") or [] if str(item).strip()]
@@ -9346,6 +9827,16 @@ class AgentRuntime:
             state_space_fixture_value_impl_blocked_paths = {
                 str(item).replace("\\", "/")
                 for item in state.get("state_space_fixture_value_impl_blocked_paths") or []
+                if str(item).strip()
+            }
+            test_fixture_value_impl_blocked_paths = {
+                str(item).replace("\\", "/")
+                for item in state.get("test_fixture_value_impl_blocked_paths") or []
+                if str(item).strip()
+            }
+            return_shape_impl_blocked_paths = {
+                str(item).replace("\\", "/")
+                for item in state.get("return_shape_impl_blocked_paths") or []
                 if str(item).strip()
             }
             repeated_nonreducing_paths_for_phase = (
@@ -9448,6 +9939,46 @@ class AgentRuntime:
                     "next_required_action": "choose a different allowed target; do not repeat the no-op file",
                     "state": state,
                 }
+            if path in return_shape_impl_blocked_paths and tool_name in {"append_file", "replace_text", "write_file"}:
+                return {
+                    "reason_code": "implementation_task_failed_unittest_prioritizes_return_shape_surface",
+                    "phase": phase,
+                    "path": path,
+                    "message": (
+                        "返却shape/API不一致の修復でimplementation側の広い編集はすでに拒否済みです。"
+                        "同じimplementation targetを再試行せず、公開APIの戻り値shapeと呼び出し側の解釈を"
+                        "test/oracle側の小さい差分で揃えてください。"
+                    ),
+                    "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                    "suggested_fix": (
+                        "allowed_next_actionsに出ているtest/oracle artifactを修正してください。"
+                        "implementation docstring/annotationが戻り値順序を明示している場合は、"
+                        "test unpack assignment または reference/brute_force/oracle helper return order を合わせてください。"
+                    ),
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": "repair the test/oracle return-shape interpretation instead of repeating implementation edits",
+                    "state": state,
+                }
+            if path in test_fixture_value_impl_blocked_paths and tool_name in {"append_file", "replace_text", "write_file"}:
+                return {
+                    "reason_code": "implementation_task_failed_unittest_prioritizes_test_fixture_oracle",
+                    "phase": phase,
+                    "path": path,
+                    "message": (
+                        "自己生成test fixtureの期待値が独立oracleなしに正本扱いされ、"
+                        "implementation編集後も同一assert失敗が再発しています。"
+                        "同じimplementation targetを再試行せず、読了済みtest artifactのfixture/expected値を"
+                        "ユーザー仕様から導ける形へ修正してください。"
+                    ),
+                    "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                    "suggested_fix": (
+                        "allowed_next_actionsに出ているtest artifactを修正してください。"
+                        "test fixtureが矛盾している場合は、implementationではなくtests/test_*.pyをtargetにしてください。"
+                    ),
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": "repair the test artifact fixture instead of repeating implementation edits",
+                    "state": state,
+                }
             if path in state_space_fixture_value_impl_blocked_paths and tool_name in {"append_file", "replace_text", "write_file"}:
                 return {
                     "reason_code": "implementation_task_failed_unittest_prioritizes_fixture_repair_after_impl_noop",
@@ -9504,14 +10035,31 @@ class AgentRuntime:
                     tool_name in {"replace_text", "write_file"}
                     and path in repeated_nonreducing_paths_for_phase
                 ):
-                    allowed_after_no_match = [
-                        *[
-                            f"replace_text {target} with a small unique old_text"
-                            for target in repeated_nonreducing_paths_for_phase
-                            if target in editable_after_read_paths
-                        ],
-                        *[f"write_file {target}" for target in write_only_paths],
-                    ]
+                    if state.get("return_shape_contract_mismatch"):
+                        allowed_after_no_match = [
+                            str(item)
+                            for item in state.get("allowed_next_actions") or []
+                            if str(item).strip()
+                        ]
+                        suggested_fix = (
+                            "返却shape/API契約の修復です。アルゴリズム全体を再実装せず、"
+                            "allowed_next_actionsからtest/oracle側の小さい修復を1つ選んでください。"
+                            "implementation側の広いreplace_text/write_fileは次候補ではありません。"
+                        )
+                        next_required_action = (
+                            "choose a test/oracle return-shape repair from allowed_next_actions"
+                        )
+                    else:
+                        allowed_after_no_match = [
+                            *[
+                                f"replace_text {target} with a small unique old_text"
+                                for target in repeated_nonreducing_paths_for_phase
+                                if target in editable_after_read_paths
+                            ],
+                            *[f"write_file {target}" for target in write_only_paths],
+                        ]
+                        suggested_fix = "直近に読んだ実装/テスト内容とtracebackに基づき、非改善pathなら現在sourceに一意一致する小さいold_textでreplace_textし、別対象なら完全なwrite_fileで失敗signatureを変えてください。"
+                        next_required_action = "choose one allowed_next_actions item"
                     return {
                         "reason_code": "implementation_task_failed_unittest_requires_write_after_no_match",
                         "phase": phase,
@@ -9522,7 +10070,8 @@ class AgentRuntime:
                             "非改善pathは小さいexact replace_text、その他の既読対象はwrite_fileで修正してください。"
                         ),
                         "allowed_next_actions": allowed_after_no_match,
-                        "suggested_fix": "直近に読んだ実装/テスト内容とtracebackに基づき、非改善pathなら現在sourceに一意一致する小さいold_textでreplace_textし、別対象なら完全なwrite_fileで失敗signatureを変えてください。",
+                        "suggested_fix": suggested_fix,
+                        "next_required_action": next_required_action,
                         "state": state,
                     }
             if tool_name == "read_file" and path in consumed_paths:
@@ -9562,6 +10111,14 @@ class AgentRuntime:
                             )
                         ],
                     ] or list(state.get("allowed_next_actions") or [])
+                    if state.get("return_shape_contract_mismatch"):
+                        canonical_actions = [
+                            str(item)
+                            for item in state.get("allowed_next_actions") or []
+                            if str(item).strip()
+                        ]
+                        if canonical_actions:
+                            target_actions = canonical_actions
                     if tool_name == "replace_text":
                         current_source = self._current_artifact_source_for_path(path, turn_workspace=turn_workspace)
                         old_text = str(tool_args.get("old_text") or "")
@@ -9588,7 +10145,12 @@ class AgentRuntime:
                             reason_code = "implementation_task_failed_unittest_blocks_broad_replace_text"
                         else:
                             reason_code = "implementation_task_failed_unittest_blocks_unmatched_replace_text"
-                        if block_header_only_replace:
+                        if state.get("return_shape_contract_mismatch"):
+                            allowed_actions = []
+                            for action in [f"replace_text {path} with a small unique old_text", *target_actions]:
+                                if action not in allowed_actions:
+                                    allowed_actions.append(action)
+                        elif block_header_only_replace:
                             allowed_actions = (
                                 [f"replace_text {path} with a small unique old_text"]
                                 if path in repeated_nonreducing_paths
@@ -9608,24 +10170,37 @@ class AgentRuntime:
                             f"exact_old_text_matches={exact_match_count}, "
                             f"block_header_only_replace={block_header_only_replace}。"
                         )
+                        if state.get("return_shape_contract_mismatch"):
+                            suggested_fix = (
+                                "返却shape/API契約の修復です。アルゴリズム全体を再実装せず、"
+                                "allowed_next_actionsから1つ選び、function return tuple order、test unpack assignment、"
+                                "reference/brute_force/oracle helper return order、docstring/annotation のどれか1面だけを小さい差分で揃えてください。"
+                                "implementation pathへの全面write_fileは許可しません。"
+                            )
+                            next_required_action = (
+                                "choose one allowed_next_actions item; prefer test/oracle unpack alignment when the implementation docstring or annotation already declares the return order"
+                            )
+                        else:
+                            suggested_fix = (
+                                "replace_textを使うなら、read_file済みの現在sourceから数行だけを正確にコピーした"
+                                "一意なold_textにしてください。関数やclassを置換する場合はヘッダだけではなく現在のブロック全体を含めるか、"
+                                "大きい修正なら完全なwrite_fileで出してください。"
+                                " current_source_excerptがある場合は、そこからold_textを作ってください。"
+                            )
+                            next_required_action = (
+                                "write_file the complete corrected target file"
+                                if block_header_only_replace
+                                else "retry with a small exact replace_text, or write_file the complete corrected target file"
+                            )
                         return {
                             "reason_code": reason_code,
                             "phase": phase,
                             "path": path,
                             "message": message,
                             "allowed_next_actions": allowed_actions,
-                            "suggested_fix": (
-                                "replace_textを使うなら、read_file済みの現在sourceから数行だけを正確にコピーした"
-                                "一意なold_textにしてください。関数やclassを置換する場合はヘッダだけではなく現在のブロック全体を含めるか、"
-                                "大きい修正なら完全なwrite_fileで出してください。"
-                                " current_source_excerptがある場合は、そこからold_textを作ってください。"
-                            ),
+                            "suggested_fix": suggested_fix,
                             "blocked_by": "implementation_task_progress_controller",
-                            "next_required_action": (
-                                "write_file the complete corrected target file"
-                                if block_header_only_replace
-                                else "retry with a small exact replace_text, or write_file the complete corrected target file"
-                            ),
+                            "next_required_action": next_required_action,
                             "broad_rewrite": broad_replace,
                             "block_header_only_replace": block_header_only_replace,
                             "exact_old_text_matches": exact_match_count,
@@ -9978,6 +10553,36 @@ class AgentRuntime:
                 "reason_code": "completion_contract_external_audit_recovery",
                 "system_decision": "CompletionContract recovery: finish前の外部auditとしてunittestを再実行します。",
             }
+        if (
+            "stdout_displayed" in contract
+            and bool(evidence.get("python_artifact_written"))
+            and not bool(evidence.get("stdout_displayed"))
+        ):
+            if "unittest_passed" in contract and not bool(evidence.get("unittest_passed")):
+                return None
+            artifact_paths = [
+                str(path)
+                for path in evidence.get("artifact_paths") or []
+                if _artifact_path_is_python_implementation(str(path))
+            ]
+            successful_commands = {
+                str(command).strip()
+                for command in evidence.get("successful_commands") or []
+                if str(command).strip()
+            }
+            for artifact_path in reversed(artifact_paths):
+                command = f"python3 {artifact_path}"
+                if command in successful_commands:
+                    continue
+                return {
+                    "tool_name": "run_command",
+                    "tool_args": {"command": command, "shell": "auto"},
+                    "reason_code": "completion_contract_stdout_recovery",
+                    "system_decision": (
+                        "CompletionContract recovery: ユーザーが表示結果を要求しています。"
+                        "unittest成功だけではstdout_displayedを満たさないため、成果物を実行して可視結果を取得します。"
+                    ),
+                }
         text = str(user_message or "").lower()
         if not any(marker in text for marker in ["実行", "run", "execute", "起動"]):
             return None
@@ -12548,10 +13153,77 @@ class AgentRuntime:
                 bool(progress_state.get("applicable"))
                 and str(progress_state.get("phase") or "") == "external_contract_satisfied"
             ):
-                final_answer = (
-                    "auto_finish: implementation artifact, meaningful tests, unittest success, "
-                    "and external audit success are present."
+                final_answer = self._controller_terminal_finish(
+                    selection=selection,
+                    goal_text=goal_text,
+                    user_message=recent_user_message,
+                    steps=steps,
+                ) or self._implementation_contract_final_answer(
+                    user_message=recent_user_message,
+                    steps=steps,
+                    session_id=session_id,
+                    turn_workspace=turn_workspace,
                 )
+                if final_answer is None:
+                    final_answer = (
+                        "実装タスクは完了条件を満たしました。成果物、意味のあるテスト、"
+                        "unittest成功、外部audit成功が揃っています。"
+                    )
+                acceptance = self._finish_acceptance_evaluation(
+                    user_message=recent_user_message,
+                    final_answer=final_answer,
+                    steps=steps,
+                )
+                self._append_session_event(
+                    self.root,
+                    session_id,
+                    {
+                        "type": "system_note",
+                        "role": "system",
+                        "content": f"完了受理判定: {acceptance.get('status')}",
+                        "code": "finish_acceptance",
+                        "reason_code": self._finish_acceptance_reason_code(acceptance),
+                        "details": acceptance,
+                        "turn_id": turn_id,
+                        "queue_id": queue_id,
+                        "step_index": step_index,
+                        "llm_workspace": str(turn_workspace),
+                    },
+                )
+                if not self._finish_status_is_accepted(acceptance.get("status")):
+                    block_text = self._finish_acceptance_block_text(acceptance)
+                    self._append_session_event(
+                        self.root,
+                        session_id,
+                        {
+                            "type": "system_note",
+                            "role": "system",
+                            "content": block_text,
+                            "code": "finish_blocked",
+                            "reason_code": "finish_acceptance_failed",
+                            "details": {
+                                **acceptance,
+                                "failure_type": "finish_acceptance_failed",
+                                "blocked_by": "finish_acceptance_gate",
+                                "allowed_next_actions": list(
+                                    acceptance.get("allowed_next_actions") or ["revise evidence or final_answer before retrying finish"]
+                                ),
+                                "suggested_fix": str(
+                                    acceptance.get("suggested_fix") or "不足している完了契約の証拠を追加してからfinishしてください。"
+                                ),
+                                "next_required_action": str(
+                                    acceptance.get("next_required_action")
+                                    or acceptance.get("suggested_fix")
+                                    or "choose one allowed_next_actions item"
+                                ),
+                            },
+                            "turn_id": turn_id,
+                            "queue_id": queue_id,
+                            "step_index": step_index,
+                            "llm_workspace": str(turn_workspace),
+                        },
+                    )
+                    continue
                 self._append_session_event(
                     self.root,
                     session_id,

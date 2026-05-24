@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def _looks_like_test_path(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1]
+    return normalized.startswith("tests/") or "/tests/" in normalized or name.startswith("test_")
+
+
 @dataclass(frozen=True)
 class AllowedAction:
     tool: str
@@ -32,6 +38,8 @@ class UnittestRepairActionPolicy:
     state_space_fixture_value_impl_blocked_paths: tuple[str, ...]
     latest_test_path: str
     latest_impl_path: str
+    test_fixture_value_impl_blocked_paths: tuple[str, ...] = ()
+    return_shape_contract_mismatch: bool = False
 
     def allowed_actions(self) -> list[AllowedAction]:
         if self.failed_unittest_noop_blocked_paths:
@@ -76,6 +84,21 @@ class UnittestRepairActionPolicy:
             if self.repeated_unittest_failure_signature
             else set()
         )
+        blocked_paths = set(self.state_space_fixture_value_impl_blocked_paths) | set(
+            self.test_fixture_value_impl_blocked_paths
+        )
+        if self.return_shape_contract_mismatch:
+            actions = [
+                AllowedAction("replace_text", target, "with a small unique old_text")
+                for target in self.failed_unittest_recovery_editable_paths
+                if target not in blocked_paths
+            ]
+            actions.extend(
+                AllowedAction("write_file", target)
+                for target in self.failed_unittest_no_match_write_only_paths
+                if _looks_like_test_path(target) and target not in blocked_paths
+            )
+            return actions
         actions = [
             AllowedAction("replace_text", target, "with a small unique old_text")
             for target in self.failed_unittest_recovery_editable_paths
@@ -96,12 +119,24 @@ class UnittestRepairActionPolicy:
                 or [self.latest_test_path or "tests/test_*.py", self.latest_impl_path or "<implementation>.py"]
             )
             if target not in self.state_space_fixture_value_impl_blocked_paths
+            and target not in self.test_fixture_value_impl_blocked_paths
         ]
         nonreducing_paths = (
             set(self.same_signature_nonreducing_edit_paths)
             if self.repeated_unittest_failure_signature
             else set()
         )
+        if self.return_shape_contract_mismatch:
+            actions = [
+                AllowedAction("replace_text", target, "with a small unique old_text")
+                for target in targets
+            ]
+            actions.extend(
+                AllowedAction("write_file", target)
+                for target in targets
+                if _looks_like_test_path(target) and target not in nonreducing_paths
+            )
+            return actions
         actions = [
             AllowedAction("replace_text", target, "with a small unique old_text")
             for target in targets
@@ -129,6 +164,8 @@ def _policy_from_legacy_args(
     state_space_fixture_value_impl_blocked_paths: list[str],
     latest_test_path: str,
     latest_impl_path: str,
+    test_fixture_value_impl_blocked_paths: list[str] | None = None,
+    return_shape_contract_mismatch: bool = False,
 ) -> UnittestRepairActionPolicy:
     return UnittestRepairActionPolicy(
         failed_unittest_noop_blocked_paths=tuple(failed_unittest_noop_blocked_paths),
@@ -142,8 +179,10 @@ def _policy_from_legacy_args(
         repeated_unittest_failure_signature=bool(repeated_unittest_failure_signature),
         state_space_no_match_exact_replace_paths=tuple(state_space_no_match_exact_replace_paths),
         state_space_fixture_value_impl_blocked_paths=tuple(state_space_fixture_value_impl_blocked_paths),
+        test_fixture_value_impl_blocked_paths=tuple(test_fixture_value_impl_blocked_paths or []),
         latest_test_path=str(latest_test_path or ""),
         latest_impl_path=str(latest_impl_path or ""),
+        return_shape_contract_mismatch=bool(return_shape_contract_mismatch),
     )
 
 
@@ -162,6 +201,8 @@ def build_unittest_failed_allowed_actions(
     state_space_fixture_value_impl_blocked_paths: list[str],
     latest_test_path: str,
     latest_impl_path: str,
+    test_fixture_value_impl_blocked_paths: list[str] | None = None,
+    return_shape_contract_mismatch: bool = False,
 ) -> list[str]:
     """Return the canonical action surface for unittest_failed_needs_fix."""
     return _policy_from_legacy_args(
@@ -176,6 +217,8 @@ def build_unittest_failed_allowed_actions(
         repeated_unittest_failure_signature=repeated_unittest_failure_signature,
         state_space_no_match_exact_replace_paths=state_space_no_match_exact_replace_paths,
         state_space_fixture_value_impl_blocked_paths=state_space_fixture_value_impl_blocked_paths,
+        test_fixture_value_impl_blocked_paths=test_fixture_value_impl_blocked_paths,
         latest_test_path=latest_test_path,
         latest_impl_path=latest_impl_path,
+        return_shape_contract_mismatch=return_shape_contract_mismatch,
     ).legacy_allowed_next_actions()
