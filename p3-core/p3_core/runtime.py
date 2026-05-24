@@ -1286,13 +1286,6 @@ class AgentRuntime:
             return None
         if any(str(event.get("type") or "") == "finish" for event in recent_events[-8:]):
             return None
-        scaffold = self._coding_scaffold_fast_path(
-            step_index=step_index,
-            user_message=user_message,
-            steps=steps,
-        )
-        if scaffold is not None:
-            return scaffold
         missing = self._missing_requested_commands(user_message=user_message, steps=steps)
         if not missing:
             return None
@@ -1315,77 +1308,6 @@ class AgentRuntime:
             "tool_name": "run_command",
             "tool_args": {"command": command, "shell": shell_name},
         }
-
-    def _coding_scaffold_fast_path(
-        self,
-        *,
-        step_index: int,
-        user_message: str,
-        steps: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        text = str(user_message or "").lower()
-        wants_maze = "迷路" in user_message or "maze" in text
-        wants_program = any(token in text for token in {"implement", "create", "program", "script"}) or any(
-            token in user_message for token in {"実装", "作成", "作って", "プログラム", "コード"}
-        )
-        if not (wants_maze and wants_program):
-            return None
-        wrote_maze = any(
-            str(step.get("tool_name") or "") == "write_file"
-            and str((step.get("tool_result") or {}).get("path") or "") == "maze_gen.py"
-            and bool((step.get("tool_result") or {}).get("ok"))
-            for step in steps
-        )
-        ran_maze = any(
-            str(step.get("tool_name") or "") == "run_command"
-            and "python3 maze_gen.py" in str((step.get("tool_result") or {}).get("command") or "")
-            for step in steps
-        )
-        if not wrote_maze:
-            return {
-                "analysis": "controller scaffold: create a small standalone maze program without asking the model to emit long code JSON.",
-                "assistant_message": "迷路プログラムを専用 workspace に作成します。",
-                "tool_name": "write_file",
-                "tool_args": {"path": "maze_gen.py", "content": self._maze_program_source()},
-            }
-        if not ran_maze:
-            return {
-                "analysis": "controller scaffold: run the generated maze program and use stdout as evidence.",
-                "assistant_message": "作成した迷路プログラムを実行します。",
-                "tool_name": "run_command",
-                "tool_args": {"command": "python3 maze_gen.py", "shell": "auto"},
-            }
-        return None
-
-    def _maze_program_source(self) -> str:
-        return '''import random
-
-
-def generate_maze(width=12, height=7, seed=7):
-    random.seed(seed)
-    grid_w = width * 2 + 1
-    grid_h = height * 2 + 1
-    maze = [["#" for _ in range(grid_w)] for _ in range(grid_h)]
-
-    def carve(x, y):
-        maze[y][x] = " "
-        directions = [(2, 0), (-2, 0), (0, 2), (0, -2)]
-        random.shuffle(directions)
-        for dx, dy in directions:
-            nx, ny = x + dx, y + dy
-            if 0 < nx < grid_w - 1 and 0 < ny < grid_h - 1 and maze[ny][nx] == "#":
-                maze[y + dy // 2][x + dx // 2] = " "
-                carve(nx, ny)
-
-    carve(1, 1)
-    maze[1][0] = "S"
-    maze[grid_h - 2][grid_w - 1] = "G"
-    return "\\n".join("".join(row) for row in maze)
-
-
-if __name__ == "__main__":
-    print(generate_maze())
-'''
 
     def _preferred_shell_from_extra_prompt(self, extra_prompt: str | None) -> str:
         text = str(extra_prompt or "")

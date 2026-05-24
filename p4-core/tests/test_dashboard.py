@@ -663,6 +663,85 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("separate inspect and execute", html)
             self.assertIn("task-2", html)
 
+    def test_dashboard_renders_planner_flow_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap_workspace(root, force=True)
+            from p4_core.dashboard import build_snapshot, render_dashboard_html
+            from p4_core.workspace import active_session_id, append_session_event
+
+            session_id = active_session_id(root)
+            append_session_event(
+                root,
+                session_id,
+                {
+                    "type": "operation",
+                    "role": "system",
+                    "operation_id": "op-planner",
+                    "title": "Terminal agent",
+                    "detail": "planner",
+                    "status": "running",
+                    "started_at": "2026-04-18T10:00:00+00:00",
+                },
+            )
+            profile = {
+                "complexity": "complex",
+                "signals": ["state_space:パズル"],
+                "strategy": "state_space_search",
+                "state_model": "states and legal moves",
+                "constraints": ["legal moves only"],
+                "verification_requirements": ["final_verifier"],
+            }
+            plan = {
+                "plan_id": "plan-dashboard",
+                "profile": profile,
+                "strategy": "state_space_search",
+                "work_units": [{"unit_id": "unit-1", "goal": "build solver"}],
+                "verification_contract": {"final_verifier": "replay the move sequence"},
+                "status": "accepted",
+                "revision_count": 0,
+            }
+            append_session_event(
+                root,
+                session_id,
+                {
+                    "type": "problem_profile",
+                    "role": "system",
+                    "operation_id": "op-planner",
+                    "content": "Problem profile selected strategy=state_space_search",
+                    "profile": profile,
+                    "turn_id": "turn-planner",
+                    "step_index": 1,
+                },
+            )
+            append_session_event(
+                root,
+                session_id,
+                {
+                    "type": "plan_record",
+                    "role": "system",
+                    "operation_id": "op-planner",
+                    "content": "Accepted PlanRecord plan-dashboard with 1 work units.",
+                    "plan": plan,
+                    "profile": profile,
+                    "strategy": "state_space_search",
+                    "work_units": plan["work_units"],
+                    "verification_contract": plan["verification_contract"],
+                    "turn_id": "turn-planner",
+                    "step_index": 2,
+                },
+            )
+
+            snapshot = build_snapshot(root)
+            operation = snapshot["recent_operations"][0]
+            labels = [item["label"] for item in _flow_items(operation)]
+            self.assertGreaterEqual(labels.count("decision"), 2)
+            html = render_dashboard_html(snapshot)
+            self.assertIn("problem_profile", html)
+            self.assertIn("plan_record", html)
+            self.assertIn("state_space_search", html)
+            self.assertIn("final_verifier", html)
+
     def test_operation_window_prefers_operation_id_over_time_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1394,6 +1473,140 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("success_evidence is required", html)
             self.assertIn("次に直すべきこと", html)
             self.assertIn("Provide a directly executable first_action", html)
+
+    def test_contract_progress_uses_canonical_finish_acceptance_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap_workspace(root, force=True)
+            from p4_core.dashboard import build_snapshot, render_dashboard_html
+            from p4_core.workspace import active_session_id, append_canonical_event
+
+            session_id = active_session_id(root)
+            append_canonical_event(
+                root,
+                session_id,
+                {
+                    "operation_id": "op-finished",
+                    "kind": "tool",
+                    "status": "finished",
+                    "payload": {
+                        "tool_name": "run_command",
+                        "tool_result": {"ok": True, "stdout": "", "stderr": "OK\n"},
+                    },
+                },
+            )
+            append_canonical_event(
+                root,
+                session_id,
+                {
+                    "operation_id": "op-finished",
+                    "kind": "decision",
+                    "status": "accepted",
+                    "payload": {
+                        "decision_type": "finish_acceptance",
+                        "details": {
+                            "status": "success",
+                            "evidence": {
+                                "artifact_written": True,
+                                "command_executed": True,
+                                "stdout_displayed": False,
+                            },
+                        },
+                    },
+                },
+            )
+
+            snapshot = build_snapshot(root)
+            self.assertEqual(snapshot["contract_progress"]["contract_state"], "success")
+            self.assertEqual(snapshot["contract_progress"]["artifact_written"], "yes")
+            self.assertEqual(snapshot["contract_progress"]["command_executed"], "yes")
+            self.assertEqual(snapshot["contract_progress"]["stdout_displayed"], "no")
+            self.assertEqual(snapshot["contract_progress"]["result_selected_for_user"], "yes")
+            html = render_dashboard_html(snapshot)
+            self.assertIn("<span>success</span>", html)
+            self.assertIn("<span>yes</span>", html)
+
+    def test_finished_canonical_operation_does_not_show_processing_child_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap_workspace(root, force=True)
+            from p4_core.dashboard import build_snapshot, render_dashboard_html
+            from p4_core.workspace import active_session_id, append_canonical_event
+
+            session_id = active_session_id(root)
+            append_canonical_event(
+                root,
+                session_id,
+                {
+                    "operation_id": "op-finished",
+                    "turn_id": "turn-finished",
+                    "step_index": 1,
+                    "kind": "decision",
+                    "status": "blocked",
+                    "payload": {
+                        "decision_type": "implementation_task_progress",
+                        "reason_code": "event_sourced_progress_state",
+                        "message": "実装タスク進行状態: implementation_missing",
+                    },
+                },
+            )
+            append_canonical_event(
+                root,
+                session_id,
+                {
+                    "operation_id": "op-finished",
+                    "turn_id": "turn-finished",
+                    "step_index": 2,
+                    "kind": "tool",
+                    "status": "finished",
+                    "payload": {
+                        "tool_name": "write_file",
+                        "tool_result": {"ok": True, "path": "app.py"},
+                    },
+                },
+            )
+            append_canonical_event(
+                root,
+                session_id,
+                {
+                    "operation_id": "op-finished",
+                    "turn_id": "turn-finished",
+                    "step_index": 3,
+                    "kind": "decision",
+                    "status": "accepted",
+                    "payload": {
+                        "decision_type": "finish_acceptance",
+                        "message": "完了受理判定: success",
+                        "details": {"status": "success", "evidence": {"artifact_written": True}},
+                    },
+                },
+            )
+            append_canonical_event(
+                root,
+                session_id,
+                {
+                    "operation_id": "op-finished",
+                    "turn_id": "turn-finished",
+                    "step_index": 4,
+                    "kind": "operation",
+                    "status": "finished",
+                    "payload": {
+                        "title": "Runtime queue item",
+                        "detail": "finished",
+                        "started_at": "2026-04-18T10:00:00+00:00",
+                        "finished_at": "2026-04-18T10:00:01+00:00",
+                        "output_preview": "done",
+                    },
+                },
+            )
+
+            operation = build_snapshot(root)["recent_operations"][0]
+            child_tasks = operation.get("flow_steps") or []
+            self.assertTrue(child_tasks)
+            self.assertEqual(child_tasks[0]["status"], "finished")
+            self.assertNotEqual(child_tasks[0]["title"], "処理中")
+            html = render_dashboard_html(build_snapshot(root))
+            self.assertNotIn("⚠ 子タスク 1: 処理中", html)
 
 class ModelNormalizationTests(unittest.TestCase):
     def test_router_prefers_fast_model_for_short_japanese_prompt(self) -> None:

@@ -6,7 +6,8 @@ import time
 from typing import Any
 
 from p4_core.config_defaults import DEFAULT_TOOL_CONTENT_CHUNK_BYTES
-from p4_core.schemas import tool_action_schema
+from p4_core.planning import PLAN_RECORD_SHAPE_HINT, plan_requires_revision, planning_required_for_profile, profile_problem
+from p4_core.schemas import PLAN_RECORD_SCHEMA, tool_action_schema
 from p4_core.runtime_profile import runtime_identity_answer
 
 from p4_core.workspace import append_jsonl, append_session_event, now_iso, read_json, read_jsonl
@@ -19,6 +20,8 @@ def _current_phase(self, *, user_message: str, steps: list[dict[str, Any]], rece
         result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
         if tool_name == "read_file" and bool(result.get("ok")):
             continue
+        if not bool(result.get("ok")) and plan_requires_revision(list(recent_events or []), [step]):
+            return "PLAN_REVISION"
         if tool_name in edit_tools and not bool(result.get("ok")):
             return "RECOVER_FROM_TOOL_FAILURE"
         if tool_name == "run_command" and not bool(result.get("ok")):
@@ -26,6 +29,26 @@ def _current_phase(self, *, user_message: str, steps: list[dict[str, Any]], rece
         break
     if self._deliberation_reasons(user_message=user_message, steps=steps, recent_events=recent_events):
         return "DELIBERATE"
+    recent = list(recent_events or [])
+    if plan_requires_revision(recent, steps):
+        return "PLAN_REVISION"
+    current_frame = self.frame_manager.current_frame()
+    if current_frame is not None and (
+        current_frame.parent_frame_id is not None
+        or current_frame.working_memory.child_tasks
+        or current_frame.working_memory.completed_child_tasks
+    ):
+        return "PLAN_EXECUTION"
+    profile = profile_problem(user_message)
+    has_plan_record = (
+        self._latest_plan_record_for_current_request(
+            user_message=user_message,
+            recent_events=recent,
+        )
+        is not None
+    )
+    if planning_required_for_profile(profile) and not has_plan_record:
+        return "PLANNING_REQUIRED"
     if recent_events:
         for event in reversed(recent_events):
             event_type = str(event.get("type") or "")
@@ -133,7 +156,17 @@ def _system_prompt(
     suppress_frame_operations: bool = False,
     allowed_tool_names: list[str] | tuple[str, ...] | None = None,
 ) -> str:
-    output_budget = self._output_budget_prompt(suppress_frame_operations=suppress_frame_operations)
+    allowed_tool_set = {str(name) for name in (allowed_tool_names or [])}
+    planning_contract_only = allowed_tool_set == {"create_plan"}
+    if planning_contract_only:
+        suppress_frame_operations = True
+    output_budget = (
+        "現在は計画契約フェーズです。create_plan 以外の tool は選べません。"
+        "PlanRecord には実装コード本文、テストコード本文、write_file/append_file/replace_text を入れないでください。"
+        "WorkUnit.first_action は list_files/read_file/search_code/run_command のいずれかだけにしてください。"
+        if planning_contract_only
+        else self._output_budget_prompt(suppress_frame_operations=suppress_frame_operations)
+    )
     tool_action_schema_text = json.dumps(
         tool_action_schema(
             include_frame_operations=not suppress_frame_operations,
@@ -143,6 +176,10 @@ def _system_prompt(
         separators=(",", ":"),
     )
     tool_descriptions = self.tools.describe_for_prompt()
+    if allowed_tool_set:
+        tool_descriptions = "\n".join(
+            line for line in tool_descriptions.splitlines() if any(line.startswith(f"- {name}:") for name in allowed_tool_set)
+        )
     if suppress_frame_operations:
         hidden_prefixes = ("- decompose_tasks:", "- open_child_frame:", "- return_to_parent:")
         tool_descriptions = "\n".join(
@@ -227,6 +264,9 @@ def _build_prompt(
     user_message: str = "",
     suppress_frame_operations: bool = False,
 ) -> str:
+    planning_contract_phase = current_phase in {"PLANNING_REQUIRED", "PLAN_REVISION"}
+    if planning_contract_phase:
+        suppress_frame_operations = True
     rendered_events = self._render_action_context_events(recent_events=recent_events, steps=steps or [], user_message=user_message)
     goal_part = goal_text.strip() or "(目標が設定されていません)"
     frame = self.frame_manager.current_frame()
@@ -269,6 +309,24 @@ def _build_prompt(
                 f"first_action={json.dumps(first_action, ensure_ascii=False)}\n"
                 "この状態で decompose_tasks/open_child_frame/finish を選ぶと runtime がブロックします。\n"
             )
+        if frame.depth > 0 and work_package and self._current_child_is_plan_work_unit():
+            if str(current_phase or "").startswith("IMPLEMENTATION_TASK_PROGRESS:"):
+                frame_block += (
+                    "\n重要: この子フレームは accepted PlanRecord の WorkUnit ですが、"
+                    "現在は implementation task progress gate が未完了です。"
+                    "この場合の正本は WorkUnit の work_type ではなく、後続の "
+                    "実装タスク進行契約 allowed_next_actions です。"
+                    "特に unittest 失敗後は、同じ run_command を繰り返さず、"
+                    "read_file once / targeted edit / unittest再実行の順に従ってください。\n"
+                )
+            else:
+                frame_block += (
+                    "\n重要: この子フレームは accepted PlanRecord の WorkUnit です。"
+                    "PlanRecord が分解の正本なので、この子フレーム内で decompose_tasks/open_child_frame は使えません。"
+                    "work_type と success_evidence に対応する直接ツールを1つ実行してください。"
+                    "edit なら write_file/replace_text、run_test なら run_command、inspect なら list_files/read_file/search_code を優先してください。"
+                    "WorkUnit の success_evidence が満たされた時だけ return_to_parent してください。\n"
+                )
         if frame.depth > 0 and has_child_return:
             frame_block += (
                 "\n重要: このフレームは直近で child_return を受け取り済みです。"
@@ -286,10 +344,42 @@ def _build_prompt(
         + "\n\n直近のリフレクション (失敗からの教訓):\n"
         + self._reflection_prompt_block(user_message=user_message)
         + "\n\n編集方針:\n"
-        + self._output_budget_prompt(suppress_frame_operations=suppress_frame_operations)
+        + (
+            "現在は計画契約フェーズです。create_plan 以外の tool は選ばないでください。"
+            "PlanRecord には実装コード本文、テストコード本文、write_file/append_file/replace_text を入れないでください。"
+            "WorkUnit.first_action は list_files/read_file/search_code/run_command のいずれかだけにしてください。"
+            if planning_contract_phase
+            else self._output_budget_prompt(suppress_frame_operations=suppress_frame_operations)
+        )
     )
     if current_phase == "DELIBERATE":
         prompt += "\n\n" + self._build_deliberation_note(user_message=user_message, steps=steps or [], recent_events=recent_events)
+    elif current_phase in {"PLANNING_REQUIRED", "PLAN_REVISION"}:
+        profile = profile_problem(user_message)
+        prompt += (
+            f"\n\n【計画契約フェーズ（{current_phase}）】\n"
+            "このタスクは実行前に PlanRecord が必要です。write_file/run_command/finish へ進まず、"
+            "tool_name=create_plan を返してください。\n"
+            "このフェーズの出力は小さい計画契約だけです。実装・テスト・長いcontent・コード断片は一切出力しないでください。"
+            "edit WorkUnit でも first_action は list_files か read_file にし、実際の write_file は PLAN_EXECUTION の子フレームで返してください。"
+            "run_test WorkUnit の first_action は run_command にしてください。"
+            "最小形は work_units を inspect/edit/run_test の3件程度にし、各 first_action は tool と args だけにしてください。\n"
+            f"ProblemProfile: {json.dumps(profile, ensure_ascii=False)}\n"
+            f"PlanRecord JSON Schema: {json.dumps(PLAN_RECORD_SCHEMA, ensure_ascii=False, separators=(',', ':'))}\n"
+            "PlanRecord は profile, strategy, work_units, verification_contract, status, revision_count を含めてください。"
+            "profile.strategy が state_space_search 等の専門戦略なら plan.strategy も同じ値にしてください。"
+            "state_space_search を選ぶ場合、verification_contract に state/action/goal/legal_move_validator/"
+            "solvability_check/heuristic_or_search_policy/final_verifier を必ず含めてください。"
+            "WorkUnit の first_action は実行可能な具体アクションにし、pass/TODO/暫定return/未実装コメントを含む実装やテストを入れないでください。"
+            f"{PLAN_RECORD_SHAPE_HINT}"
+        )
+    elif current_phase == "PLAN_EXECUTION":
+        prompt += (
+            "\n\n【計画実行フェーズ（PLAN_EXECUTION）】\n"
+            "accepted PlanRecord の WorkUnit を既存の child frame 契約として順に実行してください。"
+            "子フレーム内では first_action を優先し、PlanRecord WorkUnit の中で再度 decompose_tasks/open_child_frame を使わないでください。"
+            "証拠が揃ったら return_to_parent してください。"
+        )
     elif current_phase == "PLANNING":
         prompt += (
             "\n\n【計画フェーズ（PLANNING）】\n"
@@ -337,6 +427,7 @@ def _render_action_context_events(
         "open_child_frame_blocked",
         "frame_open_blocked",
         "frame_return_blocked",
+        "work_unit_success_evidence_blocked",
         "controller_finish",
         "grounding_judge",
         "validation_failure_consultant",
@@ -346,6 +437,12 @@ def _render_action_context_events(
         "first_action_required",
         "plan_acceptance_blocked",
         "plan_acceptance_review",
+        "planner_action_blocked",
+        "plan_record_autorepaired",
+        "plan_revision_returned_to_root",
+        "plan_execution_continue",
+        "plan_execution_paused_for_progress",
+        "workspace_resume",
         "completion_contract_recovery",
         "contract_incomplete",
         "judge_fallback_finish",
@@ -353,6 +450,7 @@ def _render_action_context_events(
         "blocked_action_ignored",
         "command_similarity_warning",
         "step_limit_final_gate",
+        "step_limit_plan_incomplete",
         "decompose_tasks_skipped_satisfied",
         "implementation_task_progress",
         "operator_interrupt",
@@ -780,6 +878,7 @@ def _render_action_context_events(
                 blocked_by = str(details.get("blocked_by") or "")
                 blocked_tool = str(details.get("blocked_tool") or "")
                 path = str(details.get("path") or "")
+                expected_shape = str(details.get("expected_shape") or "")
                 missing = "; ".join(str(item) for item in details.get("missing_requirements") or [] if str(item).strip())
                 allowed_next_actions = ", ".join(str(item) for item in details.get("allowed_next_actions") or [] if str(item).strip())
                 suggested_fix = str(details.get("suggested_fix") or "")
@@ -800,6 +899,8 @@ def _render_action_context_events(
                     line += f" | 許可される次アクション: {self._compact_context_text(allowed_next_actions, limit=360)}"
                 if suggested_fix and "次に必要:" not in line:
                     line += f" | 次に必要: {self._compact_context_text(suggested_fix, limit=600)}"
+                if str(event.get("code") or "") == "planner_action_blocked" and expected_shape and "PlanRecord正本:" not in line:
+                    line += f" | PlanRecord正本: {self._compact_context_text(expected_shape, limit=1500)}"
                 if next_required_action and "next_required_action:" not in line:
                     line += f" | next_required_action: {self._compact_context_text(next_required_action, limit=600)}"
         elif event_type == "tool_call":

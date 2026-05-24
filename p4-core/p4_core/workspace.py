@@ -29,6 +29,7 @@ DEFAULT_CONFIG = {
     "runtime": {
         "max_steps_per_message": 12,
         "verified_implementation_max_steps": 32,
+        "planned_implementation_max_steps": 48,
         "child_frame_max_steps": 15,
         "worker_poll_seconds": 2,
         "chat_timeout_seconds": 180,
@@ -601,6 +602,28 @@ def _canonical_event_from_session_event(event: dict[str, Any]) -> dict[str, Any]
                 "tasks": list(event.get("tasks") or []),
                 "rationale": str(event.get("rationale") or ""),
                 "frame_id": frame_id or str(event.get("frame_id") or ""),
+                "frame_depth": frame_depth,
+            },
+        }
+
+    if row_type in {"problem_profile", "planner_decision", "plan_record", "plan_revision"}:
+        plan = event.get("plan") if isinstance(event.get("plan"), dict) else {}
+        profile = event.get("profile") if isinstance(event.get("profile"), dict) else {}
+        details = event.get("details") if isinstance(event.get("details"), dict) else {}
+        return {
+            **common,
+            "kind": "decision",
+            "status": "accepted" if row_type != "plan_revision" else "blocked",
+            "payload": {
+                "decision_type": row_type,
+                "message": str(event.get("content") or ""),
+                "strategy": str(event.get("strategy") or plan.get("strategy") or profile.get("strategy") or ""),
+                "profile": profile,
+                "plan": plan,
+                "work_units": list(event.get("work_units") or plan.get("work_units") or []),
+                "verification_contract": event.get("verification_contract") or plan.get("verification_contract") or {},
+                "details": details,
+                "frame_id": frame_id,
                 "frame_depth": frame_depth,
             },
         }

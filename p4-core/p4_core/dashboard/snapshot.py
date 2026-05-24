@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from p4_core.frames import FrameManager
+from p4_core.grounding import _finish_acceptance_contract
 from p4_core.ollama_client import OllamaChatClient
 from p4_core.workspace import WorkspacePaths, active_session_id, read_json, read_jsonl, now_iso
 
@@ -212,7 +213,7 @@ def _trace_preview_for_operation(operation: dict[str, Any], events: list[dict[st
         if row_time is None or row_time < started_at: continue
         if finished_at is not None and row_time > finished_at + timedelta(seconds=2): continue
         row_type = str(row.get("type") or "")
-        if row_type not in {"user_message", "assistant_message", "tool_call", "tool_result", "finish", "system_note", "planning_note", "task_plan", "observer_note", "activity_update", "runtime_event", "frame_opened", "frame_returned", "child_return"}: continue
+        if row_type not in {"user_message", "assistant_message", "tool_call", "tool_result", "finish", "system_note", "planning_note", "task_plan", "problem_profile", "planner_decision", "plan_record", "plan_revision", "observer_note", "activity_update", "runtime_event", "frame_opened", "frame_returned", "child_return"}: continue
         if row_type == "user_message":
             trace_lines.append(f"[user_message] {row.get('content') or ''}")
         elif row_type == "assistant_message":
@@ -227,6 +228,8 @@ def _trace_preview_for_operation(operation: dict[str, Any], events: list[dict[st
             trace_lines.append(f"[runtime_event:{row.get('event_name') or ''}] {row.get('content') or ''}")
         elif row_type == "task_plan":
             trace_lines.append(f"[task_plan] {row.get('content') or ''} tasks={json.dumps(row.get('tasks') or [], ensure_ascii=False)}")
+        elif row_type in {"problem_profile", "planner_decision", "plan_record", "plan_revision"}:
+            trace_lines.append(f"[{row_type}] {row.get('content') or ''} details={json.dumps(row.get('plan') or row.get('profile') or row.get('details') or {}, ensure_ascii=False)}")
         elif row_type == "finish":
             trace_lines.append(f"[finish] {row.get('content') or ''}")
     return "\n\n".join(trace_lines)[-16000:]
@@ -255,7 +258,7 @@ def _flow_steps_for_operation(operation: dict[str, Any], events: list[dict[str, 
     frame_stack: list[str] = []
     for row in events:
         row_type = str(row.get("type") or "")
-        if row_type not in {"user_message", "assistant_message", "tool_call", "tool_result", "finish", "system_note", "planning_note", "task_plan", "observer_note", "activity_update", "runtime_event", "frame_opened", "frame_returned", "child_return"}: continue
+        if row_type not in {"user_message", "assistant_message", "tool_call", "tool_result", "finish", "system_note", "planning_note", "task_plan", "problem_profile", "planner_decision", "plan_record", "plan_revision", "observer_note", "activity_update", "runtime_event", "frame_opened", "frame_returned", "child_return"}: continue
         if not _event_in_operation_window(row, operation): continue
         if row_type == "runtime_event" and str(row.get("event_name") or "") in {"llm_stream_chunk", "tool_stream"}:
             continue
@@ -303,6 +306,17 @@ def _flow_steps_for_operation(operation: dict[str, Any], events: list[dict[str, 
                 "rationale": str(row.get("rationale") or ""),
                 "tasks": row.get("tasks") or [],
                 "frame_id": str(row.get("frame_id") or ""),
+            }
+        elif row_type in {"problem_profile", "planner_decision", "plan_record", "plan_revision"}:
+            item = {
+                "label": row_type,
+                "content": str(row.get("content") or ""),
+                "profile": row.get("profile") or {},
+                "strategy": str(row.get("strategy") or ""),
+                "plan": row.get("plan") or {},
+                "work_units": row.get("work_units") or [],
+                "verification_contract": row.get("verification_contract") or {},
+                "details": row.get("details") or {},
             }
         elif row_type == "runtime_event":
             item = {
@@ -612,6 +626,7 @@ def _canonical_flow_steps_for_operation(
         "grounding_issues": {"title": "根拠判定NG", "desc": "最終回答が収集済みEvidenceで支えられていない"},
         "tool_failed": {"title": "ツール実行失敗", "desc": "toolが returncode 非0または ok=false を返した"},
         "child_task_incomplete": {"title": "子タスク未完了", "desc": "first_action は成功したが success_evidence 未達"},
+        "work_unit_success_evidence_not_observed": {"title": "WorkUnit成功条件未達", "desc": "toolは成功したが、PlanRecordのsuccess_evidenceに対応する観測証拠がまだない"},
     }
 
     for row in events:
@@ -640,7 +655,7 @@ def _canonical_flow_steps_for_operation(
         
         target_code = code
         if code == "llm_output_issue": target_code = parse_issue
-        if code in {"work_package_invalid", "decompose_tasks_blocked", "open_child_frame_blocked", "frame_open_blocked"} and reason_code:
+        if code in {"work_package_invalid", "decompose_tasks_blocked", "open_child_frame_blocked", "frame_open_blocked", "work_unit_success_evidence_blocked"} and reason_code:
             target_code = reason_code
         if code == "grounding_judge" and reason_code == "error":
             target_code = "grounding_judge_error"
@@ -664,9 +679,19 @@ def _canonical_flow_steps_for_operation(
     child_tasks = []
     current_child_task = None
     
-    def _close_child_task():
+    def _close_child_task(final: bool = False):
         nonlocal current_child_task
         if current_child_task:
+            status = str(current_child_task.get("status") or "")
+            if not operation_finished:
+                if final:
+                    if status in {"blocked", "failed"}:
+                        current_child_task["status"] = "running"
+                elif status in {"blocked", "failed"} or current_child_task.get("has_warnings"):
+                    current_child_task["status"] = "finished_with_warnings"
+                elif status == "running":
+                    current_child_task["status"] = "finished"
+            current_child_task.pop("has_warnings", None)
             child_tasks.append(current_child_task)
             current_child_task = None
 
@@ -891,13 +916,21 @@ def _canonical_flow_steps_for_operation(
         
         # Set task status
         if any(i.get("status") == "blocked" for i in consolidated_items):
-            current_child_task["status"] = "finished_with_warnings" if operation_finished else "blocked"
+            current_child_task["has_warnings"] = True
+            current_child_task["status"] = "finished_with_warnings" if operation_finished else "running"
         elif any(i.get("status") == "failed" for i in consolidated_items):
-            current_child_task["status"] = "finished_with_warnings" if operation_finished else "failed"
-        elif current_child_task["status"] == "running":
+            current_child_task["has_warnings"] = True
+            current_child_task["status"] = "finished_with_warnings" if operation_finished else "running"
+        elif operation_finished and current_child_task["status"] == "running":
             current_child_task["status"] = "finished" # optimistic finish for now
 
-    _close_child_task()
+    _close_child_task(final=True)
+    if operation_finished and str(operation.get("status") or "") == "finished":
+        for task in child_tasks:
+            if str(task.get("status") or "") in {"running", "blocked", "finished_with_warnings"}:
+                task["status"] = "finished"
+            if str(task.get("title") or "") == "処理中":
+                task["title"] = "実行フロー"
     
     return child_tasks
 
@@ -1068,6 +1101,13 @@ def build_snapshot(root: Path) -> dict[str, Any]:
                     latest_tool_result = next((row for row in reversed(events) if row.get("type") == "tool_result" and _event_in_operation_window(row, operation)), None)
                     if latest_tool_result is not None and str(operation.get("status") or "") != "blocked":
                         operation["output_preview"] = str(latest_tool_result.get("content") or operation.get("output_preview") or "")
+    contract_progress = _compute_contract_progress(canonical_display_events) if canonical_events else _compute_contract_progress(_legacy_events_for_contract_progress(events))
+    if not contract_progress.get("required_contract"):
+        current_user_message = str(runtime.get("current_user_message") or "").strip()
+        if current_user_message:
+            contract_progress["required_contract"] = _finish_acceptance_contract(current_user_message)
+            if contract_progress["required_contract"] and contract_progress.get("contract_state") == "unknown":
+                contract_progress["contract_state"] = "running"
     return {
         "root": str(Path(root).expanduser().resolve()),
         "model": _reasoning_model(root),
@@ -1082,6 +1122,7 @@ def build_snapshot(root: Path) -> dict[str, Any]:
         "commentator_notes": _canonical_commentator_notes(canonical_display_events) if canonical_events else _commentator_notes(events),
         "frames": FrameManager(root).snapshot(),
         "latest_result": _latest_result_from_canonical(canonical_events) if canonical_events else _latest_result_from_legacy(session),
+        "contract_progress": contract_progress,
     }
 
 
@@ -1170,6 +1211,7 @@ def _latest_result_from_legacy(session: dict[str, Any]) -> dict[str, Any]:
 def _compute_contract_progress(events: list[dict[str, Any]]) -> dict[str, Any]:
     state = {
         "contract_state": "unknown",
+        "required_contract": [],
         "artifact_written": "no",
         "command_executed": "no",
         "stdout_displayed": "no",
@@ -1192,8 +1234,12 @@ def _compute_contract_progress(events: list[dict[str, Any]]) -> dict[str, Any]:
                     
         # Override with finish_acceptance decision if present
         if kind == "decision" and payload.get("decision_type") == "finish_acceptance":
-            state["contract_state"] = payload.get("status", "unknown")
-            evidence = payload.get("evidence", {})
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            state["contract_state"] = details.get("status") or payload.get("status", "unknown")
+            contract = details.get("contract") if isinstance(details.get("contract"), list) else payload.get("contract", [])
+            if isinstance(contract, list):
+                state["required_contract"] = [str(item) for item in contract if str(item or "").strip()]
+            evidence = details.get("evidence") if isinstance(details.get("evidence"), dict) else payload.get("evidence", {})
             if "artifact_written" in evidence:
                 state["artifact_written"] = "yes" if evidence["artifact_written"] else "no"
             if "command_executed" in evidence:
@@ -1204,3 +1250,41 @@ def _compute_contract_progress(events: list[dict[str, Any]]) -> dict[str, Any]:
                 state["result_selected_for_user"] = "yes"
                 
     return state
+
+
+def _legacy_events_for_contract_progress(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in events:
+        event_type = str(row.get("type") or "")
+        if event_type == "tool_result":
+            tool_result = {}
+            raw_content = row.get("content")
+            if isinstance(raw_content, str) and raw_content.strip():
+                try:
+                    parsed = json.loads(raw_content)
+                    if isinstance(parsed, dict):
+                        tool_result = parsed
+                except json.JSONDecodeError:
+                    tool_result = {}
+            if "ok" not in tool_result:
+                tool_result["ok"] = bool(row.get("ok"))
+            rows.append(
+                {
+                    "kind": "tool",
+                    "payload": {
+                        "tool_name": str(row.get("tool_name") or tool_result.get("tool") or ""),
+                        "tool_result": tool_result,
+                    },
+                }
+            )
+        if event_type == "system_note" and str(row.get("code") or "") == "finish_acceptance":
+            rows.append(
+                {
+                    "kind": "decision",
+                    "payload": {
+                        "decision_type": "finish_acceptance",
+                        "details": row.get("details") if isinstance(row.get("details"), dict) else {},
+                    },
+                }
+            )
+    return rows

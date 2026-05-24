@@ -540,27 +540,34 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(tool_call["tool_name"], "run_command")
             self.assertEqual(tool_call["tool_args"]["command"], "pwd")
 
-    def test_terminal_fast_path_creates_and_runs_maze_without_llm_code_json(self) -> None:
+    def test_terminal_agent_uses_llm_for_maze_requests_instead_of_fixed_scaffold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bootstrap_workspace(root, force=True)
-            runtime = AgentRuntime(root, llm_backend=FakeBackend([]))
+            backend = FakeBackend(
+                [
+                    '{"assistant_message":"writing","tool_name":"write_file","tool_args":{"path":"maze_gen.py","content":"print(\\"MODEL_MAZE\\")\\n"}}',
+                    '{"assistant_message":"running","tool_name":"run_command","tool_args":{"command":"python3 maze_gen.py","shell":"bash"}}',
+                ]
+            )
+            runtime = AgentRuntime(root, llm_backend=backend)
             result = runtime.run_terminal_agent("迷路を実装して実行し表示して結果を見せて", model="devstral:latest", shell_name="bash")
             self.assertTrue(result["run"]["last_result"]["ok"])
             status = read_json(WorkspacePaths(root).runtime_status_path, fallback={})
             workspace = Path(status["last_llm_workspace"])
             self.assertTrue((workspace / "maze_gen.py").exists())
+            self.assertEqual((workspace / "maze_gen.py").read_text(), 'print("MODEL_MAZE")\n')
             events = read_jsonl(WorkspacePaths(root).session_events_path("main"))
             tool_calls = [event for event in events if event["type"] == "tool_call"]
             self.assertEqual([event["tool_name"] for event in tool_calls], ["write_file", "run_command"])
+            self.assertTrue(any(event["type"] == "assistant_message" and "writing" in event["content"] for event in events))
             run_result = next(
                 json.loads(event["content"])
                 for event in events
                 if event["type"] == "tool_result" and event["tool_name"] == "run_command"
             )
             self.assertTrue(run_result["ok"])
-            self.assertIn("S", run_result["stdout"])
-            self.assertIn("G", run_result["stdout"])
+            self.assertIn("MODEL_MAZE", run_result["stdout"])
 
     def test_terminal_fast_path_continues_with_next_missing_command_before_llm_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

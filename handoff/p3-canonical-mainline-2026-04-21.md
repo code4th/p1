@@ -19,11 +19,11 @@ This is the single P3 entry point for the completed P3 baseline. If another P3 n
 - Runtime version constant: `p3_core.__version__`
 - Tests: `p3-core/tests/`
 - requirements/design/task history:
-  - [p3-requirements-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/p3-requirements-2026-04-18.md)
-  - [p3-design-spec-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/p3-design-spec-2026-04-18.md)
-  - [p3-phase-plan-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/p3-phase-plan-2026-04-18.md)
-  - [p3-task-list-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/p3-task-list-2026-04-18.md)
-  - [note-p3-experiment-2026-04-20.md](/Users/satojunichi/Documents/openclaw/handoff/note-p3-experiment-2026-04-20.md)
+  - [p3-requirements-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p3/p3-requirements-2026-04-18.md)
+  - [p3-design-spec-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p3/p3-design-spec-2026-04-18.md)
+  - [p3-phase-plan-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p3/p3-phase-plan-2026-04-18.md)
+  - [p3-task-list-2026-04-18.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p3/p3-task-list-2026-04-18.md)
+  - [note-p3-experiment-2026-04-20.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p3/note-p3-experiment-2026-04-20.md)
 
 Verification:
 
@@ -53,7 +53,7 @@ P3 mainline is a local LLM agent runtime with:
 - compact action context that excludes stale observer notes and unrelated old tasks
 - passive Japanese live commentator, observational only
 - blocked/success/failed/running operation status separation
-- controller fast paths for requested commands and the known maze scaffold task
+- controller fast paths for explicit user-requested commands only
 - direct terminal evidence completion for command stdout results
 
 ## Important Behavioral Decisions
@@ -89,34 +89,13 @@ P3 mainline is a local LLM agent runtime with:
 
    If terminal stdout is direct evidence for the final answer, the controller may finish without waiting for an LLM judge.
 
-6. The maze task is a known scaffold fast path.
+6. Coding tasks are not satisfied through fixed benchmark scaffolds.
 
-   For requests like `迷路を実装して実行し表示して結果を見せて`, P3 writes a small `maze_gen.py`, runs `python3 maze_gen.py`, and returns the observed stdout. This proves the current mainline can create and run a small program.
+   Requests like `迷路を実装して実行し表示して結果を見せて` must go through the normal LLM action loop. The controller fast path may execute explicit user-requested commands, but it must not synthesize a fixed `maze_gen.py` or other benchmark artifact.
 
 ## Latest Live Smoke Result
 
-Workspace:
-
-```text
-/tmp/p3-dashboard-commentary
-```
-
-Latest relevant run created:
-
-```text
-/private/tmp/p3-dashboard-commentary/workspaces/runs/cd5a315f2bcf4bce8d9b20c059c6579f/maze_gen.py
-```
-
-Result:
-
-- operation status: `success`
-- runtime status: `idle`
-- command: `python3 maze_gen.py`
-- returncode: `0`
-- output: S/G ASCII maze
-- reachability check: S to G path exists
-
-This live workspace is not the mainline itself. It is only a smoke-test artifact.
+The previous maze scaffold smoke result has been retired because fixed benchmark-like scaffolds pollute capability evaluation. Current smoke coverage should use either explicit user-requested commands or LLM-driven coding turns.
 
 ## Remaining Work Before P4
 
@@ -150,7 +129,7 @@ Do not start P4 from:
 
 - `/tmp/p3-dashboard-commentary`
 - old P2 docs
-- `handoff/note-p3-experiment-2026-04-20.md`
+- `handoff/archive/p3/note-p3-experiment-2026-04-20.md`
 - partial dashboard logs
 
 Those are historical evidence. The current baseline is `p3-core/` plus this canonical handoff.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import time
 from typing import Any
 
@@ -87,6 +88,15 @@ def _finish_acceptance_evaluation(self, *, user_message: str, final_answer: str,
     }
     if missing:
         evaluation["limitations"].append("required observable evidence is missing")
+        if "stdout_displayed" in missing:
+            evaluation["allowed_next_actions"] = [
+                "run_command <non-interactive demo or verifier command that prints the requested visible result to stdout>"
+            ]
+            evaluation["suggested_fix"] = (
+                "ユーザーが実行結果の可視証拠を求めているため、unittestのstderr成功だけではfinishできません。"
+                "成果物のprogrammatic APIまたはCLIを非対話で実行し、解答・到達状態・主要結果をstdoutに出してください。"
+            )
+            evaluation["next_required_action"] = "run the artifact or verifier and print the requested result to stdout"
         return evaluation
     sanity_issues = (
         visible_result_sanity_issues(
@@ -101,6 +111,11 @@ def _finish_acceptance_evaluation(self, *, user_message: str, final_answer: str,
         evaluation["semantic_status"] = "not_required"
         evaluation["missing"].append("visible_result_sanity_passed")
         evaluation["limitations"].extend(sanity_issues)
+        evaluation["allowed_next_actions"] = [
+            "run_command <non-interactive demo or verifier command that prints a meaningful visible result>"
+        ]
+        evaluation["suggested_fix"] = "表示されたstdoutが低情報量です。成果物の状態・結果・検証内容が分かるstdoutを出してください。"
+        evaluation["next_required_action"] = "rerun the artifact or verifier with meaningful stdout"
         return evaluation
     if _final_answer_is_empty_tool_success(user_message=user_message, final_answer=final_answer, evidence=evidence):
         evaluation["status"] = "needs_revision"
@@ -163,6 +178,24 @@ def _finish_acceptance_evaluation(self, *, user_message: str, final_answer: str,
     return evaluation
 
 
+def _unittest_command_is_acceptance(command: str) -> bool:
+    """Return whether a unittest command is the full acceptance suite.
+
+    Narrow unittest targets are useful diagnostics after a timeout, but they
+    must not satisfy the finish gate.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(command or "").strip().lower())
+    if " -m unittest " not in f" {normalized} ":
+        return False
+    if " discover" not in normalized:
+        return False
+    return bool(
+        re.search(r"(?:^| )-s tests(?: |$)", normalized)
+        or re.search(r"(?:^| )--start-directory(?:=| )tests(?: |$)", normalized)
+    )
+
+
 def _finish_acceptance_evidence(steps: list[dict[str, Any]]) -> dict[str, Any]:
     successful_edits = [
         step
@@ -209,13 +242,20 @@ def _finish_acceptance_evidence(steps: list[dict[str, Any]]) -> dict[str, Any]:
         for row in command_results
         if "unittest" in str(row.get("command") or "").lower()
     ]
+    acceptance_unittest_results = [
+        row
+        for row in unittest_results
+        if _unittest_command_is_acceptance(str(row.get("command") or ""))
+    ]
     return {
         "artifact_written": artifact_written,
         "python_artifact_written": any(_artifact_path_is_python_implementation(path) for path in artifact_paths),
         "tests_written": bool(test_steps),
         "meaningful_tests": any(_test_source_is_meaningful(_step_source_text(step)) for step in test_steps),
-        "unittest_run": bool(unittest_results),
-        "unittest_passed": any(bool(row.get("ok")) for row in unittest_results),
+        "unittest_run": bool(acceptance_unittest_results),
+        "unittest_passed": any(bool(row.get("ok")) for row in acceptance_unittest_results),
+        "diagnostic_unittest_run": bool(unittest_results),
+        "diagnostic_unittest_passed": any(bool(row.get("ok")) for row in unittest_results),
         "command_executed": command_executed,
         "stdout_displayed": stdout_displayed,
         "stderr_only": stderr_only,
@@ -246,15 +286,19 @@ def _finish_acceptance_evidence(steps: list[dict[str, Any]]) -> dict[str, Any]:
 def _finish_acceptance_contract(user_message: str) -> list[str]:
     text = str(user_message or "").lower()
     contract: list[str] = []
+    execution_requested = any(marker in text for marker in ["実行", "run", "execute", "起動"])
     if any(marker in text for marker in ["作", "生成", "create", "write", "file", "ファイル", "コード"]):
         contract.append("artifact_written")
     if any(marker in text for marker in ["実装", "implement", "python", "solver", "ソルバー", "コード"]):
         contract.append("python_artifact_written")
     if any(marker in text for marker in ["unittest", "tests/", "テスト", "検証", "test"]):
         contract.extend(["tests_written", "meaningful_tests", "unittest_run", "unittest_passed"])
-    if any(marker in text for marker in ["実行", "run", "execute", "起動"]):
+    if execution_requested:
         contract.append("command_executed")
-    if any(marker in text for marker in ["標準出力", "stdout", "表示", "見せ", "display", "show"]):
+    self_run_markers = ["自分で", "自ら", "クリア", "解く", "solve", "complete"]
+    if any(marker in text for marker in ["標準出力", "stdout", "表示", "見せ", "display", "show"]) or (
+        execution_requested and any(marker in text for marker in self_run_markers)
+    ):
         contract.append("stdout_displayed")
     return list(dict.fromkeys(contract))
 
@@ -264,13 +308,19 @@ def _artifact_path_is_test(path: str) -> bool:
     name = normalized.rsplit("/", 1)[-1]
     if name == "__init__.py":
         return False
-    return normalized.startswith("tests/") or name.startswith("test_") or name.endswith("_test.py")
+    return normalized.startswith("tests/") and (name.startswith("test_") or name.endswith("_test.py"))
 
 
 def _artifact_path_is_python_implementation(path: str) -> bool:
     normalized = str(path or "").replace("\\", "/")
     name = normalized.rsplit("/", 1)[-1]
-    return normalized.endswith(".py") and not _artifact_path_is_test(normalized) and name != "__init__.py"
+    return (
+        normalized.endswith(".py")
+        and not _artifact_path_is_test(normalized)
+        and not name.startswith("test_")
+        and not name.endswith("_test.py")
+        and name != "__init__.py"
+    )
 
 
 def _step_source_text(step: dict[str, Any]) -> str:

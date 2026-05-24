@@ -33,7 +33,7 @@
 
 ### 1. 設計の主語と中心命題
 
-- [p2-meta-design-clarification-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-meta-design-clarification-2026-04-11.md)
+- [p2-meta-design-clarification-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-meta-design-clarification-2026-04-11.md)
   - 役割: `P2` 自身と `P2` を実装する側を分ける
   - 現在の扱い: 正本
   - 重要点:
@@ -42,7 +42,7 @@
 
 ### 2. 失敗原因の正本診断
 
-- [p2-why-repeats-failures-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-why-repeats-failures-2026-04-11.md)
+- [p2-why-repeats-failures-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-why-repeats-failures-2026-04-11.md)
   - 役割: 失敗反復の主因整理
   - 現在の扱い: 正本
   - 重要点:
@@ -51,7 +51,7 @@
 
 ### 3. 現在の kernel 方針
 
-- [p2-session-kernel-implementation-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-session-kernel-implementation-2026-04-11.md)
+- [p2-session-kernel-implementation-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-session-kernel-implementation-2026-04-11.md)
   - 役割: 現在の実装済み kernel の説明
   - 現在の扱い: 正本
   - 重要点:
@@ -61,7 +61,7 @@
 
 ### 4. 再帰フレーム運用
 
-- [p2-recursive-frame-rules-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-recursive-frame-rules-2026-04-11.md)
+- [p2-recursive-frame-rules-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-recursive-frame-rules-2026-04-11.md)
   - 役割: 子フレームへ降りる条件、戻る条件、小タスク作成ルール
   - 現在の扱い: 正本
   - 重要点:
@@ -72,49 +72,49 @@
 
 ### 設計判断の補助
 
-- [p2-context-vs-tool-loop-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-context-vs-tool-loop-2026-04-11.md)
+- [p2-context-vs-tool-loop-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-context-vs-tool-loop-2026-04-11.md)
   - 役割: コンテキスト粗さと tool loop 不在の関係整理
   - 現在の扱い: 補助
 
-- [p2-context-failure-ack-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-context-failure-ack-2026-04-11.md)
+- [p2-context-failure-ack-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-context-failure-ack-2026-04-11.md)
   - 役割: 実装側の失敗認識
   - 現在の扱い: 補助
 
-- [p2-what-to-do-next-meta-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-what-to-do-next-meta-2026-04-11.md)
+- [p2-what-to-do-next-meta-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-what-to-do-next-meta-2026-04-11.md)
   - 役割: session/event loop への切り替え理由
   - 現在の扱い: 補助
 
-- [p2-context-carryover-design-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-context-carryover-design-2026-04-11.md)
+- [p2-context-carryover-design-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-context-carryover-design-2026-04-11.md)
   - 役割: OSS を基準にした P2 の文脈継承設計
   - 現在の扱い: 補助
 
 ### 調査・分析
 
-- [p2-stability-log-investigation-2026-04-09.md](/Users/satojunichi/Documents/openclaw/handoff/p2-stability-log-investigation-2026-04-09.md)
+- [p2-stability-log-investigation-2026-04-09.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-stability-log-investigation-2026-04-09.md)
   - 役割: 長時間 run の分析
   - 現在の扱い: 補助
 
-- [claw-code-purpose-achievement-analysis-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/claw-code-purpose-achievement-analysis-2026-04-11.md)
+- [claw-code-purpose-achievement-analysis-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/general/claw-code-purpose-achievement-analysis-2026-04-11.md)
   - 役割: `claw-code` 実装調査
   - 現在の扱い: 補助
 
-- [open-source-agent-purpose-execution-comparison-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/open-source-agent-purpose-execution-comparison-2026-04-11.md)
+- [open-source-agent-purpose-execution-comparison-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/general/open-source-agent-purpose-execution-comparison-2026-04-11.md)
   - 役割: OSS agent 横断比較
   - 現在の扱い: 補助
 
 ## Historical / Article Drafts
 
-- [note-self-improvement-ai-hierarchy-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/note-self-improvement-ai-hierarchy-2026-04-11.md)
+- [note-self-improvement-ai-hierarchy-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/general/note-self-improvement-ai-hierarchy-2026-04-11.md)
   - 役割: note 向け叙述
   - 現在の扱い: 履歴 / 外部向け文章
 
-- [note-self-improvement-ai-self-awareness-2026-04-09.md](/Users/satojunichi/Documents/openclaw/handoff/note-self-improvement-ai-self-awareness-2026-04-09.md)
+- [note-self-improvement-ai-self-awareness-2026-04-09.md](/Users/satojunichi/Documents/openclaw/handoff/archive/general/note-self-improvement-ai-self-awareness-2026-04-09.md)
   - 役割: note 向け叙述
   - 現在の扱い: 履歴 / 外部向け文章
 
 ## Conflict
 
-- [p2-minimal-kernel-cut-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/p2-minimal-kernel-cut-2026-04-11.md)
+- [p2-minimal-kernel-cut-2026-04-11.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p2/p2-minimal-kernel-cut-2026-04-11.md)
   - 役割: 仕切り直し時点の最小 kernel 案
   - 現在の扱い: 一部衝突あり
   - 衝突点:

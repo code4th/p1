@@ -12,14 +12,14 @@ Use this document first, then the code and operational docs below:
 - code root: [p1-core](/Users/satojunichi/Documents/openclaw/p1-core)
 - architecture: [architecture.md](/Users/satojunichi/Documents/openclaw/p1-core/docs/architecture.md)
 - operator runbook: [p1-bootstrap-runbook.md](/Users/satojunichi/Documents/openclaw/p1-core/runbooks/p1-bootstrap-runbook.md)
-- future handoff: [p1-future-handoff-2026-04-05.md](/Users/satojunichi/Documents/openclaw/handoff/p1-future-handoff-2026-04-05.md)
+- future handoff: [p1-future-handoff-2026-04-05.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-future-handoff-2026-04-05.md)
 
 Historical P1 notes remain useful as background, but they do not override this file.
 When a scattered note conflicts with this master document, update this master document first.
 
 Main-thread catch-up:
 
-- [p1-main-thread-catchup-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/p1-main-thread-catchup-2026-04-04.md)
+- [p1-main-thread-catchup-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-main-thread-catchup-2026-04-04.md)
 
 ## 0. Purpose Before Means
 
@@ -618,10 +618,10 @@ The next meaningful work is now:
 
 These are now supporting docs, not the primary entrypoint:
 
-- [p1-manager-handoff-source-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/p1-manager-handoff-source-2026-04-04.md)
-- [p1-canonical-handoff-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/p1-canonical-handoff-2026-04-04.md)
-- [p1-external-core-plan-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/p1-external-core-plan-2026-04-04.md)
-- [p1-openclaw-bridge-spec-2026-03-30.md](/Users/satojunichi/Documents/openclaw/handoff/p1-openclaw-bridge-spec-2026-03-30.md)
-- [p1-openclaw-operating-rule-2026-03-29.md](/Users/satojunichi/Documents/openclaw/handoff/p1-openclaw-operating-rule-2026-03-29.md)
-- [p1-keeper-handoff-2026-03-29.md](/Users/satojunichi/Documents/openclaw/handoff/p1-keeper-handoff-2026-03-29.md)
+- [p1-manager-handoff-source-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-manager-handoff-source-2026-04-04.md)
+- [p1-canonical-handoff-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-canonical-handoff-2026-04-04.md)
+- [p1-external-core-plan-2026-04-04.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-external-core-plan-2026-04-04.md)
+- [p1-openclaw-bridge-spec-2026-03-30.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-openclaw-bridge-spec-2026-03-30.md)
+- [p1-openclaw-operating-rule-2026-03-29.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-openclaw-operating-rule-2026-03-29.md)
+- [p1-keeper-handoff-2026-03-29.md](/Users/satojunichi/Documents/openclaw/handoff/archive/p1/p1-keeper-handoff-2026-03-29.md)
 - [p1-bootstrap-runbook.md](/Users/satojunichi/Documents/openclaw/p1-core/runbooks/p1-bootstrap-runbook.md)

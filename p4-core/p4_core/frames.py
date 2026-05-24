@@ -295,6 +295,16 @@ class FrameManager:
         self._persist("step_incremented")
         return frame.step_count
 
+    def reset_active_stack_steps(self) -> None:
+        """Start a continuation turn with a fresh per-turn frame budget."""
+
+        stack = self.frame_stack()
+        if not stack:
+            return
+        for frame in stack:
+            frame.step_count = 0
+        self._persist("continuation_steps_reset")
+
     def abandon_all(self) -> None:
         for frame in self.frames.values():
             if frame.status == "active":

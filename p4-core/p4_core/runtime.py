@@ -19,9 +19,23 @@ from p4_core.config_defaults import DEFAULT_TOOL_CONTENT_CHUNK_BYTES
 from p4_core.models import ModelRouter
 from p4_core.ollama_client import OllamaChatClient
 from p4_core.output_contract import stdout_looks_like_user_visible_result
+from p4_core.progress_block import ProgressBlockDecision
 from p4_core.repo_map import build_repo_map, format_repo_map_for_prompt
 from p4_core.schema_validation import validate_json_schema
-from p4_core.schemas import NON_DECOMPOSE_ACTION_TOOLS, PLAN_ACCEPTANCE_SCHEMA, TOOL_ACTION_NAMES, WORK_PACKAGE_SCHEMA, WORK_TYPES
+from p4_core.planning import (
+    CONSTRAINT_SATISFACTION_REQUIRED_CONTRACT,
+    DYNAMIC_PROGRAMMING_REQUIRED_CONTRACT,
+    PLAN_FIRST_ACTION_CONTENT_BYTES,
+    PLAN_RECORD_SHAPE_HINT,
+    plan_record_to_work_packages,
+    plan_revision_reasons,
+    planning_required_for_profile,
+    profile_problem,
+    plan_requires_revision,
+    STATE_SPACE_REQUIRED_CONTRACT,
+    validate_plan_record_contract,
+)
+from p4_core.schemas import NON_DECOMPOSE_ACTION_TOOLS, PLAN_ACCEPTANCE_SCHEMA, PLAN_RECORD_SCHEMA, TOOL_ACTION_NAMES, WORK_PACKAGE_SCHEMA, WORK_TYPES
 from p4_core.runtime_profile import is_runtime_identity_query, runtime_identity_answer, runtime_profile_evidence
 from p4_core.tools import ToolExecutor
 from p4_core.workspace import (
@@ -58,6 +72,7 @@ from p4_core.grounding import (
     _semantic_finish_acceptance_review,
     _semantic_grounding_check,
     _test_source_is_meaningful,
+    _unittest_command_is_acceptance,
 )
 from p4_core.guards import (
     _classify_failure,
@@ -77,6 +92,7 @@ from p4_core.llm_comm import (
     _format_llm_stream_text,
     _json_repair_prompt,
     _looks_like_in_progress_write_file_content_stream,
+    _looks_like_plan_record_embedded_edit_stream,
     _looks_like_repetitive_machine_control_output,
     _parse_issue_should_exit_repair_loop,
     _tail_stream_text,
@@ -127,12 +143,13 @@ from p4_core.terminal import (
     _terminal_answer_is_direct_evidence,
     run_terminal_agent,
 )
+from p4_core.unittest_repair import build_unittest_failed_allowed_actions
 
 
 _UNSET = object()
 WORK_PACKAGE_TYPES = set(WORK_TYPES)
 NON_DECOMPOSE_ACTION_TOOL_SET = set(NON_DECOMPOSE_ACTION_TOOLS)
-FRAME_OPERATION_TOOL_SET = {"decompose_tasks", "open_child_frame", "return_to_parent"}
+FRAME_OPERATION_TOOL_SET = {"create_plan", "decompose_tasks", "open_child_frame", "return_to_parent"}
 IMPLEMENTATION_ROUTE_PROMPT_CONTEXT_ROUTES: set[str] = set()
 IMPLEMENTATION_ROUTE_PROMPT_CONTEXT_PHASES = {
     "implementation_required",
@@ -298,7 +315,18 @@ class AgentRuntime:
             payload["frame_depth"] = current_frame.depth
         return self._append_session_event(session_id, payload)
 
-    def _start_turn_frame(self, *, user_message: str) -> None:
+    def _start_turn_frame(self, *, user_message: str, resume_existing: bool = False) -> None:
+        if resume_existing and self.frame_manager.current_frame() is not None:
+            self.frame_manager.reset_active_stack_steps()
+            self.frame_manager.append_event(
+                {
+                    "type": "user_message",
+                    "role": "user",
+                    "content": user_message,
+                    "timestamp": now_iso(),
+                }
+            )
+            return
         if self.frame_manager.frames:
             self.frame_manager.abandon_all()
         frame = self.frame_manager.create_root_frame(user_message)
@@ -398,6 +426,33 @@ class AgentRuntime:
             if first_action_tool in NON_DECOMPOSE_ACTION_TOOL_SET:
                 for issue in self.tools.argument_issues(first_action_tool, first_action_args):
                     issues.append(f"first_action.args: {issue}")
+            if work_type == "edit" and first_action_tool == "run_command":
+                issues.append(
+                    "edit WorkUnit first_action must not be a no-op run_command. "
+                    "Use list_files/read_file/search_code to inspect, then perform the actual edit inside PLAN_EXECUTION."
+                )
+            if work_type == "run_test" and first_action_tool != "run_command":
+                issues.append("run_test WorkUnit first_action must be run_command with the concrete verification command")
+            if work_type == "run_test" and first_action_tool == "run_command":
+                command = str(first_action_args.get("command") or "").strip()
+                direct_python_script = bool(
+                    re.fullmatch(r"(?:python|python3)(?:\s+[-\w]+)*\s+[\w./-]+\.py(?:\s+.*)?", command)
+                )
+                command_lower = command.lower()
+                if "unittest" in command_lower and not (
+                    "discover" in command_lower
+                    and "-s tests" in command_lower
+                ):
+                    issues.append(
+                        "run_test WorkUnit first_action must run unittest through `python3 -m unittest discover -s tests` "
+                        "so verifier evidence is tied to the runtime test artifact contract."
+                    )
+                if direct_python_script and "unittest" not in command and "pytest" not in command and " -c " not in command:
+                    issues.append(
+                        "run_test WorkUnit first_action must be a non-interactive verification command. "
+                        "Use `python3 -m unittest discover -s tests`, `pytest`, or a `python3 -c` verifier that calls the programmatic API; "
+                        "do not use direct `python script.py` as the planned verification action."
+                    )
             first_action_path = str(first_action_args.get("path") or "").strip()
             if first_action_tool in {"write_file", "append_file", "replace_text"}:
                 first_action_content = (
@@ -439,7 +494,33 @@ class AgentRuntime:
 
     def _python_source_placeholder_markers(self, source: str) -> list[str]:
         text = str(source or "")
-        if not any(marker in text for marker in ["pass", "TODO", "todo", "ここに実装", "未実装", "...", "NotImplemented", "return None", "return []", "placeholder", "for now"]):
+        incomplete_comment_markers = [
+            "ここに実装",
+            "ここに実際",
+            "未実装",
+            "簡単な実装",
+            "テスト用の実装",
+            "今回は簡単",
+            "placeholder implementation",
+            "for now",
+            "for a full implementation",
+            "real implementation",
+            "actual implementation",
+        ]
+        if not any(
+            marker in text
+            for marker in [
+                "pass",
+                "TODO",
+                "todo",
+                "...",
+                "NotImplemented",
+                "return None",
+                "return []",
+                "placeholder",
+                *incomplete_comment_markers,
+            ]
+        ):
             return []
         try:
             tree = ast.parse(text)
@@ -450,7 +531,7 @@ class AgentRuntime:
         if any(marker in text for marker in ["TODO", "todo", "ここに実装", "未実装"]):
             if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(tree)):
                 markers.append("TODO")
-        if any(marker in lower_text for marker in ["placeholder implementation", "for now", "for a full implementation"]):
+        if any(marker.lower() in lower_text for marker in incomplete_comment_markers):
             if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(tree)):
                 markers.append("incomplete-comment")
         for node in ast.walk(tree):
@@ -496,6 +577,89 @@ class AgentRuntime:
                     markers.append(f"{node.name}: return []-only")
                     continue
         return sorted(set(markers))
+
+    def _python_source_placeholder_repair_hints(
+        self,
+        source: str,
+        *,
+        max_hints: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return exact local edit anchors for placeholder-only callables."""
+        text = str(source or "")
+        if not text.strip():
+            return []
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        lines = text.splitlines()
+        hints: list[dict[str, Any]] = []
+
+        def snippet(start_line: int, end_line: int) -> str:
+            start = max(1, start_line)
+            end = max(start, end_line)
+            return "\n".join(lines[start - 1 : end])
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = [
+                stmt
+                for stmt in node.body
+                if not (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(getattr(stmt, "value", None), ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                )
+            ]
+            if len(body) != 1:
+                continue
+            only = body[0]
+            reason = ""
+            if isinstance(only, ast.Pass):
+                reason = f"{node.name} is pass-only"
+            elif (
+                isinstance(only, ast.Expr)
+                and isinstance(getattr(only, "value", None), ast.Constant)
+                and only.value.value is Ellipsis
+            ):
+                reason = f"{node.name} is ellipsis-only"
+            elif (
+                isinstance(only, ast.Raise)
+                and isinstance(getattr(only, "exc", None), ast.Call)
+                and getattr(only.exc.func, "id", "") == "NotImplementedError"
+            ):
+                reason = f"{node.name} raises only NotImplementedError"
+            elif isinstance(only, ast.Return):
+                value = only.value
+                if value is None:
+                    reason = f"{node.name} has only bare return"
+                elif isinstance(value, ast.Constant) and value.value is None:
+                    reason = f"{node.name} returns only None"
+                elif isinstance(value, ast.List) and not value.elts:
+                    reason = f"{node.name} returns only []"
+            if not reason:
+                continue
+            end_line = int(getattr(only, "end_lineno", None) or getattr(only, "lineno", 0) or 0)
+            start_line = int(getattr(node, "lineno", None) or end_line or 0)
+            old_text = snippet(start_line, end_line) if start_line and end_line else ""
+            hints.append(
+                {
+                    "line": int(getattr(only, "lineno", None) or start_line or 0),
+                    "current_text": old_text or reason,
+                    "reason": reason
+                    + "; replace this placeholder callable before editing unrelated functions or tests",
+                    "suggested_action": "replace_placeholder_callable",
+                    "suggested_old_text": old_text,
+                    "suggested_strategy": (
+                        "Use replace_text with this exact small function-local old_text, "
+                        "or write_file a complete placeholder-free implementation if the local edit cannot express the fix."
+                    ),
+                }
+            )
+            if len(hints) >= max_hints:
+                break
+        return hints
 
     def _python_source_has_pass_only_callable(self, source: str) -> bool:
         return bool(self._python_source_placeholder_markers(source))
@@ -560,13 +724,18 @@ class AgentRuntime:
         if score <= 0:
             return ""
         text = str(source or "")
-        if re.search(r"\benumerate\s*\(\s*(?:rows|items|records|entries)\s*\)", text) or "list of sets" in text.lower():
+        parameter_pattern = self._source_public_parameter_pattern(text)
+        if parameter_pattern and re.search(rf"\benumerate\s*\(\s*{parameter_pattern}\s*\)", text):
             return (
                 "ユーザー要求はIDを保持するmapping入力です。"
                 "実装がmappingをlist/enumerateの内部indexへ置き換えており、callerが渡したIDを壊します。"
                 "mapping.items() で元IDを保持してください。"
             )
-        if re.search(r"\bsorted\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*ids?|items|keys|rows|cols)\s*\)", text):
+        sorted_public_input = bool(
+            parameter_pattern and re.search(rf"\bsorted\s*\(\s*{parameter_pattern}\s*\)", text)
+        )
+        sorted_identifier_like = bool(re.search(r"\bsorted\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*ids?|keys)\s*\)", text))
+        if sorted_public_input or sorted_identifier_like:
             return (
                 "ユーザー要求はIDを保持するmapping入力です。"
                 "実装がID集合を sorted(...) しており、比較不能な任意IDで失敗します。"
@@ -592,11 +761,42 @@ class AgentRuntime:
         )
         return id_mapping_requested or arbitrary_identifier_requested
 
+    def _source_public_parameter_names(self, source: str) -> set[str]:
+        try:
+            tree = ast.parse(str(source or ""))
+        except SyntaxError:
+            return set()
+
+        def parameter_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+            args = list(function.args.posonlyargs) + list(function.args.args) + list(function.args.kwonlyargs)
+            if function.args.vararg is not None:
+                args.append(function.args.vararg)
+            if function.args.kwarg is not None:
+                args.append(function.args.kwarg)
+            return {arg.arg for arg in args if arg.arg not in {"self", "cls"}}
+
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.update(parameter_names(node))
+            elif isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and not child.name.startswith("_"):
+                        names.update(parameter_names(child))
+        return names
+
+    def _source_public_parameter_pattern(self, source: str) -> str:
+        names = sorted(self._source_public_parameter_names(source), key=len, reverse=True)
+        if not names:
+            return ""
+        return "(?:" + "|".join(re.escape(name) for name in names) + ")"
+
     def _python_source_narrowed_input_contract_score(self, *, user_message: str, source: str) -> int:
         """Count observable type/API narrowings for identifier-preserving inputs."""
         if not self._identifier_mapping_input_contract_requested(user_message):
             return 0
         text = str(source or "")
+        parameter_pattern = self._source_public_parameter_pattern(text)
         primitive_fixed_patterns = [
             r"\bDict\s*\[\s*int\s*,\s*Set\s*\[\s*int\s*\]\s*\]",
             r"\bdict\s*\[\s*int\s*,\s*set\s*\[\s*int\s*\]\s*\]",
@@ -616,9 +816,13 @@ class AgentRuntime:
             r"\bstr\s*\|\s*int\b",
         ]
         score = sum(len(re.findall(pattern, text)) for pattern in primitive_fixed_patterns)
-        if re.search(r"\benumerate\s*\(\s*(?:rows|items|records|entries)\s*\)", text) or "list of sets" in text.lower():
+        if parameter_pattern and re.search(rf"\benumerate\s*\(\s*{parameter_pattern}\s*\)", text):
             score += 1
-        if re.search(r"\bsorted\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*ids?|items|keys|rows|cols)\s*\)", text):
+        sorted_public_input = bool(
+            parameter_pattern and re.search(rf"\bsorted\s*\(\s*{parameter_pattern}\s*\)", text)
+        )
+        sorted_identifier_like = bool(re.search(r"\bsorted\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*ids?|keys)\s*\)", text))
+        if sorted_public_input or sorted_identifier_like:
             score += 1
         return score
 
@@ -642,6 +846,7 @@ class AgentRuntime:
         text = str(source or "")
         if not text:
             return []
+        parameter_pattern = self._source_public_parameter_pattern(text)
         restricted_annotation_patterns = [
             r"\b(?:Dict|dict)\s*\[\s*(?:int|str)\s*,\s*(?:Set|set)\s*\[\s*(?:int|str)\s*\]\s*\]",
             r"\b(?:List|list)\s*\[\s*(?:int|str)\s*\]",
@@ -659,15 +864,16 @@ class AgentRuntime:
             if any(re.search(pattern, line) for pattern in restricted_annotation_patterns):
                 reason = "public API/result annotation narrows caller-supplied identifiers to primitive ID types"
                 suggested = self._relaxed_identifier_mapping_line(line)
-            elif re.search(r"\benumerate\s*\(\s*(?:rows|items|records|entries)\s*\)", line):
+            elif parameter_pattern and re.search(rf"\benumerate\s*\(\s*{parameter_pattern}\s*\)", line):
                 reason = "enumerate(...) converts caller IDs to positional indexes"
                 suggested = re.sub(r"\benumerate\s*\(", "mapping.items() から元keyを保持する形に変更: enumerate(", line)
-            elif "list of sets" in stripped.lower():
-                reason = "list-of-sets representation drops mapping keys"
             elif re.search(r"\blist\s*\(\s*range\s*\(\s*len\s*\(", line):
                 reason = "range(len(...)) returns positional indexes instead of caller IDs"
                 suggested = re.sub(r"list\s*\(\s*range\s*\(\s*len\s*\(([^)]*)\)\s*\)\s*\)", r"list(\1.keys())", line)
-            elif re.search(r"\bsorted\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*ids?|items|keys|rows|cols)\s*\)", line):
+            elif (
+                (parameter_pattern and re.search(rf"\bsorted\s*\(\s*{parameter_pattern}\s*\)", line))
+                or re.search(r"\bsorted\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*ids?|keys)\s*\)", line)
+            ):
                 reason = "sorted(...) requires comparable IDs and changes the arbitrary-ID contract"
             if not reason:
                 continue
@@ -747,17 +953,32 @@ class AgentRuntime:
                 current = current.value
             return current.id if isinstance(current, ast.Name) else ""
 
-        def aliases_rows_parameter(node: ast.AST, input_names: set[str]) -> bool:
+        def aliases_input_parameter(node: ast.AST, input_names: set[str]) -> bool:
             return isinstance(node, ast.Name) and node.id in input_names
 
-        for function in [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-            input_names = {"rows"} if "rows" in parameter_names(function) else set()
+        public_functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                public_functions.append(node)
+            elif isinstance(node, ast.ClassDef):
+                public_functions.extend(
+                    child
+                    for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not child.name.startswith("_")
+                )
+        for function in public_functions:
+            input_names = {
+                name
+                for name in parameter_names(function)
+                if name not in {"self", "cls"}
+            }
             if not input_names:
                 continue
             for node in walk_function_body(function):
                 if isinstance(node, ast.Assign):
                     for target in node.targets:
-                        if isinstance(target, ast.Name) and aliases_rows_parameter(node.value, input_names):
+                        if isinstance(target, ast.Name) and aliases_input_parameter(node.value, input_names):
                             input_names.add(target.id)
                 if (
                     isinstance(node, ast.Call)
@@ -766,7 +987,7 @@ class AgentRuntime:
                     and root_name(node.func.value) in input_names
                 ):
                     return (
-                        "実装が public API 入力 rows または rows内のset/listを直接変更しています。"
+                        "実装が caller-owned public API 入力、または入力内のmutable collectionを直接変更しています。"
                         "検証や複数回探索で入力が破壊されるため、caller-owned inputは不変として扱い、"
                         "必要なら local copy に別名で複製してから探索状態を更新してください。"
                     )
@@ -781,7 +1002,7 @@ class AgentRuntime:
                     for target in targets:
                         if isinstance(target, ast.Subscript) and root_name(target.value) in input_names:
                             return (
-                                "実装が public API 入力 rows の要素を直接代入/削除しています。"
+                                "実装が caller-owned public API 入力の要素を直接代入/削除しています。"
                                 "caller-owned inputは不変として扱い、必要なら local copy に別名で複製してから探索状態を更新してください。"
                             )
         return ""
@@ -801,12 +1022,13 @@ class AgentRuntime:
             "active",
             "available",
             "candidate",
-            "col",
-            "column",
+            "closed",
+            "frontier",
+            "open",
+            "pending",
             "remaining",
-            "row",
             "state",
-            "uncovered",
+            "visited",
         )
 
         def root_name(node: ast.AST) -> str:
@@ -918,7 +1140,7 @@ class AgentRuntime:
                 return (
                     "recursive/backtracking実装が共有探索状態を destructive に更新しています: "
                     f"{sample}。KeyError/無限再帰/復元漏れを起こしやすいため、"
-                    "各再帰branchでは branch-local copy を渡すか、cover/uncover の変更対象を完全に記録して対称に復元してください。"
+                    "各再帰branchでは branch-local copy を渡すか、変更対象を完全に記録して対称に復元してください。"
                 )
         return ""
 
@@ -944,12 +1166,13 @@ class AgentRuntime:
             "active",
             "available",
             "candidate",
-            "col",
-            "column",
+            "closed",
+            "frontier",
+            "open",
+            "pending",
             "remaining",
-            "row",
             "state",
-            "uncovered",
+            "visited",
         )
 
         def root_name(node: ast.AST) -> str:
@@ -1029,12 +1252,12 @@ class AgentRuntime:
         state_name_markers = (
             "available",
             "candidate",
-            "col",
-            "column",
+            "frontier",
+            "open",
+            "pending",
             "remaining",
-            "row",
             "state",
-            "uncovered",
+            "visited",
         )
         branch_state_prefixes = ("new_", "next_", "branch_")
 
@@ -1131,8 +1354,8 @@ class AgentRuntime:
                 return (
                     "recursive/backtracking実装が branch-local 探索状態を作っていますが、"
                     f"再帰呼び出しへ渡していません: {sample}。"
-                    "copyを作るだけでは次branchの状態にならないため、search(..., next_rows, next_columns) "
-                    "のように作成した次状態をrecursive callへthreadしてください。"
+                    "copyを作るだけでは次branchの状態にならないため、作成した next_/branch_ state を"
+                    "recursive call の引数へthreadしてください。"
                 )
         return ""
 
@@ -1155,8 +1378,8 @@ class AgentRuntime:
                 ),
                 "allowed_next_actions": ["write_file tests/test_*.py", "replace_text tests/test_*.py"],
                 "suggested_fix": (
-                    "巨大fixtureを捨て、2-4個の小さい既知fixtureで solve_one / solve_all / "
-                    "validate_solution / no-solution を直接検証してください。"
+                    "巨大fixtureを捨て、2-4個の小さい既知fixtureで、ユーザー要求から抽出した公開API、"
+                    "成功例、複数結果が必要な場合の列挙例、失敗/不成立例を直接検証してください。"
                 ),
             }
         try:
@@ -1270,6 +1493,18 @@ class AgentRuntime:
             "before",
             "after",
             "delta",
+            "append_file",
+            "create_plan",
+            "decompose_tasks",
+            "finish",
+            "list_files",
+            "open_child_frame",
+            "read_file",
+            "replace_text",
+            "return_to_parent",
+            "run_command",
+            "search_code",
+            "write_file",
         }
         names: list[str] = []
 
@@ -1280,17 +1515,44 @@ class AgentRuntime:
             if name not in names:
                 names.append(name)
 
-        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        # Only treat call-shaped names as public API when the sentence itself
+        # says it is describing an API. Formulae and examples often contain
+        # helper calls that should remain implementation details.
+        api_sentence_markers = (
+            "api",
+            "public function",
+            "public functions",
+            "公開api",
+            "公開 api",
+            "公開関数",
+            "公開関数は",
+        )
+        for sentence in re.split(r"(?<=[。.!?])\s+|[。\n]", text):
+            sentence_lower = sentence.lower()
+            if not any(marker in sentence_lower for marker in api_sentence_markers):
+                continue
+            for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", sentence):
+                add_name(match.group(1))
+
+        explicit_call_api_pattern = (
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)"
+            r"\s*(?=(?:を|は|が|で)\s*(?:実装|作成|追加|検証|公開API|公開関数|public))"
+        )
+        for match in re.finditer(explicit_call_api_pattern, text):
             add_name(match.group(1))
 
-        # Japanese task prompts often state the public API as prose:
-        # "solve_one は...", not "solve_one(...)". Treat snake_case names in
-        # that role as requested module-level callables without knowing their
-        # domain or benchmark task name.
+        # Japanese task prompts often state the public API as prose rather than
+        # as an explicit call expression. Treat snake_case names in that role as
+        # requested module-level callables without knowing their domain.
         prose_api_pattern = (
             r"(?<![A-Za-z0-9_])"
             r"([a-z][a-z0-9]*_[a-z0-9_]*)"
-            r"(?=\s*(?:は|が(?:存在|必要|返)|を(?:実装|作成|追加|返|列挙|検証)|で(?:検証|実装)))"
+            r"(?=\s*(?:"
+            r"は[^。\n]{0,40}(?:実装|作成|追加|返|列挙|検証|存在|必要)|"
+            r"が(?:存在|必要|返)|"
+            r"を(?:実装|作成|追加|返|列挙|検証)|"
+            r"で(?:検証|実装)"
+            r"))"
         )
         for match in re.finditer(prose_api_pattern, text):
             add_name(match.group(1))
@@ -1448,6 +1710,14 @@ class AgentRuntime:
         """Observable implementation-source issues for generic implementation tasks."""
         text = str(source or "")
         issues: list[str] = []
+        plan_context = self._plan_record_execution_context()
+        plan_strategy = str(plan_context.get("plan_strategy") or "")
+        if plan_strategy == "state_space_search":
+            issues.extend(self._state_space_search_source_contract_issues(text))
+        elif plan_strategy == "dynamic_programming":
+            issues.extend(self._dynamic_programming_source_contract_issues(text, user_message=user_message))
+        elif plan_strategy == "constraint_satisfaction":
+            issues.extend(self._constraint_satisfaction_source_contract_issues(text))
         requested_function_names = self._requested_top_level_function_names(user_message)
         if requested_function_names:
             try:
@@ -1500,6 +1770,984 @@ class AgentRuntime:
             if len(incomplete_markers) > 4:
                 label += f", ... ({len(incomplete_markers)} total)"
             issues.append(f"未完成のpass文または次工程前提の実装が残っています: {label}。")
+        return issues
+
+    def _dynamic_programming_source_contract_issues(self, source: str, *, user_message: str = "") -> list[str]:
+        """Return generic source issues for dynamic-programming PlanRecords."""
+
+        text = str(source or "")
+        if not text.strip():
+            return []
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        callable_names = [
+            node.name.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        requested_function_names = {
+            name.lower()
+            for name in self._requested_top_level_function_names(user_message)
+        }
+        solverish_tokens = (
+            "solve",
+            "compute",
+            "count",
+            "optimize",
+            "optimal",
+            "best",
+            "dp",
+            "memo",
+            "tabulate",
+        )
+        has_requested_callable = bool(requested_function_names & set(callable_names))
+        has_solverish_callable = has_requested_callable or any(
+            any(token in name for token in solverish_tokens)
+            for name in callable_names
+        )
+        lowered = text.lower()
+        has_memo_or_table = any(
+            token in lowered
+            for token in ("memo", "cache", "lru_cache", "dp[", "table", "tabulat", "dynamic programming")
+        )
+        has_indexed_state_assignment = False
+        has_recursive_call = False
+        current_function = ""
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = list(node.targets)
+                else:
+                    targets = [node.target]
+                if any(isinstance(target, ast.Subscript) for target in targets):
+                    has_indexed_state_assignment = True
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                current_function = node.name
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == current_function:
+                        has_recursive_call = True
+                        break
+        has_base_case = bool(
+            re.search(r"\b(base|base_case|initial|seed)\b", lowered)
+            or "基底" in text
+            or "初期" in text
+        )
+        if not has_base_case:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    if any(isinstance(target, ast.Subscript) for target in node.targets):
+                        slice_text = ast.unparse(node.targets[0].slice) if hasattr(ast, "unparse") else ""
+                        if re.search(r"\b0\b|\b1\b", slice_text):
+                            has_base_case = True
+                            break
+                if isinstance(node, ast.If):
+                    if any(isinstance(child, ast.Return) for child in ast.walk(node)):
+                        condition_text = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
+                        if re.search(r"\b0\b|\b1\b|\bnot\b", condition_text):
+                            has_base_case = True
+                            break
+        has_recurrence_or_transition = bool(
+            re.search(r"\b(recurrence|transition|subproblem|state transition)\b", lowered)
+            or "漸化" in text
+            or "遷移" in text
+            or has_recursive_call
+            or has_memo_or_table
+            or has_indexed_state_assignment
+        )
+        issues: list[str] = []
+        if not has_solverish_callable:
+            issues.append(
+                "PlanRecord strategy=dynamic_programming ですが、subproblemを計算するprogrammatic callableが見つかりません。"
+                "ユーザー指定のtop-level API、またはDP表やmemoizationを実行して結果を返すsolve/compute/count/optimize系callableを実装してください。"
+            )
+        if not has_base_case:
+            issues.append(
+                "dynamic_programming PlanRecordのbase_case_verifier義務に対し、base caseまたは初期状態を表す実装経路が観測できません。"
+                "最小subproblemの戻り値、初期DP表、またはbase caseを明示してください。"
+            )
+        if not has_recurrence_or_transition:
+            issues.append(
+                "dynamic_programming PlanRecordのrecurrence_verifier義務に対し、recurrence/transition/memoization/table更新が観測できません。"
+                "部分問題から次状態を導く漸化式またはDP表更新を実装してください。"
+            )
+        return issues
+
+    def _constraint_satisfaction_source_contract_issues(self, source: str) -> list[str]:
+        """Return generic source issues for constraint-satisfaction PlanRecords."""
+
+        text = str(source or "")
+        if not text.strip():
+            return []
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        callable_names = [
+            node.name.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        solverish_tokens = ("solve", "search", "assign", "backtrack", "satisfy", "csp")
+        checker_tokens = ("constraint", "consistent", "valid", "validate", "check", "satisf")
+        solution_tokens = ("solution", "assignment", "validate", "verify", "check")
+        has_solverish_callable = any(any(token in name for token in solverish_tokens) for name in callable_names)
+        has_constraint_checker = any(any(token in name for token in checker_tokens) for name in callable_names)
+        has_solution_validator = any(any(token in name for token in solution_tokens) for name in callable_names)
+        lowered = text.lower()
+        has_constraint_model = any(
+            token in lowered
+            for token in ("variables", "domains", "constraints", "assignment", "constraint")
+        ) or any(token in text for token in ("変数", "ドメイン", "制約", "割当"))
+        issues: list[str] = []
+        if not has_solverish_callable:
+            issues.append(
+                "PlanRecord strategy=constraint_satisfaction ですが、assignmentを探索するprogrammatic solver/search/backtrack callableが見つかりません。"
+                "変数・ドメイン・制約から候補割当を生成するsolve/search/assign系callableを実装してください。"
+            )
+        if not has_constraint_model:
+            issues.append(
+                "constraint_satisfaction PlanRecordのvariables/domains/constraints義務に対し、制約モデルがsource上で観測できません。"
+                "変数、ドメイン、制約を入力または内部モデルとして明示してください。"
+            )
+        if not has_constraint_checker:
+            issues.append(
+                "constraint_satisfaction PlanRecordのconstraint_checker義務に対し、各制約を検査するcheck/valid/constraint系callableが不足しています。"
+                "候補割当が制約を満たすかを独立に判定する経路を実装してください。"
+            )
+        if not has_solution_validator:
+            issues.append(
+                "constraint_satisfaction PlanRecordのsolution_validator義務に対し、最終assignment全体を検証するvalidate/verify/check_solution系callableが不足しています。"
+                "solverの戻り値を受け取り、完全性と全制約充足を確認する検証経路を実装してください。"
+            )
+        return issues
+
+    def _state_space_search_source_contract_issues(self, source: str) -> list[str]:
+        """Return generic source issues for state-space-search PlanRecords."""
+
+        text = str(source or "")
+        if not text.strip():
+            return []
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        callable_names: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                callable_names.append(node.name.lower())
+        solverish_tokens = ("solve", "solver", "search", "astar", "a_star", "bfs", "dfs", "plan", "path")
+        verifierish_tokens = ("verify", "validator", "legal", "goal", "replay")
+        replay_verifier_tokens = ("verify", "validate", "replay", "check_solution", "final_verifier")
+        state_predicate_names = {"is_solved", "solved", "is_goal", "goal_reached", "is_goal_state"}
+        has_solverish_callable = any(
+            name not in state_predicate_names and any(token in name for token in solverish_tokens)
+            for name in callable_names
+        )
+        has_verifierish_callable = any(
+            any(token in name for token in verifierish_tokens)
+            for name in callable_names
+        )
+        has_replay_verifier_callable = any(
+            any(token in name for token in replay_verifier_tokens)
+            for name in callable_names
+        )
+        has_manual_input_loop = bool(re.search(r"\binput\s*\(", text))
+        issues: list[str] = []
+        nondeterministic_fixture_helpers: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            function_name = node.name.lower()
+            if not any(token in function_name for token in ("fixture", "near_goal", "near", "scramble")):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Import):
+                    if any(alias.name == "random" or alias.name.startswith("random.") for alias in child.names):
+                        nondeterministic_fixture_helpers.append(node.name)
+                        break
+                if isinstance(child, ast.ImportFrom) and child.module == "random":
+                    nondeterministic_fixture_helpers.append(node.name)
+                    break
+                if isinstance(child, ast.Call):
+                    func = child.func
+                    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "random":
+                        nondeterministic_fixture_helpers.append(node.name)
+                        break
+                    if isinstance(func, ast.Name) and func.id in {"choice", "sample", "shuffle", "randint", "randrange"}:
+                        nondeterministic_fixture_helpers.append(node.name)
+                        break
+        if not has_solverish_callable:
+            issues.append(
+                "PlanRecord strategy=state_space_search ですが、action列を返すprogrammatic solver/search callableが見つかりません。"
+                "手動UIやmove helperだけではなく、状態からゴールまでの探索結果を返すsolve/search/path系callableを実装してください。"
+            )
+        if has_manual_input_loop and not has_solverish_callable:
+            issues.append(
+                "state_space_search PlanRecordでは manual input loop alone は実装義務を満たしません。"
+                "CLI入力は補助に留め、runtime/testから呼べるsolver/search callableを追加してください。"
+            )
+        if not has_verifierish_callable:
+            issues.append(
+                "state_space_search PlanRecordのfinal_verifier義務に対し、legal move validator / goal check / replay verifier を表すcallableが不足しています。"
+                "返されたaction列を合法手としてreplayできる検証経路を実装してください。"
+            )
+        elif not has_replay_verifier_callable:
+            issues.append(
+                "state_space_search PlanRecordのfinal_verifier義務に対し、solver/searchが返したaction列を独立にreplay/verifyするcallableが不足しています。"
+                "is_legal_move や is_goal_state だけではfinal_verifierになりません。solve/searchの戻り値を受け取り、合法手を順に適用してgoal到達を返す verify/replay/validate 系callableを追加してください。"
+            )
+        if nondeterministic_fixture_helpers:
+            helpers = ", ".join(sorted(set(nondeterministic_fixture_helpers))[:4])
+            issues.append(
+                "state_space_search fixture helperが random/shuffle に依存しています: "
+                + helpers
+                + "。near-goalやfixture生成は決定的でなければなりません。"
+                "既知の基準stateから固定順のlegal transitionを短く適用し、直前の逆操作だけを避けるなど、"
+                "同じ入力から常に同じstart stateを作る実装にしてください。"
+            )
+        return issues
+
+    def _state_space_search_replay_verifier_repair_hints(
+        self,
+        *,
+        source: str,
+        issues: list[str],
+    ) -> list[dict[str, Any]]:
+        issue_text = "\n".join(str(issue) for issue in issues)
+        if "final_verifier" not in issue_text and "replay/verify" not in issue_text:
+            return []
+        return [
+            {
+                "suggested_action": "add_state_space_replay_verifier",
+                "current_text": "solver/search action output has no independent replay verifier",
+                "reason": (
+                    "state_space_search の finish 証拠は、solver/search が返した action 列を "
+                    "initial_state から合法性確認しながら適用し、goal 到達を boolean で返す callable です。"
+                ),
+                "suggested_new_text": self._state_space_search_replay_verifier_template(source),
+            }
+        ]
+
+    @staticmethod
+    def _state_space_search_preferred_symbol(names: set[str], preferred: tuple[str, ...], tokens: tuple[str, ...]) -> str:
+        for name in preferred:
+            if name in names:
+                return name
+        for name in sorted(names):
+            lowered = name.lower()
+            if tokens and any(token in lowered for token in tokens):
+                return name
+        return ""
+
+    @staticmethod
+    def _state_space_search_legal_check_lines(symbol: str, *, receiver: str = "", indent: str = "        ") -> str:
+        lowered = str(symbol or "").lower()
+        call = f"{receiver}{symbol}"
+        if lowered.startswith("get_") or "moves" in lowered or "actions" in lowered:
+            return (
+                f"{indent}if action not in list({call}(current_state)):\n"
+                f"{indent}    return False\n"
+            )
+        return (
+            f"{indent}if not {call}(current_state, action):\n"
+            f"{indent}    return False\n"
+        )
+
+    def _state_space_search_replay_verifier_template(self, source: str) -> str:
+        """Return a generic replay-verifier repair template adapted to visible helper names."""
+
+        try:
+            tree = ast.parse(str(source or ""))
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for class_node in [node for node in tree.body if isinstance(node, ast.ClassDef)]:
+                method_names = {
+                    node.name
+                    for node in class_node.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                legal_method = self._state_space_search_preferred_symbol(
+                    method_names,
+                    ("is_valid_move", "is_legal_move", "validate_move", "get_legal_moves", "legal_moves", "legal_actions"),
+                    ("legal", "valid", "validate", "moves", "actions"),
+                )
+                transition_method = self._state_space_search_preferred_symbol(
+                    method_names,
+                    ("make_move", "apply_move", "apply_action", "transition", "next_state"),
+                    ("apply", "transition", "next_state", "make_move"),
+                )
+                goal_attrs: set[str] = set()
+                for node in ast.walk(class_node):
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "self"
+                        and isinstance(getattr(node, "ctx", None), ast.Store)
+                    ):
+                        goal_attrs.add(node.attr)
+                goal_attr = (
+                    "goal_state"
+                    if "goal_state" in goal_attrs or "goal_state" in str(source or "")
+                    else sorted(goal_attrs)[0]
+                    if goal_attrs
+                    else "goal_state"
+                )
+                if legal_method and transition_method:
+                    legal_check = self._state_space_search_legal_check_lines(
+                        legal_method,
+                        receiver="self.",
+                        indent="            ",
+                    )
+                    return (
+                        f"    def verify_solution(self, initial_state, actions):\n"
+                        f"        if actions is None:\n"
+                        f"            return False\n"
+                        f"        current_state = initial_state\n"
+                        f"        for action in actions:\n"
+                        f"{legal_check}"
+                        f"            current_state = self.{transition_method}(current_state, action)\n"
+                        f"        return current_state == self.{goal_attr}\n"
+                    )
+            function_names = {
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            legal_function = self._state_space_search_preferred_symbol(
+                function_names,
+                ("is_valid_move", "is_legal_move", "validate_move", "get_legal_moves", "legal_moves", "legal_actions"),
+                ("legal", "valid", "validate", "moves", "actions"),
+            )
+            transition_function = self._state_space_search_preferred_symbol(
+                function_names,
+                ("make_move", "apply_move", "apply_action", "transition", "next_state"),
+                ("apply", "transition", "next_state", "make_move"),
+            )
+            goal_function = self._state_space_search_preferred_symbol(
+                function_names,
+                ("is_goal_state", "is_goal", "goal_reached", "is_solved"),
+                ("goal", "solved"),
+            )
+            if legal_function and transition_function:
+                goal_line = (
+                    f"    return {goal_function}(current_state, goal_state)\n"
+                    if goal_function
+                    else "    return current_state == goal_state\n"
+                )
+                legal_check = self._state_space_search_legal_check_lines(legal_function, indent="        ")
+                return (
+                    "def verify_solution(initial_state, goal_state, actions):\n"
+                    "    if actions is None:\n"
+                    "        return False\n"
+                    "    current_state = initial_state\n"
+                    "    for action in actions:\n"
+                    f"{legal_check}"
+                    f"        current_state = {transition_function}(current_state, action)\n"
+                    f"{goal_line}"
+                )
+        return (
+            "def verify_solution(initial_state, goal_state, actions, legal_move_validator, transition):\n"
+            "    if actions is None:\n"
+            "        return False\n"
+            "    current_state = initial_state\n"
+            "    for action in actions:\n"
+            "        if not legal_move_validator(current_state, action):\n"
+            "            return False\n"
+            "        current_state = transition(current_state, action)\n"
+            "    return current_state == goal_state\n"
+        )
+
+    def _state_space_search_test_contract_issues(self, test_sources: list[tuple[str, str]]) -> list[str]:
+        """Return generic test-artifact issues for state-space-search plans."""
+
+        if str(self._plan_record_execution_context().get("plan_strategy") or "") != "state_space_search":
+            return []
+        solverish_tokens = ("solve", "solver", "search", "astar", "a_star", "bfs", "dfs", "plan", "path")
+        verifierish_tokens = (
+            "verify",
+            "verifier",
+            "replay",
+            "legal",
+            "valid",
+            "apply",
+            "make_move",
+            "goal",
+            "solved",
+            "is_solved",
+        )
+
+        def call_name(call: ast.Call) -> str:
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id.lower()
+            if isinstance(func, ast.Attribute):
+                return func.attr.lower()
+            return ""
+
+        def is_solver_execution_call(call: ast.Call) -> bool:
+            name = call_name(call)
+            if not name:
+                return False
+            if name in {"solver", "set_start_state", "set_goal_state", "is_solvable", "solvable"}:
+                return False
+            execution_tokens = (
+                "solve",
+                "search",
+                "astar",
+                "a_star",
+                "bfs",
+                "dfs",
+                "find_path",
+                "shortest_path",
+                "plan_path",
+            )
+            return any(token in name for token in execution_tokens)
+
+        def solver_call_has_explicit_bound(call: ast.Call, test_source_lower: str) -> bool:
+            bound_tokens = (
+                "max_depth",
+                "max_steps",
+                "max_nodes",
+                "max_iterations",
+                "depth_limit",
+                "node_limit",
+                "step_limit",
+                "timeout",
+                "time_limit",
+                "budget",
+                "cutoff",
+                "bound",
+                "limit",
+            )
+            for keyword in call.keywords:
+                keyword_name = str(keyword.arg or "").lower()
+                if keyword_name and any(token in keyword_name for token in bound_tokens):
+                    return True
+            return any(token in test_source_lower for token in bound_tokens)
+
+        def assertion_expects_none_from_solver(call: ast.Call, solver_result_names: set[str]) -> bool:
+            if call_name(call) not in {"assertisnone", "assert_is_none"}:
+                return False
+            if not call.args:
+                return False
+            target = call.args[0]
+            if isinstance(target, ast.Name) and target.id in solver_result_names:
+                return True
+            return isinstance(target, ast.Call) and is_solver_execution_call(target)
+
+        def target_names(target: ast.AST) -> list[str]:
+            if isinstance(target, ast.Name):
+                return [target.id]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                names: list[str] = []
+                for item in target.elts:
+                    names.extend(target_names(item))
+                return names
+            return []
+
+        def literal_container_len(node: ast.AST) -> int:
+            if isinstance(node, (ast.List, ast.Tuple)):
+                return len(node.elts)
+            return 0
+
+        def is_small_literal_action_item(node: ast.AST) -> bool:
+            if isinstance(node, ast.Constant):
+                return isinstance(node.value, (str, int, float, bool, type(None)))
+            if isinstance(node, (ast.List, ast.Tuple)):
+                return all(is_small_literal_action_item(item) for item in node.elts)
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                return is_small_literal_action_item(node.operand)
+            return False
+
+        def is_handwritten_action_sequence_literal(node: ast.AST) -> bool:
+            if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 4:
+                return False
+            return all(is_small_literal_action_item(item) for item in node.elts)
+
+        action_fixture_name_tokens = ("action", "actions", "move", "moves", "solution", "path", "route", "plan")
+        start_fixture_name_tokens = ("start", "initial")
+        goal_fixture_name_tokens = ("goal", "target")
+
+        issues: list[str] = []
+        solver_test_seen = False
+        replaying_solver_test_seen = False
+        solver_tests_with_pass: list[str] = []
+        randomized_or_broad_solver_tests: list[str] = []
+        unbounded_no_solution_solver_tests: list[str] = []
+        handwritten_action_fixture_tests: list[str] = []
+        literal_near_goal_fixture_tests: list[str] = []
+        for path, source in test_sources:
+            try:
+                tree = ast.parse(str(source or ""))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not node.name.startswith("test"):
+                    continue
+                calls = [call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
+                has_solver_call = any(
+                    any(token in name for token in solverish_tokens)
+                    for name in calls
+                    if name
+                )
+                if not has_solver_call:
+                    continue
+                solver_test_seen = True
+                test_source = ast.get_source_segment(str(source or ""), node) or ""
+                test_source_lower = test_source.lower()
+                solver_result_names: set[str] = set()
+                solver_execution_calls: list[ast.Call] = []
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Assign) and isinstance(child.value, ast.Call) and is_solver_execution_call(child.value):
+                        solver_execution_calls.append(child.value)
+                        for target in child.targets:
+                            if isinstance(target, ast.Name):
+                                solver_result_names.add(target.id)
+                    elif isinstance(child, ast.Call) and is_solver_execution_call(child):
+                        solver_execution_calls.append(child)
+                if (
+                    "shuffle(" in test_source_lower
+                    or "make_random_move(" in test_source_lower
+                    or "random." in test_source_lower
+                    or any(name in {"choice", "sample", "randint", "randrange"} for name in calls)
+                ):
+                    randomized_or_broad_solver_tests.append(f"{path}:{node.name}")
+                if any(isinstance(stmt, ast.Pass) for stmt in ast.walk(node)):
+                    solver_tests_with_pass.append(f"{path}:{node.name}")
+                has_replay_or_verifier = any(
+                    any(token in name for token in verifierish_tokens)
+                    for name in calls
+                    if name
+                )
+                if has_replay_or_verifier:
+                    replaying_solver_test_seen = True
+                no_solution_named_test = any(
+                    token in node.name.lower()
+                    for token in ("unsolvable", "no_solution", "no_path", "unreachable", "impossible")
+                )
+                no_solution_assert = any(
+                    isinstance(child, ast.Call) and assertion_expects_none_from_solver(child, solver_result_names)
+                    for child in ast.walk(node)
+                )
+                if (no_solution_named_test or no_solution_assert) and solver_execution_calls:
+                    if not any(solver_call_has_explicit_bound(call, test_source_lower) for call in solver_execution_calls):
+                        unbounded_no_solution_solver_tests.append(f"{path}:{node.name}")
+                near_goal_claimed = any(
+                    token in node.name.lower() or token in test_source_lower
+                    for token in ("near_goal", "near-goal", "near goal")
+                )
+                literal_start_lines: list[int | str] = []
+                literal_goal_lines: list[int | str] = []
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Assign):
+                        names = [
+                            name.lower()
+                            for target in child.targets
+                            for name in target_names(target)
+                        ]
+                        if (
+                            names
+                            and any(any(token in name for token in action_fixture_name_tokens) for name in names)
+                            and is_handwritten_action_sequence_literal(child.value)
+                        ):
+                            size = literal_container_len(child.value)
+                            label = "/".join(names[:3])
+                            handwritten_action_fixture_tests.append(
+                                f"{path}:{node.name}:line {getattr(child, 'lineno', '?')}:{label}[{size}]"
+                            )
+                        if (
+                            names
+                            and any("near" in name and "goal" in name for name in names)
+                            and isinstance(child.value, (ast.List, ast.Tuple))
+                        ):
+                            literal_near_goal_fixture_tests.append(
+                                f"{path}:{node.name}:line {getattr(child, 'lineno', '?')}"
+                            )
+                        if near_goal_claimed and names and is_small_literal_action_item(child.value):
+                            if any(any(token in name for token in start_fixture_name_tokens) for name in names):
+                                literal_start_lines.append(getattr(child, "lineno", "?"))
+                            if any(any(token in name for token in goal_fixture_name_tokens) for name in names):
+                                literal_goal_lines.append(getattr(child, "lineno", "?"))
+                    elif isinstance(child, ast.Call):
+                        name = call_name(child)
+                        if not any(token in name for token in verifierish_tokens):
+                            continue
+                        for arg in child.args:
+                            if is_handwritten_action_sequence_literal(arg):
+                                handwritten_action_fixture_tests.append(
+                                    f"{path}:{node.name}:line {getattr(child, 'lineno', '?')}:verifier_arg[{literal_container_len(arg)}]"
+                                )
+                if near_goal_claimed and literal_start_lines and literal_goal_lines:
+                    literal_near_goal_fixture_tests.append(
+                        f"{path}:{node.name}:literal start/goal lines "
+                        f"{literal_start_lines[0]}/{literal_goal_lines[0]}"
+                    )
+        if not solver_test_seen:
+            issues.append(
+                "state_space_search test artifact が solver/search callableを直接呼んでいません。"
+                "PlanRecordの実行証拠として、探索結果のaction列を生成するテストを追加してください。"
+            )
+        elif not replaying_solver_test_seen:
+            issues.append(
+                "state_space_search test artifact が solver/searchの戻り値を legal move replay / final_verifier / goal assertion で検証していません。"
+                "solution is not None だけでは不十分です。返されたaction列を合法手として再生し、goal到達をassertしてください。"
+            )
+        if solver_tests_with_pass:
+            issues.append(
+                "state_space_search solver test内に pass が残っています: "
+                + ", ".join(solver_tests_with_pass[:4])
+                + "。未検証ループで成功扱いにせず、各actionをreplayしてassertしてください。"
+            )
+        if randomized_or_broad_solver_tests:
+            issues.append(
+                "state_space_search solver testが random/shuffle に依存した広いfixtureで探索を実行しています: "
+                + ", ".join(randomized_or_broad_solver_tests[:4])
+                + "。unit testは決定的なnear-goal fixtureに縮小してください。"
+                "goalまたは既知の基準stateから短い合法transitionで導出できるstart stateを明示し、solver/searchを1回だけ呼び、"
+                "返ったaction列をfinal_verifier/legal replayへ渡してgoal到達をassertしてください。"
+            )
+        if unbounded_no_solution_solver_tests:
+            issues.append(
+                "state_space_search no-solution/unsolvable testが境界なしでsolver/searchを実行しています: "
+                + ", ".join(unbounded_no_solution_solver_tests[:4])
+                + "。no-solution系は状態空間全探索でtimeoutしやすいため、unit testでは"
+                "solvability_checkを単体検証するか、max_depth/max_nodes/timeout等の明示境界付きでsolver/searchを呼んでください。"
+                "全体unittestで広い不可解fixtureを無制限探索させてはいけません。"
+            )
+        if handwritten_action_fixture_tests:
+            issues.append(
+                "state_space_search solver testが長い手書きaction/path/solution fixtureを正解として埋め込んでいます: "
+                + ", ".join(handwritten_action_fixture_tests[:4])
+                + "。unit testは長い解列をテスト内で固定せず、solver/searchの戻り値をそのまま"
+                "legal move replay / final_verifierへ渡してください。start fixtureは短い合法遷移で導出できる"
+                "小さいnear-goalに縮小し、期待するのは具体的な経路列ではなくgoal到達です。"
+            )
+        if literal_near_goal_fixture_tests:
+            issues.append(
+                "state_space_search test artifact に literal near-goal fixture があります: "
+                + ", ".join(literal_near_goal_fixture_tests[:4])
+                + "。near-goalと名付けるfixtureは任意の値を直書きせず、goalや既知の基準stateから短いlegal move/transitionを"
+                "適用して導出してください。runtimeはタスク専用oracleを持たないため、fixtureの由来を"
+                "テストコード上で観測できる形にしてください。"
+            )
+        return issues
+
+    def _dynamic_programming_test_contract_issues(
+        self,
+        test_sources: list[tuple[str, str]],
+        *,
+        user_message: str = "",
+    ) -> list[str]:
+        """Return generic test-artifact issues for dynamic-programming plans."""
+
+        if str(self._plan_record_execution_context().get("plan_strategy") or "") != "dynamic_programming":
+            return []
+
+        def call_name(call: ast.Call) -> str:
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id.lower()
+            if isinstance(func, ast.Attribute):
+                return func.attr.lower()
+            return ""
+
+        solverish_tokens = (
+            "solve",
+            "compute",
+            "count",
+            "optimize",
+            "optimal",
+            "best",
+            "dp",
+            "memo",
+            "tabulate",
+        )
+        requested_function_names = {
+            name.lower()
+            for name in self._requested_top_level_function_names(user_message)
+        }
+        assertion_names = {
+            "assertequal",
+            "assertnotequal",
+            "asserttrue",
+            "assertfalse",
+            "assertisnone",
+            "assertisnotnone",
+            "assertgreater",
+            "assertgreaterequal",
+            "assertless",
+            "assertlessequal",
+        }
+        solver_test_seen = False
+        assertion_count = 0
+        base_or_sample_seen = False
+        recurrence_or_transition_seen = False
+        for _path, source in test_sources:
+            try:
+                tree = ast.parse(str(source or ""))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not node.name.startswith("test"):
+                    continue
+                test_source = ast.get_source_segment(str(source or ""), node) or ""
+                lowered = test_source.lower()
+                calls = [call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
+                if any(name in requested_function_names for name in calls if name) or any(
+                    any(token in name for token in solverish_tokens)
+                    for name in calls
+                    if name
+                ):
+                    solver_test_seen = True
+                assertion_count += sum(1 for name in calls if name in assertion_names)
+                if (
+                    any(token in lowered for token in ("base", "base_case", "sample", "oracle", "initial"))
+                    or any(token in test_source for token in ("基底", "初期", "期待値"))
+                ):
+                    base_or_sample_seen = True
+                if (
+                    any(token in lowered for token in ("recurrence", "transition", "subproblem", "memo", "table", "dp"))
+                    or any(token in test_source for token in ("漸化", "遷移", "部分問題"))
+                ):
+                    recurrence_or_transition_seen = True
+        issues: list[str] = []
+        if not solver_test_seen:
+            issues.append(
+                "dynamic_programming test artifact が solver/compute callableを直接呼んでいません。"
+                "PlanRecordの実行証拠として、DP本体を呼び出し期待値と比較するunittestを追加してください。"
+            )
+        if assertion_count < 2 or not base_or_sample_seen or not recurrence_or_transition_seen:
+            issues.append(
+                "dynamic_programming test artifact は base case と recurrence/sample oracle の両方を観測可能に検証していません。"
+                "最小subproblemの期待値と、漸化式またはDP表更新で導かれるsampleケースを別々にassertしてください。"
+            )
+        return issues
+
+    def _constraint_satisfaction_test_contract_issues(self, test_sources: list[tuple[str, str]]) -> list[str]:
+        """Return generic test-artifact issues for constraint-satisfaction plans."""
+
+        if str(self._plan_record_execution_context().get("plan_strategy") or "") != "constraint_satisfaction":
+            return []
+
+        def call_name(call: ast.Call) -> str:
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id.lower()
+            if isinstance(func, ast.Attribute):
+                return func.attr.lower()
+            return ""
+
+        solverish_tokens = ("solve", "search", "assign", "backtrack", "satisfy", "csp")
+        validator_tokens = ("constraint", "consistent", "valid", "validate", "verify", "check", "satisf")
+        solver_test_seen = False
+        validator_test_seen = False
+        negative_case_seen = False
+        for _path, source in test_sources:
+            try:
+                tree = ast.parse(str(source or ""))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not node.name.startswith("test"):
+                    continue
+                test_source = ast.get_source_segment(str(source or ""), node) or ""
+                lowered = test_source.lower()
+                calls = [call_name(call) for call in ast.walk(node) if isinstance(call, ast.Call)]
+                if any(any(token in name for token in solverish_tokens) for name in calls if name):
+                    solver_test_seen = True
+                if any(any(token in name for token in validator_tokens) for name in calls if name):
+                    validator_test_seen = True
+                if (
+                    any(token in lowered for token in ("negative", "invalid", "reject", "unsatisfied", "violate"))
+                    or any(token in test_source for token in ("不正", "違反", "失敗", "拒否"))
+                    or any(name in {"assertfalse", "assertraises", "assertisnone"} for name in calls)
+                ):
+                    negative_case_seen = True
+        issues: list[str] = []
+        if not solver_test_seen:
+            issues.append(
+                "constraint_satisfaction test artifact が solver/search/backtrack callableを直接呼んでいません。"
+                "PlanRecordの実行証拠として、候補assignmentを生成するテストを追加してください。"
+            )
+        if not validator_test_seen:
+            issues.append(
+                "constraint_satisfaction test artifact が constraint checker / solution validator を直接検証していません。"
+                "solverの戻り値をvalidate/checkし、全制約充足をassertしてください。"
+            )
+        if not negative_case_seen:
+            issues.append(
+                "constraint_satisfaction test artifact に invalid/negative assignment rejection の検証がありません。"
+                "不正な割当がconstraint_checkerまたはsolution_validatorで拒否されることをassertしてください。"
+            )
+        return issues
+
+    def _test_source_contract_issues(
+        self,
+        *,
+        user_message: str,
+        test_sources: list[tuple[str, str]],
+    ) -> list[str]:
+        """Observable test-source issues for generic implementation tasks."""
+
+        issues: list[str] = []
+        for issue in self._test_source_contradictory_predicate_expectation_issues(test_sources):
+            if issue not in issues:
+                issues.append(issue)
+        for issue in self._state_space_search_test_contract_issues(test_sources):
+            if issue not in issues:
+                issues.append(issue)
+        for issue in self._dynamic_programming_test_contract_issues(test_sources, user_message=user_message):
+            if issue not in issues:
+                issues.append(issue)
+        for issue in self._constraint_satisfaction_test_contract_issues(test_sources):
+            if issue not in issues:
+                issues.append(issue)
+        return issues
+
+    def _test_source_contradictory_predicate_expectation_issues(
+        self,
+        test_sources: list[tuple[str, str]],
+    ) -> list[str]:
+        """Detect deterministic test fixtures that assert both truth values for the same predicate input."""
+
+        def literal_signature(node: ast.AST, env: dict[str, str]) -> str:
+            if isinstance(node, ast.Name) and node.id in env:
+                return env[node.id]
+            if isinstance(node, ast.Constant):
+                return repr(node.value)
+            if isinstance(node, ast.List):
+                items = [literal_signature(item, env) for item in node.elts]
+                if any(item == "" for item in items):
+                    return ""
+                return "list[" + ",".join(items) + "]"
+            if isinstance(node, ast.Tuple):
+                items = [literal_signature(item, env) for item in node.elts]
+                if any(item == "" for item in items):
+                    return ""
+                return "tuple[" + ",".join(items) + "]"
+            if isinstance(node, ast.Set):
+                items = [literal_signature(item, env) for item in node.elts]
+                if any(item == "" for item in items):
+                    return ""
+                return "set[" + ",".join(sorted(items)) + "]"
+            if isinstance(node, ast.Dict):
+                pairs: list[str] = []
+                for key, value in zip(node.keys, node.values):
+                    if key is None:
+                        return ""
+                    key_sig = literal_signature(key, env)
+                    value_sig = literal_signature(value, env)
+                    if not key_sig or not value_sig:
+                        return ""
+                    pairs.append(f"{key_sig}:{value_sig}")
+                return "dict[" + ",".join(sorted(pairs)) + "]"
+            return ""
+
+        def predicate_name(call: ast.Call) -> str:
+            func = call.func
+            if isinstance(func, ast.Attribute):
+                return func.attr
+            if isinstance(func, ast.Name):
+                return func.id
+            return ""
+
+        issues: list[str] = []
+        for path, source in test_sources:
+            text = str(source or "")
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            expectations: dict[str, dict[bool, list[str]]] = {}
+            none_expectations: dict[str, dict[bool, list[str]]] = {}
+            for function_node in ast.walk(tree):
+                if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not function_node.name.startswith("test"):
+                    continue
+                env: dict[str, str] = {}
+                call_result_env: dict[str, str] = {}
+                for node in ast.walk(function_node):
+                    if isinstance(node, ast.Assign):
+                        value_sig = literal_signature(node.value, env)
+                        if value_sig:
+                            for target in node.targets:
+                                if isinstance(target, ast.Name):
+                                    env[target.id] = value_sig
+                        if isinstance(node.value, ast.Call):
+                            call = node.value
+                            name = predicate_name(call)
+                            arg_sigs = [literal_signature(arg, env) for arg in call.args]
+                            if name and arg_sigs and not any(not item for item in arg_sigs):
+                                signature = name + "(" + ",".join(arg_sigs) + ")"
+                                for target in node.targets:
+                                    if isinstance(target, ast.Name):
+                                        call_result_env[target.id] = signature
+                    if not isinstance(node, ast.Call):
+                        continue
+                    func = node.func
+                    if not isinstance(func, ast.Attribute):
+                        continue
+                    assert_name = func.attr
+                    if assert_name in {"assertIsNone", "assertIsNotNone"} and node.args:
+                        target = node.args[0]
+                        signature = ""
+                        if isinstance(target, ast.Name):
+                            signature = call_result_env.get(target.id, "")
+                        elif isinstance(target, ast.Call):
+                            name = predicate_name(target)
+                            arg_sigs = [literal_signature(arg, env) for arg in target.args]
+                            if name and arg_sigs and not any(not item for item in arg_sigs):
+                                signature = name + "(" + ",".join(arg_sigs) + ")"
+                        if signature:
+                            expects_none = assert_name == "assertIsNone"
+                            location = f"{path}:{getattr(node, 'lineno', '?')} {function_node.name}"
+                            by_expected = none_expectations.setdefault(signature, {True: [], False: []})
+                            by_expected[expects_none].append(location)
+                        continue
+                    if assert_name not in {"assertTrue", "assertFalse"} or not node.args:
+                        continue
+                    predicate_call = node.args[0]
+                    if not isinstance(predicate_call, ast.Call):
+                        continue
+                    name = predicate_name(predicate_call)
+                    if not name:
+                        continue
+                    arg_sigs = [literal_signature(arg, env) for arg in predicate_call.args]
+                    if not arg_sigs or any(not item for item in arg_sigs):
+                        continue
+                    signature = name + "(" + ",".join(arg_sigs) + ")"
+                    expected = assert_name == "assertTrue"
+                    location = f"{path}:{getattr(node, 'lineno', '?')} {function_node.name}"
+                    by_expected = expectations.setdefault(signature, {True: [], False: []})
+                    by_expected[expected].append(location)
+            for signature, by_expected in expectations.items():
+                if by_expected[True] and by_expected[False]:
+                    issues.append(
+                        "test artifact has contradictory predicate expectations for the same input: "
+                        f"{signature} is asserted both True and False at "
+                        + ", ".join([*by_expected[False][:2], *by_expected[True][:2]])
+                        + "。同じ入力に対する同じpredicateの期待値を片方へ統一するか、fixtureを別状態へ分けてください。"
+                    )
+            for signature, by_expected in none_expectations.items():
+                if by_expected[True] and by_expected[False]:
+                    issues.append(
+                        "test artifact has contradictory call-result expectations for the same input: "
+                        f"{signature} is asserted both None and not None at "
+                        + ", ".join([*by_expected[True][:2], *by_expected[False][:2]])
+                        + "。同じ入力に対する同じcallableの戻り値期待を片方へ統一するか、"
+                        "solvable/no-solution fixtureを別状態へ分けてください。"
+                    )
         return issues
 
 
@@ -1598,6 +2846,45 @@ class AgentRuntime:
                     "message": "test file がpass-onlyまたはassertなしです。unittest要求の検証証拠として受け付けません。",
                     "allowed_next_actions": ["write_file", "replace_text"],
                     "suggested_fix": "test_* メソッドに具体的な self.assert* または assert を追加してください。",
+                }
+            plan_test_issues = self._test_source_contract_issues(
+                user_message=user_message,
+                test_sources=[(normalized_path, source)],
+            )
+            if plan_test_issues:
+                plan_strategy = str(self._plan_record_execution_context().get("plan_strategy") or "")
+                if plan_strategy == "dynamic_programming":
+                    suggested_fix = (
+                        "base case と recurrence/sample oracle を別々にassertし、DP本体のcompute/solve callableを直接呼ぶunittestにしてください。"
+                    )
+                elif plan_strategy == "constraint_satisfaction":
+                    suggested_fix = (
+                        "solverの戻り値をconstraint checker / solution validatorへ渡し、valid assignment成功とinvalid/negative assignment拒否をassertするunittestにしてください。"
+                    )
+                else:
+                    suggested_fix = (
+                        "solver/searchの戻り値をlegal move replayまたはfinal_verifierへ渡し、goal到達をassertするunittestにしてください。"
+                    )
+                if "contradictory predicate expectations" in plan_test_issues[0]:
+                    suggested_fix = (
+                        "同じ入力fixtureを同じpredicateでTrue/False両方に期待しています。"
+                        "片方の期待値を直すか、not-solved用fixtureとgoal用fixtureを別状態に分けてください。"
+                    )
+                elif "contradictory call-result expectations" in plan_test_issues[0]:
+                    suggested_fix = (
+                        "同じ入力fixtureを同じcallableでNone/not None両方に期待しています。"
+                        "solvable fixtureとno-solution fixtureを別状態に分け、各期待を一貫させてください。"
+                    )
+                elif "no-solution/unsolvable" in plan_test_issues[0]:
+                    suggested_fix = (
+                        "no-solution系testはsolvability_check単体、またはmax_depth/max_nodes/timeout等の"
+                        "明示境界付きsolver呼び出しに縮小してください。"
+                    )
+                return {
+                    "reason_code": "test_artifact_contract_incomplete",
+                    "message": plan_test_issues[0],
+                    "allowed_next_actions": ["write_file", "replace_text"],
+                    "suggested_fix": suggested_fix,
                 }
             large_fixture_issue = self._test_source_large_fixture_issue(
                 user_message=user_message,
@@ -1766,6 +3053,44 @@ class AgentRuntime:
             + "\n\n... [middle omitted for review budget] ...\n\n"
             + source[-tail_chars:]
         )
+
+    def _replace_text_current_source_excerpt(
+        self,
+        *,
+        current_source: str,
+        old_text: str,
+        max_lines: int = 36,
+    ) -> str:
+        source = str(current_source or "")
+        if not source.strip():
+            return ""
+        old = str(old_text or "")
+        lines = source.splitlines()
+        start_index = 0
+        name_match = re.search(r"(?m)^\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", old)
+        if name_match:
+            name = re.escape(name_match.group(1))
+            source_match = re.search(rf"(?m)^\s*(?:async\s+def|def|class)\s+{name}\b.*$", source)
+            if source_match:
+                start_index = source[: source_match.start()].count("\n")
+        elif old.strip():
+            for old_line in old.splitlines():
+                needle = old_line.strip()
+                if len(needle) < 8:
+                    continue
+                for index, source_line in enumerate(lines):
+                    if needle in source_line:
+                        start_index = max(0, index - 4)
+                        break
+                else:
+                    continue
+                break
+        end_index = min(len(lines), start_index + max_lines)
+        numbered = [
+            f"{line_number:>4}: {line}"
+            for line_number, line in enumerate(lines[start_index:end_index], start=start_index + 1)
+        ]
+        return "\n".join(numbered)
 
     def _validation_failure_current_file_context(
         self,
@@ -1990,6 +3315,12 @@ class AgentRuntime:
         )
         if requested_api_test_issue:
             issues.append(requested_api_test_issue)
+        for issue in self._test_source_contract_issues(
+            user_message=user_message,
+            test_sources=test_sources,
+        ):
+            if issue not in issues:
+                issues.append(issue)
         for issue in self._implementation_source_contract_issues(
             user_message=user_message,
             source=impl_text,
@@ -2678,19 +4009,43 @@ class AgentRuntime:
         """
         user_text = str(user_message or "").lower()
         abstract_markers = (
-            "世界をよく",
-            "世界を良く",
-            "世の中をよく",
-            "世の中を良く",
-            "社会をよく",
-            "社会を良く",
-            "人類を",
-            "幸せに",
-            "make the world better",
-            "improve the world",
-            "better world",
+            "改善",
+            "向上",
+            "解決",
+            "支援",
+            "幸せ",
+            "役に立",
+            "impact",
+            "outcome",
+            "improve",
+            "better",
+            "help",
+            "reduce",
+            "increase",
+            "optimize",
         )
-        if not any(marker in user_text for marker in abstract_markers):
+        external_outcome_markers = (
+            "社会",
+            "人",
+            "ユーザー",
+            "顧客",
+            "業務",
+            "生活",
+            "現実",
+            "外部",
+            "people",
+            "person",
+            "user",
+            "customer",
+            "business",
+            "external",
+            "impact",
+            "outcome",
+        )
+        if not (
+            any(marker in user_text for marker in abstract_markers)
+            and any(marker in user_text for marker in external_outcome_markers)
+        ):
             return []
         issues: list[str] = []
         for task in tasks:
@@ -2717,11 +4072,6 @@ class AgentRuntime:
                 "解決策を考える",
                 "行動計画",
                 "print(",
-                "hello",
-                "world is now",
-                "world a better place",
-                "世界をよくする",
-                "世界を良くする",
             )
             if first_tool in {"write_file", "append_file"} and any(marker in semantic_text for marker in static_artifact_markers):
                 issues.append(
@@ -2879,6 +4229,1021 @@ class AgentRuntime:
         )
         return {"ok": False, "event": blocked, "issues": issues, "review": review}
 
+    def _planning_profile_for_message(self, user_message: str) -> dict[str, Any]:
+        return profile_problem(user_message)
+
+    def _planning_is_required(self, *, user_message: str, recent_events: list[dict[str, Any]], steps: list[dict[str, Any]]) -> bool:
+        del steps
+        profile = self._planning_profile_for_message(user_message)
+        if not planning_required_for_profile(profile):
+            return False
+        if self._latest_plan_record_for_current_request(
+            user_message=user_message,
+            recent_events=recent_events,
+        ) is not None:
+            return False
+        frame = self.frame_manager.current_frame()
+        if frame is not None and (frame.working_memory.child_tasks or frame.working_memory.completed_child_tasks):
+            return False
+        return True
+
+    def _latest_plan_record(self, *, recent_events: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+        if recent_events is None:
+            events = read_jsonl(self.paths.session_events_path(active_session_id(self.root)))
+        else:
+            events = list(recent_events)
+        for event in reversed(events):
+            if str(event.get("type") or "") != "plan_record":
+                continue
+            plan = event.get("plan") if isinstance(event.get("plan"), dict) else event.get("details")
+            if isinstance(plan, dict):
+                return dict(plan)
+        return None
+
+    def _latest_plan_record_for_current_request(
+        self,
+        *,
+        user_message: str,
+        recent_events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a PlanRecord only if it was accepted after the current user message.
+
+        Plan records are execution contracts for a specific turn. A previous
+        interrupted dashboard experiment must not make a new complex request
+        skip PLANNING_REQUIRED and start writing implementation code.
+        """
+
+        events = list(recent_events or [])
+        if not events:
+            events = read_jsonl(self.paths.session_events_path(active_session_id(self.root)), limit=5000)
+
+        latest_user_index = -1
+        expected = str(user_message or "")
+        for index, event in enumerate(events):
+            if str(event.get("type") or "") != "user_message":
+                continue
+            if str(event.get("content") or "") == expected:
+                latest_user_index = index
+
+        if latest_user_index < 0 and recent_events:
+            all_events = read_jsonl(self.paths.session_events_path(active_session_id(self.root)), limit=5000)
+            for index, event in enumerate(all_events):
+                if str(event.get("type") or "") != "user_message":
+                    continue
+                if str(event.get("content") or "") == expected:
+                    latest_user_index = index
+            if latest_user_index >= 0:
+                return self._latest_plan_record(recent_events=all_events[latest_user_index + 1 :])
+
+        search_events = events[latest_user_index + 1 :] if latest_user_index >= 0 else events
+        return self._latest_plan_record(recent_events=search_events)
+
+    def _plan_record_execution_context(self, *, recent_events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Return prompt-visible obligations derived from the accepted PlanRecord."""
+
+        plan = self._latest_plan_record(recent_events=recent_events)
+        if not plan:
+            return {}
+        profile = plan.get("profile") if isinstance(plan.get("profile"), dict) else {}
+        strategy = str(plan.get("strategy") or profile.get("strategy") or "").strip()
+        raw_contract = plan.get("verification_contract")
+        verification_contract: list[str] = []
+        if isinstance(raw_contract, dict):
+            verification_contract = [
+                str(key)
+                for key, value in raw_contract.items()
+                if value is not None and str(key).strip()
+            ]
+        elif isinstance(raw_contract, list):
+            verification_contract = [str(item) for item in raw_contract if str(item).strip()]
+        work_units_summary: list[dict[str, str]] = []
+        for unit in plan.get("work_units") or []:
+            if not isinstance(unit, dict):
+                continue
+            work_units_summary.append(
+                {
+                    "unit_id": str(unit.get("unit_id") or ""),
+                    "work_type": str(unit.get("work_type") or ""),
+                    "goal": str(unit.get("goal") or ""),
+                    "success_evidence": str(unit.get("success_evidence") or ""),
+                }
+            )
+        obligation_keys = {item.lower() for item in verification_contract}
+        obligations: list[str] = []
+        if strategy == "state_space_search" or {"legal_move_validator", "final_verifier"} & obligation_keys:
+            obligations.extend(
+                [
+                    "state_space_search implementation must expose a programmatic solver/search path that returns an action sequence; a manual input loop alone does not satisfy the plan.",
+                    "final_verifier/tests must replay each returned action from the start state through a legal-move validator and assert the goal state.",
+                    "tests should include at least one illegal-move or impossible-state rejection when those concepts are part of the requested state model.",
+                ]
+            )
+        if strategy == "dynamic_programming" or {"base_case_verifier", "recurrence_verifier"} & obligation_keys:
+            obligations.extend(
+                [
+                    "dynamic_programming implementation must expose a programmatic solve/compute callable that evaluates subproblem states.",
+                    "tests must separately verify base cases and recurrence/sample oracle cases; a single happy-path assertion is not enough.",
+                    "implementation evidence must show a base case plus recurrence, memoization, or table/state transition update.",
+                ]
+            )
+        if strategy == "constraint_satisfaction" or {"constraint_checker", "solution_validator"} & obligation_keys:
+            obligations.extend(
+                [
+                    "constraint_satisfaction implementation must model variables, domains, constraints, and assignments explicitly or through inputs.",
+                    "implementation must expose a constraint checker and a solution validator for the solver result.",
+                    "tests must validate a satisfying assignment and reject an invalid or negative assignment.",
+                ]
+            )
+        return {
+            "plan_id": str(plan.get("plan_id") or ""),
+            "plan_strategy": strategy,
+            "plan_verification_contract": verification_contract,
+            "plan_work_units_summary": work_units_summary[:6],
+            "plan_execution_obligations": obligations,
+        }
+
+    def _planner_action_blocked_event(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+        tool_name: str,
+        user_message: str,
+        current_phase: str,
+        recent_events: list[dict[str, Any]],
+        steps: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if current_phase not in {"PLANNING_REQUIRED", "PLAN_REVISION"}:
+            return None
+        if tool_name == "create_plan":
+            return None
+        profile = self._planning_profile_for_message(user_message)
+        reason_code = "plan_revision_required" if current_phase == "PLAN_REVISION" else "planning_required_before_execution"
+        if current_phase == "PLAN_REVISION" and not plan_requires_revision(recent_events, steps):
+            reason_code = "planning_required_before_execution"
+        revision_reasons = plan_revision_reasons(recent_events=recent_events, steps=steps) if current_phase == "PLAN_REVISION" else []
+        if current_phase == "PLAN_REVISION":
+            self._append_session_event(
+                session_id,
+                {
+                    "type": "plan_revision",
+                    "role": "system",
+                    "content": "Plan revision is required before more execution.",
+                    "profile": profile,
+                    "details": {
+                        "failure_type": reason_code,
+                        "revision_reasons": revision_reasons,
+                        "blocked_tool": tool_name,
+                        "allowed_next_actions": ["create_plan"],
+                        "next_required_action": "create_plan with a revised PlanRecord",
+                    },
+                    "turn_id": turn_id,
+                    "queue_id": queue_id,
+                    "step_index": step_index,
+                    "llm_workspace": str(turn_workspace),
+                },
+            )
+        message = (
+            f"{tool_name} was blocked because the runtime requires a PlanRecord before execution."
+            if current_phase == "PLANNING_REQUIRED"
+            else f"{tool_name} was blocked because the previous plan requires revision before more execution."
+        )
+        return self._append_session_event(
+            session_id,
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": message,
+                "code": "planner_action_blocked",
+                "reason_code": reason_code,
+                "details": {
+                    "blocked_tool": tool_name,
+                    "failure_type": reason_code,
+                    "blocked_by": "planner_controller",
+                    "phase": current_phase,
+                    "problem_profile": profile,
+                    "allowed_next_actions": ["create_plan"],
+                    "suggested_fix": "Create a PlanRecord with profile, strategy, work_units, verification_contract, status, and revision_count before executing tools.",
+                    "next_required_action": "create_plan with a valid PlanRecord",
+                },
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+
+    def _plan_scope_issues(self, *, plan: dict[str, Any], user_message: str) -> list[str]:
+        text = str(user_message or "").lower()
+        work_units = [unit for unit in plan.get("work_units") or [] if isinstance(unit, dict)]
+        combined_units = "\n".join(
+            " ".join(
+                str(unit.get(key) or "")
+                for key in ("goal", "work_type", "success_evidence", "done_when", "context_summary")
+            ).lower()
+            for unit in work_units
+        )
+        implementation_markers = (
+            "implement",
+            "create",
+            "write",
+            "build",
+            "program",
+            "script",
+            "code",
+            "実装",
+            "作って",
+            "作る",
+            "作成",
+            "プログラム",
+            "コード",
+        )
+        run_markers = (
+            "run",
+            "execute",
+            "test",
+            "verify",
+            "unittest",
+            "実行",
+            "動か",
+            "テスト",
+            "検証",
+            "確認",
+        )
+        issues: list[str] = []
+        if any(marker in text for marker in implementation_markers):
+            if not any(str(unit.get("work_type") or "") == "edit" for unit in work_units):
+                issues.append(
+                    "plan_scope_incomplete: implementation request requires at least one work_type=edit WorkUnit; "
+                    "the PlanRecord may start that WorkUnit with list_files/read_file/search_code, but the edit itself happens in PLAN_EXECUTION"
+                )
+        if any(marker in text for marker in run_markers):
+            has_run_unit = any(str(unit.get("work_type") or "") == "run_test" for unit in work_units)
+            has_run_goal = any(marker in combined_units for marker in ("run", "execute", "test", "verify", "実行", "テスト", "検証", "確認"))
+            if not has_run_unit and not has_run_goal:
+                issues.append(
+                    "plan_scope_incomplete: execution or verification request requires a run_test/verification WorkUnit "
+                    "that depends on implementation evidence"
+                )
+        return issues
+
+    def _plan_record_embedded_edit_issues(self, plan: dict[str, Any]) -> list[str]:
+        issues: list[str] = []
+        edit_tools = {"write_file", "append_file", "replace_text"}
+        for index, raw_unit in enumerate(plan.get("work_units") or [], start=1):
+            if not isinstance(raw_unit, dict):
+                continue
+            first_action = raw_unit.get("first_action") if isinstance(raw_unit.get("first_action"), dict) else {}
+            tool = str(first_action.get("tool") or "").strip()
+            if tool in edit_tools:
+                args = first_action.get("args") if isinstance(first_action.get("args"), dict) else {}
+                issues.append(
+                    "plan_work_unit_embedded_edit: "
+                    f"work_units[{index}].first_action.tool={tool} path={str(args.get('path') or '')!r}; "
+                    "create_plan must not contain implementation edits or code bodies. "
+                    "Use a small observational first_action such as list_files/read_file/search_code; "
+                    "the actual write_file/append_file/replace_text must happen later inside PLAN_EXECUTION."
+                )
+        return issues
+
+    def _minimal_state_space_implementation_work_units(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "unit_id": "inspect-workspace",
+                "goal": "Inspect the workspace before choosing artifact paths",
+                "depends_on": [],
+                "work_type": "inspect",
+                "first_action": {"tool": "list_files", "args": {"path": "."}},
+                "success_evidence": "workspace files are listed",
+                "should_open_child_frame": True,
+            },
+            {
+                "unit_id": "implement-artifact",
+                "goal": "Implement the requested Python artifact",
+                "depends_on": ["inspect-workspace"],
+                "work_type": "edit",
+                "first_action": {"tool": "list_files", "args": {"path": "."}},
+                "success_evidence": "implementation artifact is written in PLAN_EXECUTION",
+                "should_open_child_frame": True,
+            },
+            {
+                "unit_id": "verify-legal-replay",
+                "goal": "Run final_verifier that replays each legal action from the start state to the goal",
+                "depends_on": ["implement-artifact"],
+                "work_type": "run_test",
+                "first_action": {
+                    "tool": "run_command",
+                    "args": {"command": "python3 -m unittest discover -s tests"},
+                },
+                "success_evidence": "final_verifier replays only legal actions and reaches the goal; illegal moves are rejected",
+                "should_open_child_frame": True,
+            },
+        ]
+
+    def _minimal_plan_record_for_profile(self, *, user_message: str) -> dict[str, Any]:
+        profile = self._planning_profile_for_message(user_message)
+        strategy = str(profile.get("strategy") or "task_decomposition")
+        if strategy == "state_space_search":
+            work_units = self._minimal_state_space_implementation_work_units()
+            verification_contract: list[str] = list(STATE_SPACE_REQUIRED_CONTRACT)
+        elif strategy == "dynamic_programming":
+            work_units = [
+                {
+                    "unit_id": "inspect-workspace",
+                    "goal": "Inspect the workspace before choosing artifact paths",
+                    "depends_on": [],
+                    "work_type": "inspect",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "workspace files are listed",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "implement-artifact",
+                    "goal": "Implement the requested Python artifact with explicit subproblem state, base cases, and recurrence or memoization",
+                    "depends_on": ["inspect-workspace"],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "implementation artifact is written in PLAN_EXECUTION and exposes a solve/compute callable",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-dynamic-programming-contract",
+                    "goal": "Run tests that verify base case behavior and recurrence/sample oracle behavior",
+                    "depends_on": ["implement-artifact"],
+                    "work_type": "run_test",
+                    "first_action": {
+                        "tool": "run_command",
+                        "args": {"command": "python3 -m unittest discover -s tests"},
+                    },
+                    "success_evidence": "base case assertions and recurrence/sample oracle assertions pass",
+                    "should_open_child_frame": True,
+                },
+            ]
+            verification_contract = list(DYNAMIC_PROGRAMMING_REQUIRED_CONTRACT)
+        elif strategy == "constraint_satisfaction":
+            work_units = [
+                {
+                    "unit_id": "inspect-workspace",
+                    "goal": "Inspect the workspace before choosing artifact paths",
+                    "depends_on": [],
+                    "work_type": "inspect",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "workspace files are listed",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "implement-artifact",
+                    "goal": "Implement the requested Python artifact with variables, domains, constraints, assignment search, and validation",
+                    "depends_on": ["inspect-workspace"],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "implementation artifact is written in PLAN_EXECUTION and exposes solver plus constraint checker",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-constraint-satisfaction-contract",
+                    "goal": "Run tests that validate constraint satisfaction and reject invalid negative assignments",
+                    "depends_on": ["implement-artifact"],
+                    "work_type": "run_test",
+                    "first_action": {
+                        "tool": "run_command",
+                        "args": {"command": "python3 -m unittest discover -s tests"},
+                    },
+                    "success_evidence": "constraint validator accepts a satisfying assignment and rejects an invalid negative assignment",
+                    "should_open_child_frame": True,
+                },
+            ]
+            verification_contract = list(CONSTRAINT_SATISFACTION_REQUIRED_CONTRACT)
+        else:
+            work_units = [
+                {
+                    "unit_id": "inspect-workspace",
+                    "goal": "Inspect the workspace before choosing artifact paths",
+                    "depends_on": [],
+                    "work_type": "inspect",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "workspace files are listed",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "implement-artifact",
+                    "goal": "Implement the requested Python artifact",
+                    "depends_on": ["inspect-workspace"],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "implementation artifact is written in PLAN_EXECUTION",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "run-verification",
+                    "goal": "Run the generated tests or verifier",
+                    "depends_on": ["implement-artifact"],
+                    "work_type": "run_test",
+                    "first_action": {
+                        "tool": "run_command",
+                        "args": {"command": "python3 -m unittest discover -s tests"},
+                    },
+                    "success_evidence": "verification command exits successfully",
+                    "should_open_child_frame": True,
+                },
+            ]
+            verification_contract = ["implementation_artifact", "tests_or_verifier", "unittest_or_verification_passed"]
+        return {
+            "plan_id": f"runtime-repaired-plan-{uuid.uuid4().hex[:8]}",
+            "profile": profile,
+            "strategy": strategy,
+            "work_units": work_units,
+            "verification_contract": verification_contract,
+            "status": "proposed",
+            "revision_count": 0,
+        }
+
+    def _recent_planner_block_count(self, *, session_id: str, reason_codes: set[str], limit: int = 5000) -> int:
+        events = read_jsonl(self.paths.session_events_path(session_id), limit=limit)
+        count = 0
+        for event in reversed(events):
+            if str(event.get("type") or "") != "system_note":
+                continue
+            if str(event.get("code") or "") != "planner_action_blocked":
+                continue
+            if str(event.get("reason_code") or "") in reason_codes:
+                count += 1
+        return count
+
+    def _recent_llm_output_issue_count(self, *, session_id: str, reason_codes: set[str], limit: int = 5000) -> int:
+        events = read_jsonl(self.paths.session_events_path(session_id), limit=limit)
+        count = 0
+        for event in reversed(events):
+            event_type = str(event.get("type") or "")
+            if event_type == "plan_record":
+                break
+            if event_type != "system_note":
+                continue
+            if str(event.get("code") or "") != "llm_output_issue":
+                continue
+            if str(event.get("reason_code") or "") in reason_codes:
+                count += 1
+        return count
+
+    def _auto_create_minimal_plan_after_repeated_stream_issue(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+        user_message: str,
+        current_phase: str,
+        steps: list[dict[str, Any]],
+        current_model: str,
+    ) -> dict[str, Any] | None:
+        if current_phase not in {"PLANNING_REQUIRED", "PLAN_REVISION"}:
+            return None
+        repeated_count = self._recent_llm_output_issue_count(
+            session_id=session_id,
+            reason_codes={"plan_record_embedded_edit_stream"},
+        )
+        if repeated_count < 3:
+            return None
+        repaired_plan = self._minimal_plan_record_for_profile(user_message=user_message)
+        self._append_session_event(
+            session_id,
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": (
+                    "PlanRecord stream failure repeated. Runtime is using a minimal generic PlanRecord "
+                    "derived from the problem profile so execution can move to PLAN_EXECUTION without embedding code in create_plan."
+                ),
+                "code": "plan_record_autorepaired",
+                "reason_code": "repeated_plan_record_embedded_edit_stream",
+                "details": {
+                    "blocked_by": "planner_stream_guard",
+                    "repair_source": "problem_profile",
+                    "repeated_issue_count": repeated_count,
+                    "repaired_plan": repaired_plan,
+                },
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+        return self._handle_create_plan(
+            session_id=session_id,
+            turn_id=turn_id,
+            queue_id=queue_id,
+            step_index=step_index,
+            tool_args={"plan": repaired_plan},
+            turn_workspace=turn_workspace,
+            steps=steps,
+            user_message=user_message,
+            current_model=current_model,
+        )
+
+    def _plan_revision_signature(self, plan: dict[str, Any]) -> str:
+        normalized_units: list[dict[str, Any]] = []
+        for unit in plan.get("work_units") or []:
+            if not isinstance(unit, dict):
+                continue
+            first_action = unit.get("first_action") if isinstance(unit.get("first_action"), dict) else {}
+            normalized_units.append(
+                {
+                    "unit_id": str(unit.get("unit_id") or ""),
+                    "work_type": str(unit.get("work_type") or ""),
+                    "goal": str(unit.get("goal") or ""),
+                    "success_evidence": str(unit.get("success_evidence") or ""),
+                    "first_action": {
+                        "tool": str(first_action.get("tool") or ""),
+                        "args": first_action.get("args") if isinstance(first_action.get("args"), dict) else {},
+                    },
+                }
+            )
+        payload = {
+            "strategy": str(plan.get("strategy") or ""),
+            "work_units": normalized_units,
+            "verification_contract": plan.get("verification_contract") or {},
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _latest_accepted_plan_record(self, session_id: str) -> dict[str, Any] | None:
+        for event in reversed(read_jsonl(self.paths.session_events_path(session_id))):
+            if event.get("type") != "plan_record":
+                continue
+            plan = event.get("plan")
+            if isinstance(plan, dict):
+                return dict(plan)
+        return None
+
+    def _plan_revision_contract_issues(
+        self,
+        *,
+        session_id: str,
+        plan: dict[str, Any],
+        steps: list[dict[str, Any]] | None,
+    ) -> list[str]:
+        recent_events = read_jsonl(self.paths.session_events_path(session_id), limit=200)
+        revision_reasons = plan_revision_reasons(recent_events=recent_events, steps=list(steps or []))
+        if not revision_reasons:
+            return []
+        previous_plan = self._latest_accepted_plan_record(session_id)
+        if not previous_plan:
+            return []
+        if self._plan_revision_signature(previous_plan) == self._plan_revision_signature(plan):
+            return [
+                "plan_revision_no_change: previous PlanRecord execution failed with "
+                + ", ".join(revision_reasons[:4])
+                + ", but the revised PlanRecord has the same strategy, work_units, and verification_contract. "
+                "A revised plan must materially change the next edit/verification path before rerunning validation."
+            ]
+        return []
+
+    def _return_plan_revision_to_root_frame(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+    ) -> int:
+        returned = 0
+        while True:
+            current = self.frame_manager.current_frame()
+            if current is None or current.parent_frame_id is None:
+                break
+            result = self._handle_return_to_parent(
+                session_id=session_id,
+                turn_id=turn_id,
+                queue_id=queue_id,
+                step_index=step_index,
+                tool_args={
+                    "summary": "Plan revision superseded this WorkUnit; returning to root before installing the revised PlanRecord.",
+                    "findings": [
+                        "Active child WorkUnit was abandoned because the runtime entered PLAN_REVISION.",
+                        "The next PlanRecord is root-scoped and replaces the old WorkUnit tree.",
+                    ],
+                },
+                turn_workspace=turn_workspace,
+            )
+            if not bool(result.get("ok")):
+                break
+            returned += 1
+        if returned:
+            self._append_session_event(
+                session_id,
+                {
+                    "type": "system_note",
+                    "role": "system",
+                    "content": f"Returned {returned} active child frame(s) before accepting a revised PlanRecord.",
+                    "code": "plan_revision_returned_to_root",
+                    "reason_code": "plan_record_is_root_scoped",
+                    "details": {
+                        "returned_frame_count": returned,
+                        "blocked_by": "planner_controller",
+                        "next_required_action": "install revised PlanRecord at the root frame",
+                    },
+                    "turn_id": turn_id,
+                    "queue_id": queue_id,
+                    "step_index": step_index,
+                    "llm_workspace": str(turn_workspace),
+                },
+            )
+        return returned
+
+    def _handle_create_plan(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        tool_args: dict[str, Any],
+        turn_workspace: Path,
+        steps: list[dict[str, Any]] | None = None,
+        user_message: str = "",
+        current_model: str = "",
+    ) -> dict[str, Any]:
+        raw_plan = tool_args.get("plan") if isinstance(tool_args.get("plan"), dict) else tool_args
+        plan = dict(raw_plan or {})
+        expected_profile = self._planning_profile_for_message(user_message)
+        if not isinstance(plan.get("profile"), dict):
+            plan["profile"] = expected_profile
+        if not str(plan.get("plan_id") or "").strip():
+            plan["plan_id"] = f"plan-{uuid.uuid4().hex[:12]}"
+        if not str(plan.get("strategy") or "").strip():
+            plan["strategy"] = str(plan.get("profile", {}).get("strategy") or expected_profile.get("strategy") or "task_decomposition")
+        if "revision_count" not in plan:
+            plan["revision_count"] = 0
+        if not str(plan.get("status") or "").strip():
+            plan["status"] = "proposed"
+        embedded_edit_issues = self._plan_record_embedded_edit_issues(plan)
+        schema_validation = validate_json_schema(plan, PLAN_RECORD_SCHEMA)
+        contract_issues = validate_plan_record_contract(plan)
+        scope_issues = []
+        if schema_validation.ok and not embedded_edit_issues and not contract_issues:
+            scope_issues = self._plan_scope_issues(plan=plan, user_message=user_message)
+        revision_issues = []
+        if schema_validation.ok and not embedded_edit_issues and not contract_issues and not scope_issues:
+            revision_issues = self._plan_revision_contract_issues(
+                session_id=session_id,
+                plan=plan,
+                steps=steps,
+            )
+        repair_reason_codes = {
+            "plan_scope_incomplete",
+            "state_space_search_plan_missing_execution_verifier",
+            "dynamic_programming_plan_missing_execution_verifier",
+            "constraint_satisfaction_plan_missing_execution_verifier",
+        }
+        previous_repairable_planner_blocks = self._recent_planner_block_count(
+            session_id=session_id,
+            reason_codes=repair_reason_codes,
+        )
+        repairable_issues = [*contract_issues, *scope_issues, *revision_issues]
+        if (
+            schema_validation.ok
+            and not embedded_edit_issues
+            and previous_repairable_planner_blocks >= 1
+            and any(
+                "plan_scope_incomplete" in issue
+                or "state_space_search_plan_missing_execution_verifier" in issue
+                or "dynamic_programming_plan_missing_execution_verifier" in issue
+                or "constraint_satisfaction_plan_missing_execution_verifier" in issue
+                for issue in repairable_issues
+            )
+        ):
+            repaired_plan = self._minimal_plan_record_for_profile(user_message=user_message)
+            repaired_plan["plan_id"] = str(plan.get("plan_id") or repaired_plan.get("plan_id") or "")
+            repaired_plan["revision_count"] = int(plan.get("revision_count") or 0)
+            repaired_schema_validation = validate_json_schema(repaired_plan, PLAN_RECORD_SCHEMA)
+            repaired_contract_issues = validate_plan_record_contract(repaired_plan)
+            repaired_scope_issues = (
+                self._plan_scope_issues(plan=repaired_plan, user_message=user_message)
+                if repaired_schema_validation.ok and not repaired_contract_issues
+                else []
+            )
+            if repaired_schema_validation.ok and not repaired_contract_issues and not repaired_scope_issues:
+                plan = repaired_plan
+                schema_validation = repaired_schema_validation
+                contract_issues = []
+                scope_issues = []
+                self._append_session_event(
+                    session_id,
+                    {
+                        "type": "system_note",
+                        "role": "system",
+                        "content": (
+                            "PlanRecord was repaired by the runtime after repeated planner contract failures: "
+                            "using minimal inspect -> edit -> run_test WorkUnits derived from the problem profile."
+                        ),
+                        "code": "plan_record_autorepaired",
+                        "reason_code": "repeated_planner_contract_failure",
+                        "details": {
+                            "original_plan": raw_plan,
+                            "repaired_plan": repaired_plan,
+                            "blocked_by": "planner_contract",
+                            "repair_source": "problem_profile",
+                        },
+                        "turn_id": turn_id,
+                        "queue_id": queue_id,
+                        "step_index": step_index,
+                        "llm_workspace": str(turn_workspace),
+                    },
+                )
+        if not schema_validation.ok or embedded_edit_issues or contract_issues or scope_issues or revision_issues:
+            issues = [*schema_validation.errors, *embedded_edit_issues, *contract_issues, *scope_issues, *revision_issues]
+            failure_type = (
+                "state_space_search_plan_missing_verifier"
+                if any("state_space_search_plan_missing_verifier" in issue for issue in issues)
+                else "state_space_search_plan_missing_execution_verifier"
+                if any("state_space_search_plan_missing_execution_verifier" in issue for issue in issues)
+                else "dynamic_programming_plan_missing_verifier"
+                if any("dynamic_programming_plan_missing_verifier" in issue for issue in issues)
+                else "dynamic_programming_plan_missing_execution_verifier"
+                if any("dynamic_programming_plan_missing_execution_verifier" in issue for issue in issues)
+                else "constraint_satisfaction_plan_missing_verifier"
+                if any("constraint_satisfaction_plan_missing_verifier" in issue for issue in issues)
+                else "constraint_satisfaction_plan_missing_execution_verifier"
+                if any("constraint_satisfaction_plan_missing_execution_verifier" in issue for issue in issues)
+                else "plan_revision_no_change"
+                if any("plan_revision_no_change" in issue for issue in issues)
+                else "plan_work_unit_embedded_edit"
+                if any("plan_work_unit_embedded_edit" in issue for issue in issues)
+                else "plan_work_unit_too_large"
+                if any("first_action" in issue and ("content" in issue or "new_text" in issue or "old_text" in issue) and ("too long" in issue or "max" in issue.lower()) for issue in issues)
+                else "planner_strategy_mismatch"
+                if any("planner_strategy_mismatch" in issue for issue in issues)
+                else "plan_scope_incomplete"
+                if any("plan_scope_incomplete" in issue for issue in issues)
+                else "plan_record_invalid"
+            )
+            implementation_plan_repair_units = (
+                "[{\"unit_id\":\"inspect-workspace\",\"goal\":\"Inspect the workspace before choosing artifact paths\","
+                "\"depends_on\":[],\"work_type\":\"inspect\",\"first_action\":{\"tool\":\"list_files\",\"args\":{\"path\":\".\"}},"
+                "\"success_evidence\":\"workspace files are listed\",\"should_open_child_frame\":true},"
+                "{\"unit_id\":\"implement-artifact\",\"goal\":\"Implement the requested Python artifact\","
+                "\"depends_on\":[\"inspect-workspace\"],\"work_type\":\"edit\","
+                "\"first_action\":{\"tool\":\"list_files\",\"args\":{\"path\":\".\"}},"
+                "\"success_evidence\":\"implementation artifact is written in PLAN_EXECUTION\","
+                "\"should_open_child_frame\":true},"
+                "{\"unit_id\":\"verify-legal-replay\",\"goal\":\"Run final_verifier that replays each legal action from the start state to the goal\","
+                "\"depends_on\":[\"implement-artifact\"],\"work_type\":\"run_test\","
+                "\"first_action\":{\"tool\":\"run_command\",\"args\":{\"command\":\"python3 -m unittest discover -s tests\"}},"
+                "\"success_evidence\":\"final_verifier replays only legal actions and reaches the goal; illegal moves are rejected\","
+                "\"should_open_child_frame\":true}]"
+            )
+            suggested_fix = (
+                (
+                    "Repair the PlanRecord scope. Implementation requests need work_type=edit WorkUnits; "
+                    "execution/verification requests need run_test or verification WorkUnits. "
+                    "Replace plan.work_units with this minimal executable sequence: "
+                    f"{implementation_plan_repair_units}. "
+                )
+                if failure_type == "plan_scope_incomplete"
+                else (
+                    "State-space implementation plans must include both an edit WorkUnit and this executable verifier WorkUnit. "
+                    "Replace plan.work_units with this minimal executable sequence: "
+                    f"{implementation_plan_repair_units}. "
+                    "Do not write vague success_evidence like 'tests pass' or 'works correctly'. "
+                )
+                if failure_type == "state_space_search_plan_missing_execution_verifier"
+                else (
+                    "Dynamic-programming implementation plans must include a run_test WorkUnit whose goal/success_evidence names base case verification and recurrence/sample oracle verification. "
+                    "Do not write vague success_evidence like 'tests pass' or 'works correctly'. "
+                )
+                if failure_type == "dynamic_programming_plan_missing_execution_verifier"
+                else (
+                    "Constraint-satisfaction implementation plans must include a run_test WorkUnit whose goal/success_evidence names constraint validation and invalid/negative assignment rejection. "
+                    "Do not write vague success_evidence like 'tests pass' or 'works correctly'. "
+                )
+                if failure_type == "constraint_satisfaction_plan_missing_execution_verifier"
+                else (
+                    "Do not resubmit the same PlanRecord after a timeout or repeated failure. "
+                    "Change the WorkUnits so the next edit narrows the failing fixture or implementation scope before validation reruns. "
+                )
+                if failure_type == "plan_revision_no_change"
+                else (
+                    "Remove write_file/append_file/replace_text from PlanRecord.first_action. "
+                    "Planning may choose only a small observation first_action such as "
+                    "{\"tool\":\"list_files\",\"args\":{\"path\":\".\"}}. "
+                    "Emit the actual implementation code later in PLAN_EXECUTION after the WorkUnit opens. "
+                )
+                if failure_type == "plan_work_unit_embedded_edit"
+                else "Repair the PlanRecord schema exactly. "
+            )
+            suggested_fix += PLAN_RECORD_SHAPE_HINT
+            content_prefix = (
+                "create_plan was blocked: state_space_search needs an executable verifier WorkUnit. "
+                + suggested_fix
+                if failure_type == "state_space_search_plan_missing_execution_verifier"
+                else "create_plan was blocked: dynamic_programming needs an executable verifier WorkUnit. "
+                + suggested_fix
+                if failure_type == "dynamic_programming_plan_missing_execution_verifier"
+                else "create_plan was blocked: constraint_satisfaction needs an executable verifier WorkUnit. "
+                + suggested_fix
+                if failure_type == "constraint_satisfaction_plan_missing_execution_verifier"
+                else "create_plan was blocked because PlanRecord is invalid: "
+            )
+            note = self._append_session_event(
+                session_id,
+                {
+                    "type": "system_note",
+                    "role": "system",
+                    "content": (
+                        content_prefix
+                        + "; ".join(issues)
+                        + " "
+                        + PLAN_RECORD_SHAPE_HINT
+                    ),
+                    "code": "planner_action_blocked",
+                    "reason_code": failure_type,
+                    "details": {
+                        "blocked_tool": "create_plan",
+                        "failure_type": failure_type,
+                        "blocked_by": "planner_contract",
+                        "issues": issues,
+                        "plan": plan,
+                        "problem_profile": expected_profile,
+                        "allowed_next_actions": ["create_plan"],
+                        "expected_shape": PLAN_RECORD_SHAPE_HINT,
+                        "suggested_fix": suggested_fix,
+                        "next_required_action": "retry create_plan with a valid PlanRecord",
+                    },
+                    "turn_id": turn_id,
+                    "queue_id": queue_id,
+                    "step_index": step_index,
+                    "llm_workspace": str(turn_workspace),
+                },
+            )
+            return {"ok": False, "event": note, "error": "invalid PlanRecord"}
+        accepted_plan = {**plan, "status": "accepted"}
+        profile = accepted_plan.get("profile") if isinstance(accepted_plan.get("profile"), dict) else expected_profile
+        work_packages = plan_record_to_work_packages(accepted_plan)
+        work_package_issues: list[str] = []
+        for task in work_packages:
+            issues = self._work_package_issues(self._normalize_work_package(task))
+            first_action = task.get("first_action") if isinstance(task.get("first_action"), dict) else {}
+            first_action_args = first_action.get("args") if isinstance(first_action.get("args"), dict) else {}
+            first_action_tool = str(first_action.get("tool") or "").strip()
+            if first_action_tool in {"write_file", "append_file", "replace_text"}:
+                content = (
+                    str(first_action_args.get("new_text") or "")
+                    if first_action_tool == "replace_text"
+                    else str(first_action_args.get("content") or "")
+                )
+                content_bytes = len(content.encode("utf-8"))
+                if content_bytes > PLAN_FIRST_ACTION_CONTENT_BYTES:
+                    issues.append(
+                        "first_action.content too large for PlanRecord "
+                        f"({content_bytes} bytes > {PLAN_FIRST_ACTION_CONTENT_BYTES}); "
+                        "create_plan must contain a concise first executable step, not a full implementation dump"
+                    )
+                if first_action_tool == "write_file" and str(first_action_args.get("path") or "").replace("\\", "/").endswith(".py"):
+                    try:
+                        ast.parse(content or "\n")
+                    except SyntaxError as exc:
+                        issues.append(
+                            "first_action.content for Python write_file must be syntactically valid "
+                            f"(line {exc.lineno}, offset {exc.offset}: {exc.msg})"
+                        )
+            if issues:
+                work_package_issues.append(f"{task.get('task_id')}: {', '.join(issues)}")
+        if work_package_issues:
+            failure_type = (
+                "plan_work_unit_too_large"
+                if any("too large for PlanRecord" in issue for issue in work_package_issues)
+                else "plan_work_unit_invalid_python"
+                if any("syntactically valid" in issue for issue in work_package_issues)
+                else "plan_work_unit_placeholder"
+                if any("placeholder" in issue or "pass-only" in issue for issue in work_package_issues)
+                else "plan_work_units_invalid"
+            )
+            suggested_fix = (
+                "Repair WorkUnits so every first_action is executable and contains no pass/TODO/placeholder implementation. "
+                f"{PLAN_RECORD_SHAPE_HINT}"
+            )
+            note = self._append_session_event(
+                session_id,
+                {
+                    "type": "system_note",
+                    "role": "system",
+                    "content": "create_plan was blocked because PlanRecord WorkUnits are not executable: " + "; ".join(work_package_issues),
+                    "code": "planner_action_blocked",
+                    "reason_code": failure_type,
+                    "details": {
+                        "blocked_tool": "create_plan",
+                        "failure_type": failure_type,
+                        "blocked_by": "planner_work_unit_contract",
+                        "issues": work_package_issues,
+                        "plan": accepted_plan,
+                        "problem_profile": expected_profile,
+                        "allowed_next_actions": ["create_plan"],
+                        "expected_shape": PLAN_RECORD_SHAPE_HINT,
+                        "suggested_fix": suggested_fix,
+                        "next_required_action": "retry create_plan with executable WorkUnits",
+                    },
+                    "turn_id": turn_id,
+                    "queue_id": queue_id,
+                    "step_index": step_index,
+                    "llm_workspace": str(turn_workspace),
+                },
+            )
+            return {"ok": False, "event": note, "error": "invalid PlanRecord WorkUnits"}
+        acceptance = self._plan_acceptance_gate(
+            session_id=session_id,
+            turn_id=turn_id,
+            queue_id=queue_id,
+            step_index=step_index,
+            turn_workspace=turn_workspace,
+            tool_name="create_plan",
+            user_message=user_message,
+            tasks=work_packages,
+            current_model=current_model,
+        )
+        if not bool(acceptance.get("ok")):
+            return {"ok": False, "event": acceptance.get("event"), "error": "plan semantic mismatch"}
+        self._append_session_event(
+            session_id,
+            {
+                "type": "problem_profile",
+                "role": "system",
+                "content": f"Problem profile selected strategy={profile.get('strategy') or accepted_plan.get('strategy')}",
+                "profile": profile,
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+        self._append_session_event(
+            session_id,
+            {
+                "type": "planner_decision",
+                "role": "system",
+                "content": f"Planner selected strategy={accepted_plan.get('strategy')}",
+                "strategy": str(accepted_plan.get("strategy") or ""),
+                "profile": profile,
+                "verification_contract": accepted_plan.get("verification_contract"),
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+        self._append_session_event(
+            session_id,
+            {
+                "type": "plan_record",
+                "role": "system",
+                "content": f"Accepted PlanRecord {accepted_plan.get('plan_id')} with {len(accepted_plan.get('work_units') or [])} work units.",
+                "plan": accepted_plan,
+                "profile": profile,
+                "strategy": str(accepted_plan.get("strategy") or ""),
+                "work_units": list(accepted_plan.get("work_units") or []),
+                "verification_contract": accepted_plan.get("verification_contract"),
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+        self._return_plan_revision_to_root_frame(
+            session_id=session_id,
+            turn_id=turn_id,
+            queue_id=queue_id,
+            step_index=step_index,
+            turn_workspace=turn_workspace,
+        )
+        decompose_result = self._handle_decompose_tasks(
+            session_id=session_id,
+            turn_id=turn_id,
+            queue_id=queue_id,
+            step_index=step_index,
+            tool_args={
+                "tasks": work_packages,
+                "rationale": f"PlanRecord {accepted_plan.get('plan_id')} strategy={accepted_plan.get('strategy')}",
+            },
+            turn_workspace=turn_workspace,
+            steps=steps,
+            user_message=user_message,
+            current_model=current_model,
+            skip_acceptance=True,
+        )
+        return {
+            "ok": bool(decompose_result.get("ok")),
+            "plan": accepted_plan,
+            "event": decompose_result.get("event"),
+            "tasks": work_packages,
+            "auto_steps": list(decompose_result.get("auto_steps") or []),
+            "terminal_failure": bool(decompose_result.get("terminal_failure")),
+            "error": decompose_result.get("error"),
+        }
+
     def _child_frame_has_tool_evidence(self) -> bool:
         current = self.frame_manager.current_frame()
         if current is None or current.parent_frame_id is None:
@@ -2887,6 +5252,15 @@ class AgentRuntime:
             if str(event.get("type") or "") == "tool_result":
                 return True
         return False
+
+    def _current_child_is_plan_work_unit(self) -> bool:
+        current = self.frame_manager.current_frame()
+        if current is None or current.parent_frame_id is None:
+            return False
+        work_package = self.frame_manager.work_package_for(current) or {}
+        context_summary = str(work_package.get("context_summary") or current.inherited_context.get("context_summary") or "")
+        why_not_direct = str(work_package.get("why_not_direct_action") or "")
+        return "planner_strategy=" in context_summary or "PlanRecord requires this WorkUnit" in why_not_direct
 
     def _child_frame_successful_tool_evidence(self) -> list[str]:
         current = self.frame_manager.current_frame()
@@ -2923,11 +5297,253 @@ class AgentRuntime:
             findings.append(f"{tool_name} ok")
         return findings
 
+    @staticmethod
+    def _work_unit_contract_text(work_package: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("goal", "success_evidence", "done_when", "context_summary", "why_not_direct_action"):
+            value = work_package.get(key)
+            if isinstance(value, list):
+                parts.extend(str(item) for item in value)
+            elif value:
+                parts.append(str(value))
+        return "\n".join(parts)
+
+    @staticmethod
+    def _work_unit_edit_text(tool_name: str, tool_args: dict[str, Any]) -> str:
+        if tool_name == "replace_text":
+            return str(tool_args.get("new_text") or "")
+        return str(tool_args.get("content") or "")
+
+    @staticmethod
+    def _work_unit_required_algorithm_markers(contract_text: str) -> list[str]:
+        lowered = str(contract_text or "").lower()
+        markers: list[str] = []
+        if re.search(r"\ba\s*[-*]\s*search\b|\ba\s*[-*]\b|\bastar\b|\ba_star\b", lowered):
+            markers.append("astar")
+        for marker in ("dijkstra", "bfs", "dfs"):
+            if re.search(rf"\b{re.escape(marker)}\b", lowered):
+                markers.append(marker)
+        if "動的計画" in lowered or "dynamic programming" in lowered:
+            markers.append("dynamic_programming")
+        return list(dict.fromkeys(markers))
+
+    @staticmethod
+    def _source_satisfies_algorithm_marker(source: str, marker: str) -> bool:
+        text = str(source or "")
+        lowered = text.lower()
+        if marker == "astar":
+            if re.search(r"\b(astar|a_star)\b", lowered):
+                return True
+            return "heapq" in lowered and any(token in lowered for token in ("heuristic", "f_score", "priority"))
+        if marker == "dynamic_programming":
+            return any(token in lowered for token in ("dynamic_programming", "dp", "memo", "cache")) or "漸化式" in lowered
+        return bool(re.search(rf"\b{re.escape(marker)}\b", lowered))
+
+    @staticmethod
+    def _work_unit_mentions_tests(contract_text: str) -> bool:
+        lowered = str(contract_text or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "test",
+                "tests/",
+                "unittest",
+                "assert",
+                "テスト",
+                "検証テスト",
+                "fixture",
+            )
+        )
+
+    @staticmethod
+    def _work_unit_mentions_implementation(contract_text: str) -> bool:
+        lowered = str(contract_text or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "implement",
+                "implementation",
+                "algorithm",
+                "solver",
+                "search",
+                "function",
+                "class",
+                "module",
+                "code",
+                "実装",
+                "アルゴリズム",
+                "ソルバー",
+                "探索",
+                "解法",
+                "関数",
+                "クラス",
+                "コード",
+                "プログラム",
+            )
+        )
+
+    @staticmethod
+    def _work_unit_output_literals(text: str) -> list[str]:
+        literals: list[str] = []
+        for match in re.finditer(r"'([^'\n]{1,80})'|\"([^\"\n]{1,80})\"", str(text or "")):
+            literal = str(match.group(1) or match.group(2) or "").strip()
+            if literal:
+                literals.append(literal)
+        return list(dict.fromkeys(literals))
+
+    @staticmethod
+    def _work_unit_declares_output_requirement(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "stdout",
+                "print",
+                "prints",
+                "output",
+                "display",
+                "show",
+                "標準出力",
+                "出力",
+                "表示",
+                "見せ",
+            )
+        )
+
+    def _work_unit_success_evidence_issues(
+        self,
+        *,
+        work_package: dict[str, Any],
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_result: dict[str, Any],
+    ) -> list[str]:
+        """Return generic mismatches between WorkUnit evidence and observed tool result."""
+
+        if not bool(tool_result.get("ok")):
+            return []
+        work_type = str(work_package.get("work_type") or "").strip()
+        contract_text = self._work_unit_contract_text(work_package)
+        issues: list[str] = []
+        if work_type == "edit" and tool_name in {"write_file", "append_file", "replace_text"}:
+            path = str(tool_result.get("path") or tool_args.get("path") or "").strip()
+            edit_text = self._work_unit_edit_text(tool_name, tool_args)
+            mentions_tests = self._work_unit_mentions_tests(contract_text)
+            mentions_impl = self._work_unit_mentions_implementation(contract_text)
+            if _artifact_path_is_test(path) and mentions_impl and not mentions_tests:
+                issues.append(
+                    "WorkUnit goal/success_evidence asks for implementation evidence, "
+                    f"but the successful edit wrote a test artifact: {path}"
+                )
+            if (
+                tool_name in {"write_file", "append_file"}
+                and edit_text.strip()
+                and not _artifact_path_is_test(path)
+            ):
+                for marker in self._work_unit_required_algorithm_markers(contract_text):
+                    if not self._source_satisfies_algorithm_marker(edit_text, marker):
+                        issues.append(
+                            f"WorkUnit requires {marker} evidence, but the edited implementation text does not contain an observable {marker} implementation marker"
+                        )
+            return issues
+        if work_type == "run_test" and tool_name == "run_command":
+            stdout = str(tool_result.get("stdout") or "")
+            stderr = str(tool_result.get("stderr") or "")
+            combined = stdout + "\n" + stderr
+            if self._work_unit_declares_output_requirement(contract_text):
+                literals = self._work_unit_output_literals(contract_text)
+                missing_literals = [literal for literal in literals if literal not in combined]
+                if literals and missing_literals:
+                    issues.append(
+                        "WorkUnit success_evidence requires output literal(s) that were not observed: "
+                        + ", ".join(missing_literals)
+                    )
+                elif not stdout.strip():
+                    issues.append(
+                        "WorkUnit success_evidence requires user-visible stdout, but the successful command produced empty stdout"
+                    )
+            return issues
+        return issues
+
+    def _work_unit_success_evidence_block_event(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_result: dict[str, Any],
+        issues: list[str],
+    ) -> dict[str, Any] | None:
+        current = self.frame_manager.current_frame()
+        if current is None or current.parent_frame_id is None:
+            return None
+        work_package = dict(self.frame_manager.work_package_for(current) or {})
+        if not work_package:
+            return None
+        result_summary = {
+            key: tool_result.get(key)
+            for key in ("ok", "tool", "path", "command", "returncode", "stdout", "stderr", "error")
+            if key in tool_result
+        }
+        if "stdout" in result_summary:
+            result_summary["stdout"] = str(result_summary["stdout"] or "")[:800]
+        if "stderr" in result_summary:
+            result_summary["stderr"] = str(result_summary["stderr"] or "")[:800]
+        message = (
+            "WorkUnit の success_evidence がまだ観測されていないため、子フレーム完了をブロックしました。"
+            " tool は成功しましたが、計画上の成功条件と実際の成果が一致していません。"
+        )
+        return self._append_session_event(
+            session_id,
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": message,
+                "code": "work_unit_success_evidence_blocked",
+                "reason_code": "work_unit_success_evidence_not_observed",
+                "details": {
+                    "active_frame_id": current.frame_id,
+                    "active_frame_depth": current.depth,
+                    "blocked_tool": "return_to_parent",
+                    "failure_type": "work_unit_success_evidence_not_observed",
+                    "blocked_by": "plan_execution_contract",
+                    "work_package": work_package,
+                    "tool_name": tool_name,
+                    "tool_args": tool_args,
+                    "tool_result_summary": result_summary,
+                    "issues": issues,
+                    "allowed_next_actions": [
+                        {
+                            "tool": "write_file|append_file|replace_text|run_command|read_file|search_code|list_files",
+                            "strategy": "perform a direct action whose observed result satisfies this WorkUnit success_evidence",
+                        },
+                        {
+                            "tool": "return_to_parent",
+                            "strategy": "allowed only after the WorkUnit success_evidence is actually observed",
+                        },
+                    ],
+                    "suggested_fix": (
+                        "現在の WorkUnit goal と success_evidence を読み、成功済みtoolの種類ではなく、"
+                        "観測されたpath/stdout/stderr/contentがその成功条件を満たすように直接編集または検証してください。"
+                    ),
+                    "next_required_action": "produce observed evidence matching the active WorkUnit success_evidence before returning to parent",
+                },
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+
     def _child_frame_has_unresolved_failure(self) -> bool:
         current = self.frame_manager.current_frame()
         if current is None or current.parent_frame_id is None:
             return False
-        failure_codes = {"edit_blocked", "command_failed", "validation_failed"}
+        failure_codes = {"edit_blocked", "command_failed", "validation_failed", "work_unit_success_evidence_blocked"}
         for event in current.session_events:
             if event.get("type") == "tool_result" and not bool(event.get("ok")):
                 return True
@@ -3025,13 +5641,58 @@ class AgentRuntime:
         current = self.frame_manager.current_frame()
         if current is None or current.parent_frame_id is None:
             return None
-        if not self._child_frame_has_tool_evidence():
+        is_plan_work_unit = self._current_child_is_plan_work_unit()
+        has_tool_evidence = self._child_frame_has_tool_evidence()
+        if not is_plan_work_unit and not has_tool_evidence:
             return None
         work_package = dict(self.frame_manager.work_package_for(current) or {})
-        message = (
-            "子フレームは具体ツール結果を得た後に再分解できません。"
-            "現在の work_package の証拠を return_to_parent で親へ返すか、同じ子フレーム内で直接ツールを実行してください。"
-        )
+        first_action = work_package.get("first_action") if isinstance(work_package.get("first_action"), dict) else {}
+        if is_plan_work_unit:
+            message = (
+                "accepted PlanRecord の WorkUnit 子フレームでは再分解できません。"
+                "PlanRecord自体が分解の正本なので、この子フレーム内で直接ツールを実行してください。"
+            )
+            reason_code = "plan_work_unit_requires_direct_action"
+            failure_type = "plan_work_unit_decomposition_blocked"
+            if not has_tool_evidence and first_action:
+                allowed_next_actions = [
+                    {
+                        "tool": str(first_action.get("tool") or ""),
+                        "args": first_action.get("args") or {},
+                        "strategy": "execute work_package.first_action exactly",
+                    }
+                ]
+                suggested_fix = "PlanRecord WorkUnit の最初の行動は work_package.first_action をそのまま実行してください。"
+                next_required_action = f"run {first_action.get('tool')} with expected_args"
+            else:
+                allowed_next_actions = [
+                    {
+                        "tool": "read_file|search_code|run_command|write_file|append_file|replace_text|list_files",
+                        "strategy": "perform one direct tool action that advances this WorkUnit",
+                    },
+                    {"tool": "return_to_parent", "strategy": "return only if the WorkUnit success_evidence is satisfied"},
+                ]
+                suggested_fix = (
+                    "decompose_tasks/open_child_frame を使わず、現在の WorkUnit の未達を直接解消する "
+                    "write_file/read_file/run_command などを1つ実行してください。"
+                )
+                next_required_action = "perform one direct child-frame tool action for this WorkUnit"
+        else:
+            message = (
+                "子フレームは具体ツール結果を得た後に再分解できません。"
+                "現在の work_package の証拠を return_to_parent で親へ返すか、同じ子フレーム内で直接ツールを実行してください。"
+            )
+            reason_code = "child_contract_requires_return"
+            failure_type = "child_frame_decomposition_after_evidence"
+            allowed_next_actions = [
+                {"tool": "return_to_parent", "strategy": "return the child evidence to the parent frame"},
+                {
+                    "tool": "read_file|search_code|run_command|write_file|append_file|replace_text|list_files",
+                    "strategy": "continue direct work inside this child frame only if more evidence is required",
+                },
+            ]
+            suggested_fix = "子フレームで得た証拠を return_to_parent で親へ返すか、同じ子フレーム内で直接ツールを実行してください。"
+            next_required_action = "return_to_parent with the child evidence, or perform one direct child-frame tool action"
         return self._append_session_event(
             session_id,
             {
@@ -3039,21 +5700,19 @@ class AgentRuntime:
                 "role": "system",
                 "content": message,
                 "code": "decompose_tasks_blocked" if tool_name == "decompose_tasks" else "open_child_frame_blocked",
-                "reason_code": "child_contract_requires_return",
+                "reason_code": reason_code,
                 "details": {
                     "active_frame_id": current.frame_id,
                     "active_frame_depth": current.depth,
                     "blocked_tool": tool_name,
-                    "failure_type": "child_frame_decomposition_after_evidence",
+                    "failure_type": failure_type,
                     "blocked_by": "frame_contract",
                     "work_package": work_package,
+                    "plan_work_unit": is_plan_work_unit,
                     "observations": list(current.working_memory.observations),
-                    "allowed_next_actions": [
-                        {"tool": "return_to_parent", "strategy": "return the child evidence to the parent frame"},
-                        {"tool": "read_file|search_code|run_command|write_file|append_file|replace_text|list_files", "strategy": "continue direct work inside this child frame only if more evidence is required"},
-                    ],
-                    "suggested_fix": "子フレームで得た証拠を return_to_parent で親へ返すか、同じ子フレーム内で直接ツールを実行してください。",
-                    "next_required_action": "return_to_parent with the child evidence, or perform one direct child-frame tool action",
+                    "allowed_next_actions": allowed_next_actions,
+                    "suggested_fix": suggested_fix,
+                    "next_required_action": next_required_action,
                 },
                 "turn_id": turn_id,
                 "queue_id": queue_id,
@@ -3114,14 +5773,56 @@ class AgentRuntime:
         step_index: int,
         turn_workspace: Path,
         tool_name: str,
+        tool_args: dict[str, Any],
         tool_result: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         current = self.frame_manager.current_frame()
         if current is None or current.parent_frame_id is None:
-            return
+            return False
         work_package = self.frame_manager.work_package_for(current) or {}
+        issues = self._work_unit_success_evidence_issues(
+            work_package=dict(work_package),
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_result=tool_result,
+        )
+        if issues:
+            self._work_unit_success_evidence_block_event(
+                session_id=session_id,
+                turn_id=turn_id,
+                queue_id=queue_id,
+                step_index=step_index,
+                turn_workspace=turn_workspace,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_result=tool_result,
+                issues=issues,
+            )
+            return False
         evidence = work_package.get("success_evidence") or work_package.get("done_when") or ""
-        result_summary = json.dumps(tool_result, ensure_ascii=False)[:1200]
+        result_for_summary: dict[str, Any] = {}
+        for key in (
+            "ok",
+            "tool",
+            "path",
+            "bytes_written",
+            "size_policy",
+            "returncode",
+            "command",
+            "duration_ms",
+            "failure_type",
+            "blocked_by",
+            "error",
+        ):
+            if key in tool_result:
+                result_for_summary[key] = tool_result.get(key)
+        if "items" in tool_result and isinstance(tool_result.get("items"), list):
+            result_for_summary["item_count"] = len(tool_result.get("items") or [])
+        if "content" in tool_result:
+            result_for_summary["content_summary"] = f"<omitted {len(str(tool_result.get('content') or ''))} chars>"
+        if not result_for_summary:
+            result_for_summary = {"ok": bool(tool_result.get("ok")), "tool": tool_name}
+        result_summary = json.dumps(result_for_summary, ensure_ascii=False)[:700]
         self._handle_return_to_parent(
             session_id=session_id,
             turn_id=turn_id,
@@ -3130,13 +5831,14 @@ class AgentRuntime:
             tool_args={
                 "summary": f"first_action succeeded: {tool_name}",
                 "findings": [
-                    f"success_evidence: {evidence}",
+                    f"declared_success_evidence: {evidence}",
                     f"tool_result: {result_summary}",
                     *list(current.working_memory.observations),
                 ],
             },
             turn_workspace=turn_workspace,
         )
+        return True
 
     def _current_child_should_return_after_tool_success(self, *, tool_name: str) -> bool:
         current = self.frame_manager.current_frame()
@@ -3144,7 +5846,178 @@ class AgentRuntime:
             return False
         work_package = self.frame_manager.work_package_for(current) or {}
         work_type = str(work_package.get("work_type") or "").strip()
+        if work_type == "edit":
+            return tool_name in {"write_file", "append_file", "replace_text"}
         return work_type == "run_test" and tool_name == "run_command"
+
+    def _step_limit_active_frame_block_event(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+    ) -> dict[str, Any] | None:
+        current = self.frame_manager.current_frame()
+        if current is None or current.parent_frame_id is None:
+            return None
+        work_package = dict(self.frame_manager.work_package_for(current) or {})
+        return self._append_session_event(
+            self.root,
+            session_id,
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": (
+                    "step limit final gate was blocked because a child frame still has unreturned work. "
+                    "Return the child evidence to the parent frame before any final answer can be accepted."
+                ),
+                "code": "step_limit_plan_incomplete",
+                "reason_code": "child_frame_active_at_step_limit",
+                "details": {
+                    "blocked_tool": "step_limit_final_gate",
+                    "failure_type": "child_frame_active_at_step_limit",
+                    "blocked_by": "plan_execution_contract",
+                    "active_frame_id": current.frame_id,
+                    "active_frame_depth": current.depth,
+                    "work_package": work_package,
+                    "successful_tool_evidence": self._child_frame_successful_tool_evidence(),
+                    "allowed_next_actions": [
+                        {
+                            "tool": "return_to_parent",
+                            "strategy": "return child-frame evidence before final acceptance",
+                        }
+                    ],
+                    "suggested_fix": "子フレームの成果を return_to_parent で親へ返し、残りのPlanRecord WorkUnitを実行してください。",
+                    "next_required_action": "return_to_parent with child frame evidence",
+                },
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+
+    def _pending_plan_child_task(self) -> dict[str, Any] | None:
+        """Return the next unfinished root-frame WorkUnit, if a plan is active.
+
+        Invariant: accepted PlanRecord / task_plan units are executable
+        obligations. A root frame must not synthesize finish while a planned
+        child task remains pending.
+        """
+        current = self.frame_manager.current_frame()
+        if current is None or current.parent_frame_id is not None:
+            return None
+        if not current.working_memory.child_tasks:
+            return None
+        return self.frame_manager.next_pending_child_task(current)
+
+    def _plan_execution_pending_block_event(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+        blocked_tool: str,
+        pending_task: dict[str, Any],
+    ) -> dict[str, Any]:
+        task_id = str(pending_task.get("task_id") or "")
+        goal = str(pending_task.get("goal") or "")
+        return self._append_session_event(
+            self.root,
+            session_id,
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": (
+                    f"{blocked_tool} was blocked because the accepted plan still has a pending WorkUnit: "
+                    f"{task_id} {goal}"
+                ),
+                "code": "finish_blocked" if blocked_tool == "finish" else "plan_execution_blocked",
+                "reason_code": "plan_work_units_pending",
+                "details": {
+                    "blocked_tool": blocked_tool,
+                    "failure_type": "plan_work_units_pending",
+                    "blocked_by": "plan_execution_contract",
+                    "pending_task": pending_task,
+                    "allowed_next_actions": [
+                        {
+                            "tool": "open_child_frame",
+                            "strategy": "open the pending planned WorkUnit before finish",
+                        }
+                    ],
+                    "suggested_fix": "accepted PlanRecord の未完了WorkUnitを open_child_frame で実行してからfinishしてください。",
+                    "next_required_action": "open_child_frame for the pending planned WorkUnit",
+                },
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+
+    def _auto_open_pending_plan_child(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        queue_id: str,
+        step_index: int,
+        turn_workspace: Path,
+        user_message: str,
+        current_model: str,
+    ) -> dict[str, Any] | None:
+        pending_task = self._pending_plan_child_task()
+        if pending_task is None:
+            return None
+        self._append_session_event(
+            self.root,
+            session_id,
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": f"PLAN_EXECUTION continues with pending WorkUnit: {pending_task.get('task_id') or ''}",
+                "code": "plan_execution_continue",
+                "reason_code": "pending_work_unit",
+                "details": {
+                    "pending_task": pending_task,
+                    "blocked_by": "plan_execution_contract",
+                    "next_required_action": "open_child_frame for the pending planned WorkUnit",
+                },
+                "turn_id": turn_id,
+                "queue_id": queue_id,
+                "step_index": step_index,
+                "llm_workspace": str(turn_workspace),
+            },
+        )
+        return self._handle_open_child_frame(
+            session_id=session_id,
+            turn_id=turn_id,
+            queue_id=queue_id,
+            step_index=step_index,
+            tool_args={
+                "work_package": pending_task,
+                "child_task_id": str(pending_task.get("task_id") or ""),
+            },
+            turn_workspace=turn_workspace,
+            user_message=user_message,
+            current_model=current_model,
+        )
+
+    def _plan_run_test_should_wait_for_progress(self, *, pending_task: dict[str, Any], progress_state: dict[str, Any]) -> bool:
+        """Return True when a planned verifier must wait for implementation progress."""
+
+        if str(pending_task.get("work_type") or "") != "run_test":
+            return False
+        if not list(progress_state.get("test_paths") or []):
+            return True
+        if not self._implementation_task_progress_is_incomplete(progress_state):
+            return False
+        phase = str(progress_state.get("phase") or "")
+        return phase not in {"unittest_not_run", "external_audit_required", "external_contract_satisfied"}
 
     def _first_action_result_allows_auto_return(self, *, work_package: dict[str, Any], tool_name: str) -> bool:
         """Return whether a successful first_action is itself enough child evidence.
@@ -3260,6 +6133,7 @@ class AgentRuntime:
                 step_index=step_index,
                 turn_workspace=turn_workspace,
                 tool_name=tool_name,
+                tool_args=tool_args,
                 tool_result=tool_result,
             )
         return [{"tool_name": tool_name, "tool_args": dict(tool_args), "tool_result": tool_result}]
@@ -3377,8 +6251,39 @@ class AgentRuntime:
         """
         base = max(1, int(configured or 12))
         text = str(user_message or "").lower()
-        implementation_markers = ["実装", "作成", "追加", "implement", "create", "write", "solver", "ソルバー"]
-        verification_markers = ["unittest", "tests/", "テスト", "検証", "test"]
+        implementation_markers = [
+            "実装",
+            "作成",
+            "作り",
+            "作って",
+            "プログラム",
+            "追加",
+            "implement",
+            "create",
+            "write",
+            "solver",
+            "ソルバー",
+        ]
+        verification_markers = [
+            "unittest",
+            "tests/",
+            "テスト",
+            "検証",
+            "実行",
+            "動作確認",
+            "クリア",
+            "run",
+            "execute",
+            "test",
+        ]
+        profile = self._planning_profile_for_message(user_message)
+        if planning_required_for_profile(profile):
+            target = int(
+                self.runtime_config.get("planned_implementation_max_steps")
+                or self.runtime_config.get("verified_implementation_max_steps")
+                or 48
+            )
+            return max(base, target)
         if any(marker in text for marker in implementation_markers) and any(marker in text for marker in verification_markers):
             target = int(self.runtime_config.get("verified_implementation_max_steps") or 32)
             return max(base, target)
@@ -3462,7 +6367,13 @@ class AgentRuntime:
     def _step_limit_missing_requirements(self, *, user_message: str, steps: list[dict[str, Any]]) -> list[str]:
         contract = _finish_acceptance_contract(user_message)
         evidence = _finish_acceptance_evidence(steps)
-        return [item for item in contract if not bool(evidence.get(item))]
+        missing = [item for item in contract if not bool(evidence.get(item))]
+        current = self.frame_manager.current_frame()
+        if current is not None and current.parent_frame_id is not None:
+            missing.append("child_frame_returned")
+        if self._pending_plan_child_task() is not None:
+            missing.append("plan_work_units_completed")
+        return missing
 
     def _successful_unittest_run_count(self, steps: list[dict[str, Any]]) -> int:
         count = 0
@@ -3472,9 +6383,49 @@ class AgentRuntime:
             result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
             args = step.get("tool_args") if isinstance(step.get("tool_args"), dict) else {}
             command = str(result.get("command") or args.get("command") or "").lower()
-            if "unittest" in command and bool(result.get("ok")):
+            if _unittest_command_is_acceptance(command) and bool(result.get("ok")):
                 count += 1
         return count
+
+    def _steps_observed_python_verification(self, steps: list[dict[str, Any]]) -> bool:
+        for step in steps:
+            if str(step.get("tool_name") or "") != "run_command":
+                continue
+            result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
+            args = step.get("tool_args") if isinstance(step.get("tool_args"), dict) else {}
+            command = str(result.get("command") or args.get("command") or "").lower()
+            if "unittest" in command or "pytest" in command:
+                return True
+        return False
+
+    def _unittest_failure_is_missing_tests_artifact(self, result: dict[str, Any]) -> bool:
+        command = str(result.get("command") or "").lower()
+        if "unittest" not in command and "pytest" not in command:
+            return False
+        output = "\n".join(
+            str(result.get(key) or "")
+            for key in ("stderr", "stdout", "error")
+            if str(result.get(key) or "")
+        )
+        lowered = output.lower()
+        return (
+            "start directory is not importable" in lowered
+            and "'tests'" in lowered
+        ) or (
+            "no such file or directory" in lowered
+            and "tests" in lowered
+        ) or bool(
+            re.search(
+                r"failed to import test module:\s*([a-zA-Z_][\w.]*)[\s\S]+no module named ['\"]\1['\"]",
+                output,
+                re.IGNORECASE,
+            )
+            and re.search(
+                r"failed to import test module:\s*(?:[\w.]+\.)?test[_\w]*",
+                output,
+                re.IGNORECASE,
+            )
+        )
 
     def _unittest_failure_signature(self, result: dict[str, Any], *, turn_workspace: Path | None = None) -> str:
         """Stable signature for a failed unittest observation, independent of workspace path."""
@@ -3488,6 +6439,8 @@ class AgentRuntime:
         if turn_workspace is not None:
             output = output.replace(str(Path(turn_workspace).resolve()), "<workspace>")
         output = re.sub(r'File "([^"]+)"', lambda match: f'File "{Path(match.group(1)).name}"', output)
+        output = re.sub(r", line \d+", ", line <n>", output)
+        output = re.sub(r"line \d+", "line <n>", output)
         payload = json.dumps(
             {"command": command, "output": output[-4000:]},
             ensure_ascii=False,
@@ -3506,6 +6459,8 @@ class AgentRuntime:
         return format_repo_map_for_prompt(repo_map, max_chars=1600)
 
     def _implementation_progress_event_signature(self, state: dict[str, Any]) -> dict[str, Any]:
+        implementation_repair_hints = list(state.get("implementation_source_repair_hints") or [])
+        unittest_repair_hints = [str(item) for item in state.get("unittest_repair_hints") or []]
         return {
             "phase": str(state.get("phase") or ""),
             "contract_state": str(state.get("contract_state") or ""),
@@ -3513,7 +6468,11 @@ class AgentRuntime:
             "allowed_next_actions": [str(item) for item in state.get("allowed_next_actions") or []],
             "repeated_unittest_failure_signature": bool(state.get("repeated_unittest_failure_signature")),
             "latest_unittest_failure_signature": str(state.get("latest_unittest_failure_signature") or ""),
-            "repair_hints": list(state.get("implementation_source_repair_hints") or []),
+            "repair_hints": [*implementation_repair_hints, *unittest_repair_hints],
+            "unittest_repair_hints": unittest_repair_hints,
+            "implementation_generation_repetitive_output": bool(state.get("implementation_generation_repetitive_output")),
+            "test_generation_repetitive_output": bool(state.get("test_generation_repetitive_output")),
+            "repair_generation_repetitive_output": bool(state.get("repair_generation_repetitive_output")),
             "implementation_paths": [str(item) for item in state.get("implementation_paths") or []],
             "test_paths": [str(item) for item in state.get("test_paths") or []],
             "unittest_run": bool(state.get("unittest_run")),
@@ -3545,6 +6504,8 @@ class AgentRuntime:
         phase = str(state.get("phase") or "")
         allowed = [str(item) for item in state.get("allowed_next_actions") or [] if str(item).strip()]
         missing = [str(item) for item in state.get("missing_requirements") or [] if str(item).strip()]
+        implementation_repair_hints = list(state.get("implementation_source_repair_hints") or [])
+        unittest_repair_hints = [str(item) for item in state.get("unittest_repair_hints") or []]
         self._append_session_event(
             self.root,
             session_id,
@@ -3560,7 +6521,11 @@ class AgentRuntime:
                     "contract_state": str(state.get("contract_state") or ""),
                     "missing_requirements": missing,
                     "allowed_next_actions": allowed,
-                    "repair_hints": list(state.get("implementation_source_repair_hints") or []),
+                    "repair_hints": [*implementation_repair_hints, *unittest_repair_hints],
+                    "unittest_repair_hints": unittest_repair_hints,
+                    "implementation_generation_repetitive_output": bool(state.get("implementation_generation_repetitive_output")),
+                    "test_generation_repetitive_output": bool(state.get("test_generation_repetitive_output")),
+                    "repair_generation_repetitive_output": bool(state.get("repair_generation_repetitive_output")),
                     "signature": signature,
                 },
                 "turn_id": turn_id,
@@ -3580,9 +6545,30 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         """Canonical progress state for generic implementation + unittest tasks."""
         contract = _finish_acceptance_contract(user_message)
+        evidence = _finish_acceptance_evidence(steps)
+        plan_context = self._plan_record_execution_context()
+        plan_strategy = str(plan_context.get("plan_strategy") or "")
+        plan_verification_contract = [str(item) for item in plan_context.get("plan_verification_contract") or []]
+        plan_requires_python_verification = (
+            plan_strategy in {
+                "state_space_search",
+                "dynamic_programming",
+                "constraint_satisfaction",
+                "graph_shortest_path",
+                "classical_planning",
+            }
+            or any(item in {"final_verifier", "solution_validator", "path_validator", "plan_step_validator"} for item in plan_verification_contract)
+        )
+        if self._steps_observed_python_verification(steps) and bool(evidence.get("python_artifact_written")):
+            for item in ["python_artifact_written", "tests_written", "meaningful_tests", "unittest_run", "unittest_passed"]:
+                if item not in contract:
+                    contract.append(item)
+        if plan_requires_python_verification:
+            for item in ["python_artifact_written", "tests_written", "meaningful_tests", "unittest_run", "unittest_passed"]:
+                if item not in contract:
+                    contract.append(item)
         if "python_artifact_written" not in contract or "unittest_run" not in contract:
             return {"applicable": False, "phase": "not_applicable"}
-        evidence = _finish_acceptance_evidence(steps)
         artifact_paths = [str(path or "").replace("\\", "/") for path in evidence.get("artifact_paths") or []]
         implementation_paths = [path for path in artifact_paths if _artifact_path_is_python_implementation(path)]
         test_paths = [path for path in artifact_paths if _artifact_path_is_test(path)]
@@ -3618,7 +6604,17 @@ class AgentRuntime:
         latest_impl_source = source_for(latest_impl_path)
         latest_test_sources = [(path, source_for(path)) for path in test_paths]
         latest_test_sources = [(path, source) for path, source in latest_test_sources if source]
+        test_source_issues = self._test_source_contract_issues(
+            user_message=user_message,
+            test_sources=latest_test_sources,
+        )
         repo_map_excerpt = self._repo_map_excerpt_for_workspace(turn_workspace)
+        latest_llm_output_issue = ""
+        if session_id:
+            for event in reversed(read_jsonl(self.paths.session_events_path(session_id))):
+                if event.get("type") == "system_note" and str(event.get("code") or "") == "llm_output_issue":
+                    latest_llm_output_issue = str(event.get("content") or "")
+                    break
         placeholder_present = bool(latest_impl_source) and self._python_source_has_pass_only_callable(latest_impl_source)
         implementation_source_issues = (
             self._implementation_source_contract_issues(user_message=user_message, source=latest_impl_source)
@@ -3627,6 +6623,9 @@ class AgentRuntime:
         )
         implementation_source_repair_hints = (
             [
+                *self._python_source_placeholder_repair_hints(
+                    latest_impl_source,
+                ),
                 *self._public_api_wrapper_repair_hints(
                     user_message=user_message,
                     source=latest_impl_source,
@@ -3637,6 +6636,10 @@ class AgentRuntime:
                 ),
                 *self._python_source_recursive_destructive_state_repair_hints(
                     latest_impl_source,
+                ),
+                *self._state_space_search_replay_verifier_repair_hints(
+                    source=latest_impl_source,
+                    issues=implementation_source_issues,
                 ),
             ][:6]
             if latest_impl_source and implementation_source_issues
@@ -3692,6 +6695,7 @@ class AgentRuntime:
         )
 
         latest_unittest_result: dict[str, Any] | None = None
+        latest_any_unittest_result: dict[str, Any] | None = None
         successful_unittest_count = self._successful_unittest_run_count(steps)
         latest_failed_unittest_index = -1
         previous_same_unittest_failure_index = -1
@@ -3706,18 +6710,45 @@ class AgentRuntime:
             if str(step.get("tool_name") or "") != "run_command":
                 continue
             result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
-            if "unittest" in str(result.get("command") or "").lower():
+            command_text = str(result.get("command") or "")
+            if "unittest" in command_text.lower() and latest_any_unittest_result is None:
+                latest_any_unittest_result = result
+            if _unittest_command_is_acceptance(command_text):
                 latest_unittest_result = result
                 break
-        if latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")):
+        if latest_unittest_result is None:
+            latest_unittest_result = latest_any_unittest_result
+        latest_unittest_triage_result = latest_unittest_result
+        if latest_any_unittest_result is not None and not bool(latest_any_unittest_result.get("ok")):
+            latest_unittest_triage_result = latest_any_unittest_result
+        latest_unittest_output_for_triage = ""
+        latest_unittest_missing_import = {}
+        if latest_unittest_triage_result is not None and not bool(latest_unittest_triage_result.get("ok")):
+            latest_unittest_output_for_triage = "\n".join(
+                str(latest_unittest_triage_result.get(key) or "")
+                for key in ("stderr", "stdout", "error")
+                if str(latest_unittest_triage_result.get(key) or "")
+            )
+            latest_unittest_missing_import = self._unittest_missing_import_details(
+                output=latest_unittest_output_for_triage,
+            )
             latest_failed_unittest_paths = self._extract_unittest_failure_paths(
-                output="\n".join(
-                    str(latest_unittest_result.get(key) or "")
-                    for key in ("stderr", "stdout", "error")
-                    if str(latest_unittest_result.get(key) or "")
-                ),
+                output=latest_unittest_output_for_triage,
                 turn_workspace=turn_workspace,
             )
+        latest_unittest_missing_tests_artifact = (
+            latest_unittest_result is not None
+            and not bool(latest_unittest_result.get("ok"))
+            and self._unittest_failure_is_missing_tests_artifact(latest_unittest_result)
+        )
+        latest_unittest_tool_failure_type = str((latest_unittest_triage_result or {}).get("failure_type") or "")
+        latest_unittest_timed_out = (
+            latest_unittest_tool_failure_type == "command_timeout"
+            or "timed out" in str((latest_unittest_triage_result or {}).get("stderr") or "").lower()
+            or "timeout" in str((latest_unittest_triage_result or {}).get("stderr") or "").lower()
+            or "timed out" in str((latest_unittest_triage_result or {}).get("error") or "").lower()
+            or "timeout" in str((latest_unittest_triage_result or {}).get("error") or "").lower()
+        )
         for index, step in enumerate(steps):
             step_tool = str(step.get("tool_name") or "")
             step_args = step.get("tool_args") if isinstance(step.get("tool_args"), dict) else {}
@@ -3769,18 +6800,146 @@ class AgentRuntime:
                     latest_read_paths_after_failed_unittest.update(read_paths_between_same_failures)
                     repeated_unittest_failure_signature = True
 
+        latest_unittest_failed_paths_are_tests = bool(latest_failed_unittest_paths) and all(
+            _artifact_path_is_test(str(item).replace("\\", "/"))
+            for item in latest_failed_unittest_paths
+        )
+        state_space_test_impl_contract_suspected = False
+        state_space_test_fixture_value_suspected = False
+        if plan_strategy == "state_space_search" and latest_unittest_failed_paths_are_tests:
+            fail_count = len(re.findall(r"(?m)^FAIL:", latest_unittest_output_for_triage))
+            assertion_lines = "\n".join(
+                match.group(1).strip()
+                for match in re.finditer(
+                    r"(?m)^\s+([^\n]*assert[A-Za-z0-9_]*[^\n]*)$",
+                    latest_unittest_output_for_triage,
+                )
+            )
+            failure_names = "\n".join(
+                match.group(1)
+                for match in re.finditer(r"(?m)^FAIL:\s+([^\s(]+)", latest_unittest_output_for_triage)
+            )
+            assertion_context = f"{assertion_lines}\n{failure_names}".lower()
+            contract_assertion_tokens = (
+                "assertraises",
+                "assertisnotnone",
+                "assertisnone",
+                "asserttrue",
+                "assertfalse",
+                "solve",
+                "search",
+                "verify",
+                "validate",
+                "solvable",
+                "legal",
+                "valid",
+                "goal",
+            )
+            state_space_test_impl_contract_suspected = (
+                fail_count > 1
+                or any(token in assertion_context for token in contract_assertion_tokens)
+            )
+            output_lower = latest_unittest_output_for_triage.lower()
+            fixture_value_tokens = (
+                "expected_state",
+                "expected state",
+                "expected =",
+                "len(moves)",
+                "len(actions)",
+                "len(legal",
+                "assertequal(len(",
+                "assertequal(new_state",
+                "lists differ",
+            )
+            state_space_test_fixture_value_suspected = (
+                "assertionerror" in output_lower
+                and any(token in output_lower for token in fixture_value_tokens)
+            )
+        state_space_test_fixture_repair_mode = (
+            plan_strategy == "state_space_search"
+            and latest_unittest_failed_paths_are_tests
+            and not state_space_test_impl_contract_suspected
+            and latest_test_path
+            and "AssertionError" in latest_unittest_output_for_triage
+        )
         failed_unittest_recovery_read_paths: list[str] = []
-        if latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")):
-            for item in [*latest_failed_unittest_paths, latest_test_path, latest_impl_path]:
+        if latest_unittest_triage_result is not None and not bool(latest_unittest_triage_result.get("ok")):
+            import_module = str(latest_unittest_missing_import.get("module") or "")
+            impl_module = Path(str(latest_impl_path)).stem if latest_impl_path else ""
+            if state_space_test_fixture_repair_mode:
+                recovery_read_candidates = [latest_test_path]
+            elif (
+                latest_unittest_missing_import
+                and latest_impl_path
+                and impl_module
+                and import_module.split(".")[-1] == impl_module
+            ):
+                recovery_read_candidates = [latest_impl_path]
+            else:
+                recovery_read_candidates = [*latest_failed_unittest_paths, latest_test_path, latest_impl_path]
+            for item in recovery_read_candidates:
                 normalized_item = str(item or "").replace("\\", "/")
                 if normalized_item and normalized_item not in failed_unittest_recovery_read_paths:
                     failed_unittest_recovery_read_paths.append(normalized_item)
         failed_unittest_unread_paths = [
             item for item in failed_unittest_recovery_read_paths if item not in latest_read_paths_after_failed_unittest
         ]
+        failed_unittest_recovery_editable_paths = [
+            item for item in failed_unittest_recovery_read_paths if item in latest_read_paths_after_failed_unittest
+        ]
         failed_unittest_recovery_read_consumed = bool(failed_unittest_recovery_read_paths) and not failed_unittest_unread_paths
+        same_signature_nonreducing_edit_path_set = (
+            {
+                str(item).replace("\\", "/")
+                for item in same_signature_nonreducing_edit_paths
+                if str(item).strip()
+            }
+            if repeated_unittest_failure_signature
+            else set()
+        )
+        state_space_no_match_exact_replace_paths: list[str] = []
+        state_space_fixture_value_impl_blocked_paths: list[str] = []
+        blocked_failed_unittest_replace_paths = [
+            item
+            for item in self._blocked_failed_unittest_replace_paths(session_id=session_id)
+            if item in failed_unittest_recovery_read_paths
+        ]
+        if (
+            state_space_test_fixture_value_suspected
+            and latest_impl_path
+            and latest_test_path
+            and latest_test_path in failed_unittest_recovery_editable_paths
+        ):
+            impl_recovery = self._latest_edit_match_failure_recovery(steps=steps, path=latest_impl_path)
+            if (
+                impl_recovery
+                and int(impl_recovery.get("failure_index") or -1) > latest_failed_unittest_index
+                and not impl_recovery.get("successful_edit_after_failure")
+            ):
+                state_space_fixture_value_impl_blocked_paths.append(latest_impl_path)
+            if (
+                latest_impl_path in blocked_failed_unittest_replace_paths
+                and latest_impl_path not in state_space_fixture_value_impl_blocked_paths
+            ):
+                state_space_fixture_value_impl_blocked_paths.append(latest_impl_path)
+        if (
+            state_space_test_fixture_value_suspected
+            and latest_impl_path
+            and latest_impl_path in failed_unittest_recovery_editable_paths
+            and latest_impl_path not in state_space_fixture_value_impl_blocked_paths
+        ):
+            state_space_no_match_exact_replace_paths.append(latest_impl_path)
         failed_unittest_no_match_write_only_paths: list[str] = []
-        if failed_unittest_recovery_read_consumed and latest_failed_unittest_index >= 0:
+        for item in blocked_failed_unittest_replace_paths:
+            if (
+                item in failed_unittest_recovery_editable_paths
+                and item not in state_space_no_match_exact_replace_paths
+                and item not in state_space_fixture_value_impl_blocked_paths
+                and item not in same_signature_nonreducing_edit_path_set
+                and item not in failed_unittest_no_match_write_only_paths
+            ):
+                failed_unittest_no_match_write_only_paths.append(item)
+        if latest_failed_unittest_index >= 0:
             for item in failed_unittest_recovery_read_paths:
                 recovery = self._latest_edit_match_failure_recovery(steps=steps, path=item)
                 if not recovery:
@@ -3790,7 +6949,70 @@ class AgentRuntime:
                 if recovery.get("successful_edit_after_failure"):
                     continue
                 if item in latest_read_paths_after_failed_unittest or recovery.get("read_after_failure"):
-                    failed_unittest_no_match_write_only_paths.append(item)
+                    if (
+                        item not in state_space_no_match_exact_replace_paths
+                        and item not in state_space_fixture_value_impl_blocked_paths
+                        and item not in same_signature_nonreducing_edit_path_set
+                        and item not in failed_unittest_no_match_write_only_paths
+                    ):
+                        failed_unittest_no_match_write_only_paths.append(item)
+        if failed_unittest_recovery_read_consumed and latest_failed_unittest_index >= 0:
+            no_match_evidence_paths: list[str] = []
+            for item in failed_unittest_recovery_read_paths:
+                recovery = self._latest_edit_match_failure_recovery(steps=steps, path=item)
+                if not recovery:
+                    continue
+                if int(recovery.get("failure_index") or -1) <= latest_failed_unittest_index:
+                    continue
+                if recovery.get("successful_edit_after_failure"):
+                    continue
+                if item in latest_read_paths_after_failed_unittest or recovery.get("read_after_failure"):
+                    no_match_evidence_paths.append(item)
+            for item in blocked_failed_unittest_replace_paths:
+                if item not in no_match_evidence_paths:
+                    no_match_evidence_paths.append(item)
+            if no_match_evidence_paths:
+                for item in failed_unittest_recovery_editable_paths:
+                    if (
+                        item not in state_space_no_match_exact_replace_paths
+                        and item not in state_space_fixture_value_impl_blocked_paths
+                        and item not in same_signature_nonreducing_edit_path_set
+                        and item not in failed_unittest_no_match_write_only_paths
+                    ):
+                        failed_unittest_no_match_write_only_paths.append(item)
+
+        failed_unittest_repeated_noop_paths: list[str] = []
+        if latest_failed_unittest_index >= 0:
+            for item in failed_unittest_recovery_read_paths:
+                recovery = self._latest_edit_match_failure_recovery(steps=steps, path=item)
+                if not recovery:
+                    continue
+                if int(recovery.get("failure_index") or -1) <= latest_failed_unittest_index:
+                    continue
+                if recovery.get("successful_edit_after_failure"):
+                    continue
+                if str(recovery.get("failure_type") or "") != "no_op_edit":
+                    continue
+                if int(recovery.get("match_failures_since_success") or 0) < 2:
+                    continue
+                if item not in failed_unittest_repeated_noop_paths:
+                    failed_unittest_repeated_noop_paths.append(item)
+        failed_unittest_noop_alternate_paths: list[str] = []
+        if failed_unittest_repeated_noop_paths:
+            for item in failed_unittest_recovery_read_paths:
+                if item not in failed_unittest_repeated_noop_paths and item not in failed_unittest_noop_alternate_paths:
+                    failed_unittest_noop_alternate_paths.append(item)
+            for item in [latest_impl_path, latest_test_path]:
+                normalized_item = str(item or "").replace("\\", "/")
+                if (
+                    normalized_item
+                    and normalized_item not in failed_unittest_repeated_noop_paths
+                    and normalized_item not in failed_unittest_noop_alternate_paths
+                ):
+                    failed_unittest_noop_alternate_paths.append(normalized_item)
+        failed_unittest_noop_blocked_paths = (
+            list(failed_unittest_repeated_noop_paths) if failed_unittest_noop_alternate_paths else []
+        )
 
         initial_implementation_actions = ["write_file <implementation>.py"]
         if latest_impl_path:
@@ -3798,6 +7020,11 @@ class AgentRuntime:
         implementation_read_consumed = (
             self._route_read_consumed_after_latest_edit(steps=steps, path=latest_impl_path)
             if latest_impl_path
+            else False
+        )
+        test_contract_read_consumed = (
+            self._route_read_consumed_after_latest_edit(steps=steps, path=latest_test_path)
+            if latest_test_path
             else False
         )
         implementation_repair_strategy = self._implementation_contract_repair_strategy(
@@ -3853,20 +7080,53 @@ class AgentRuntime:
             else:
                 allowed_next_actions = ["write_file <implementation>.py", "replace_text <implementation>.py", "read_file <implementation>.py once"]
             missing_requirements = implementation_source_issues
+        elif bool(evidence.get("python_artifact_written")) and latest_unittest_missing_tests_artifact and not bool(evidence.get("tests_written")):
+            phase = "tests_missing"
+            allowed_next_actions = ["write_file tests/test_*.py"]
+            missing_requirements = [
+                "tests_written",
+                "meaningful_tests",
+                "unittest_passed",
+                "直近の unittest は tests directory が存在しないため失敗しています。実装再生成ではなく tests/test_*.py を作成してください。",
+            ]
+        elif (
+            bool(evidence.get("python_artifact_written"))
+            and bool(evidence.get("tests_written"))
+            and latest_unittest_missing_tests_artifact
+            and latest_edit_after_failed_unittest > latest_failed_unittest_index
+        ):
+            phase = "unittest_not_run"
+            allowed_next_actions = ["run_command python3 -m unittest discover -s tests"]
+            missing_requirements = [
+                "unittest_run",
+                "unittest_passed",
+                "直近の unittest 失敗原因だった tests directory は作成済みです。次は同じunittestを再実行してください。",
+            ]
         elif latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")):
             phase = "unittest_failed_needs_fix"
-            if failed_unittest_unread_paths:
-                allowed_next_actions = [f"read_file {target} once" for target in failed_unittest_unread_paths]
-            elif failed_unittest_no_match_write_only_paths:
-                allowed_next_actions = [f"write_file {target}" for target in failed_unittest_no_match_write_only_paths]
-            elif latest_edit_after_failed_unittest > latest_failed_unittest_index:
-                allowed_next_actions = ["run_command python3 -m unittest discover -s tests"]
+            if latest_edit_after_failed_unittest > latest_failed_unittest_index:
+                if latest_unittest_timed_out and repeated_unittest_failure_signature:
+                    allowed_next_actions = [
+                        "run_command with a narrower unittest target",
+                    ]
+                else:
+                    allowed_next_actions = ["run_command python3 -m unittest discover -s tests"]
             else:
-                targets = failed_unittest_recovery_read_paths or [latest_test_path or "tests/test_*.py", latest_impl_path or "<implementation>.py"]
-                allowed_next_actions = [
-                    *[f"replace_text {target} with a small unique old_text" for target in targets],
-                    *[f"write_file {target}" for target in targets],
-                ]
+                allowed_next_actions = build_unittest_failed_allowed_actions(
+                    failed_unittest_noop_blocked_paths=failed_unittest_noop_blocked_paths,
+                    failed_unittest_noop_alternate_paths=failed_unittest_noop_alternate_paths,
+                    latest_read_paths_after_failed_unittest=latest_read_paths_after_failed_unittest,
+                    failed_unittest_no_match_write_only_paths=failed_unittest_no_match_write_only_paths,
+                    failed_unittest_unread_paths=failed_unittest_unread_paths,
+                    failed_unittest_recovery_editable_paths=failed_unittest_recovery_editable_paths,
+                    failed_unittest_recovery_read_paths=failed_unittest_recovery_read_paths,
+                    same_signature_nonreducing_edit_paths=same_signature_nonreducing_edit_paths,
+                    repeated_unittest_failure_signature=repeated_unittest_failure_signature,
+                    state_space_no_match_exact_replace_paths=state_space_no_match_exact_replace_paths,
+                    state_space_fixture_value_impl_blocked_paths=state_space_fixture_value_impl_blocked_paths,
+                    latest_test_path=latest_test_path or "",
+                    latest_impl_path=latest_impl_path or "",
+                )
             missing_requirements = ["unittest_passed"]
         elif bool(evidence.get("python_artifact_written")) and not bool(evidence.get("tests_written")):
             phase = "tests_missing"
@@ -3876,6 +7136,15 @@ class AgentRuntime:
             phase = "tests_missing"
             allowed_next_actions = ["write_file tests/test_*.py", "replace_text tests/test_*.py"]
             missing_requirements = ["meaningful_tests"]
+        elif bool(evidence.get("tests_written")) and test_source_issues:
+            phase = "tests_present_needs_semantic_review"
+            if latest_test_path and not test_contract_read_consumed:
+                allowed_next_actions = [f"read_file {latest_test_path} once"]
+            elif latest_test_path:
+                allowed_next_actions = [f"replace_text {latest_test_path}", f"write_file {latest_test_path}"]
+            else:
+                allowed_next_actions = ["write_file tests/test_*.py", "replace_text tests/test_*.py"]
+            missing_requirements = test_source_issues
         elif bool(evidence.get("tests_written")) and semantic_requires_revision:
             phase = "tests_present_needs_semantic_review"
             if semantic_repair_target == "test_artifact":
@@ -3904,6 +7173,143 @@ class AgentRuntime:
             phase = "implementation_present_needs_semantic_review"
             allowed_next_actions = ["write_file tests/test_*.py", "run_command python3 -m unittest discover -s tests"]
             missing_requirements = [item for item in contract if not bool(evidence.get(item))]
+
+        unittest_repair_hints: list[str] = []
+        latest_generation_too_large_or_repetitive = (
+            "repetitive_output" in latest_llm_output_issue
+            or "stream_char_limit" in latest_llm_output_issue
+        )
+        test_generation_repetitive_output = (
+            phase == "tests_missing"
+            and latest_generation_too_large_or_repetitive
+        )
+        implementation_generation_repetitive_output = (
+            phase in {"implementation_missing", "implementation_missing_needs_semantic_revision"}
+            and latest_generation_too_large_or_repetitive
+        )
+        repair_generation_repetitive_output = (
+            phase in {"unittest_failed_needs_fix", "implementation_present_needs_semantic_review", "tests_present_needs_semantic_review"}
+            and latest_generation_too_large_or_repetitive
+        )
+        if latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")):
+            if repeated_unittest_failure_signature:
+                if latest_unittest_timed_out:
+                    unittest_repair_hints.append(
+                        "同一unittest command_timeout signatureが再発しています。stdout/stderrにtracebackがないため、"
+                        "次は同じ全体unittestを繰り返さず、timeoutを起こす最小のtest method/moduleまたはfixture/solver呼び出しへ検証を狭めてください。"
+                    )
+                else:
+                    unittest_repair_hints.append(
+                        "同一unittest failure signatureが再発しています。直前の編集は失敗数/失敗箇所を減らしていないため、"
+                        "次の編集前に『実装が契約違反なのか、test fixture/期待値が契約違反なのか』をtraceback行単位で切り分けてください。"
+                    )
+                if latest_failed_unittest_paths:
+                    unittest_repair_hints.append(
+                        "失敗traceback対象: "
+                        + ", ".join(str(item) for item in latest_failed_unittest_paths[:6])
+                    )
+            if latest_unittest_missing_import:
+                missing_name = str(latest_unittest_missing_import.get("name") or "")
+                missing_module = str(latest_unittest_missing_import.get("module") or "")
+                source_file = str(latest_unittest_missing_import.get("source_file") or "")
+                source_line = str(latest_unittest_missing_import.get("source_line") or "")
+                location = f"{source_file}:{source_line}" if source_file and source_line else source_file
+                unittest_repair_hints.append(
+                    "ImportErrorはtest/import側が要求するmodule-level export不足です: "
+                    f"{missing_module}.{missing_name}。"
+                    "実装内に同等の値/関数が別名である場合は、ファイル全体を書き直さず、"
+                    "小さいreplace_textでalias追加または公開名へのrenameをしてください。"
+                )
+                if location:
+                    unittest_repair_hints.append(
+                        "ImportError発生箇所: "
+                        f"{location}。stderrに不足symbol名が出ているため、"
+                        "implementationをread済みなら同じreadを繰り返さず編集へ進んでください。"
+                    )
+            if latest_failed_unittest_paths and all(
+                _artifact_path_is_test(str(item).replace("\\", "/"))
+                for item in latest_failed_unittest_paths
+            ):
+                assertion_match = re.search(
+                    r'File "([^"]+\.py)", line (\d+), in ([^\n]+)\n'
+                    r"\s+([^\n]*assert[^\n]*)\n"
+                    r"(?:\s+~[^\n]*\n)?"
+                    r"AssertionError: ([^\n]+)",
+                    latest_unittest_output_for_triage,
+                )
+                if assertion_match:
+                    assertion_text = assertion_match.group(4).strip()
+                    assertion_error = assertion_match.group(5).strip()
+                    unittest_repair_hints.append(
+                        "tracebackはtest artifact内のassert失敗です: "
+                        f"{Path(assertion_match.group(1)).name}:{assertion_match.group(2)} "
+                        f"{assertion_text} -> AssertionError: {assertion_error}。"
+                        "これはtest fixture/期待値の誤りでも、実装が返却値・例外・入力検証契約を満たしていない場合でも発生します。"
+                        "次は失敗行の期待値、ユーザー仕様、実装の公開APIを照合し、根拠がある側だけを小さく修正してください。"
+                        "実装契約が明確でないまま期待値へ合わせる大きなrewriteは避けてください。"
+                    )
+            if plan_strategy == "state_space_search":
+                unittest_repair_hints.append(
+                    "state_space_searchのsolver/search戻り値は、PlanRecordのaction modelに沿ったaction列でなければなりません。"
+                    "final_verifier / legal replayがactionとして消費できないstate列や表示用文字列を返すなら、solver出力とverifier入力の契約を揃えてください。"
+                )
+                if (
+                    re.search(r"blank|sentinel|marker|空白|空マス", user_message, re.IGNORECASE)
+                    and "tuple.index(x): x not in tuple" in latest_unittest_output_for_triage
+                ):
+                    unittest_repair_hints.append(
+                        "state invariant violation: ユーザー仕様では state に必須のsentinel/blank markerが含まれる必要がありますが、"
+                        "traceback は marker lookup が失敗しており、test fixture または goal/start が状態空間外の値です。"
+                        "固定fixtureの値をruntimeが補完するのではなく、ユーザー仕様から導ける状態ドメインに従い、"
+                        "必須markerを含む平坦なgoal/startへ修正してください。"
+                    )
+                if "'>' not supported between instances of 'tuple' and 'list'" in latest_unittest_output_for_triage:
+                    unittest_repair_hints.append(
+                        "state type invariant violation: solver/search/solvability_check が受け取る state は平坦な値列でなければなりません。"
+                        "near-goal fixture/helper が (state, actions) のような複合tupleを返し、testがそれ全体を start として渡すと、"
+                        "state内にtuple/listが混入して比較やheuristicが壊れます。"
+                        "fixtureの公式戻り値をstateだけにするか、test側で state, _ = fixture(...) と分解してから solver に渡してください。"
+                    )
+                if "AssertionError: False is not true" in latest_unittest_output_for_triage and "final_verifier" in latest_unittest_output_for_triage:
+                    unittest_repair_hints.append(
+                        "final_verifier invariant: non-empty action列をgoal状態から開始すると、通常はgoalから離れるため goal到達assert True にはなりません。"
+                        "valid replay testは、そのaction列を適用したときにgoalへ到達するstart stateから始めるか、"
+                        "goalからの非空actionはFalse期待にしてください。"
+                    )
+                unittest_repair_hints.append(
+                    "state_space_searchのtestで『valid action』をハードコードする場合、そのactionは同じ初期stateに対してlegal_move_validatorで合法でなければなりません。"
+                    "合法手契約と矛盾する期待値なら、実装を歪めずtest fixtureを修正してください。"
+                )
+                if state_space_test_fixture_repair_mode:
+                    unittest_repair_hints.append(
+                        "state_space_searchのtracebackがtest artifact内のassertだけを指しています。"
+                        "次はimplementationを大きく書き換えず、test fixtureのstart/action/expected/unsolvable_caseが"
+                        "同じstate/action/goal契約から導けるかを優先して修正してください。"
+                    )
+                if state_space_fixture_value_impl_blocked_paths:
+                    unittest_repair_hints.append(
+                        "state_space_searchのfixture値疑いがあり、implementation側への直前編集は無変更または無一致でした。"
+                        "分析でtest fixtureが矛盾していると判断した場合、次のtool targetもimplementationではなく"
+                        "読了済みtests/test_*.pyにしてください。"
+                    )
+                elif state_space_test_impl_contract_suspected:
+                    unittest_repair_hints.append(
+                        "state_space_searchのtest assert失敗ですが、assertRaises / solve / search / verify / solvable / legal / goal "
+                        "など公開API契約に関わる失敗、または複数FAILが含まれます。"
+                        "test fixtureだけに閉じず、implementationのstate/action/goal/solvability/final_verifier契約も照合してください。"
+                    )
+                if latest_unittest_timed_out:
+                    unittest_repair_hints.append(
+                        "state_space_search unittest が command_timeout になっています。"
+                        "random/shuffle/full-search fixtureを使うtestは広すぎます。"
+                        "次の修復では deterministic near-goal fixture（短い合法遷移で導出できるstart state）に縮小し、"
+                        "solver/searchを1回だけ呼び、返ったaction列をfinal_verifier/legal replayで検証してください。"
+                    )
+                    unittest_repair_hints.append(
+                        "PLAN_REVISION中なら、同じrun_testだけのPlanRecordを再提出してはいけません。"
+                        "まず tests/test_*.py または探索境界を修正するedit WorkUnitを入れ、"
+                        "その後に python3 -m unittest discover -s tests を実行するPlanRecordへ改訂してください。"
+                    )
 
         latest_edit_match_failure_recovery = self._latest_edit_match_failure_recovery(steps=steps, path=latest_impl_path) if latest_impl_path else {}
         if latest_impl_path and phase == "implementation_present_needs_semantic_review" and latest_edit_match_failure_recovery:
@@ -3958,41 +7364,133 @@ class AgentRuntime:
             "semantic_review_issues": latest_semantic_issues,
             "semantic_review_excerpt": latest_semantic_review_text[:900],
             "semantic_review_source": str(latest_semantic_review_details.get("review_source") or ""),
+            "test_source_issues": test_source_issues,
+            "latest_llm_output_issue": latest_llm_output_issue,
+            "implementation_generation_repetitive_output": implementation_generation_repetitive_output,
+            "test_generation_repetitive_output": test_generation_repetitive_output,
+            "repair_generation_repetitive_output": repair_generation_repetitive_output,
             "unittest_run": bool(evidence.get("unittest_run")),
             "unittest_passed": bool(evidence.get("unittest_passed")),
             "successful_unittest_run_count": successful_unittest_count,
             "external_audit_passed": successful_unittest_count >= 2,
             "latest_unittest_failed": latest_unittest_result is not None and not bool(latest_unittest_result.get("ok")),
+            "latest_unittest_timed_out": latest_unittest_timed_out,
+            "latest_unittest_missing_tests_artifact": latest_unittest_missing_tests_artifact,
             "latest_unittest_failure_type": (
-                "external_audit_failed_after_previous_success"
-                if latest_unittest_result is not None
-                and not bool(latest_unittest_result.get("ok"))
-                and successful_unittest_count > 0
+                "missing_tests_artifact"
+                if latest_unittest_missing_tests_artifact
                 else (
-                    "unittest_failed"
+                    "external_audit_failed_after_previous_success"
                     if latest_unittest_result is not None and not bool(latest_unittest_result.get("ok"))
-                    else ""
+                    and successful_unittest_count > 0
+                    else (
+                        (latest_unittest_tool_failure_type or "unittest_failed")
+                        if latest_unittest_result is not None and not bool(latest_unittest_result.get("ok"))
+                        else ""
+                    )
                 )
             ),
             "latest_unittest_stderr_excerpt": str((latest_unittest_result or {}).get("stderr") or "")[-1200:],
             "latest_unittest_stdout_excerpt": str((latest_unittest_result or {}).get("stdout") or "")[-1200:],
-            "latest_unittest_output_excerpt": (
-                str((latest_unittest_result or {}).get("stderr") or "")
-                or str((latest_unittest_result or {}).get("stdout") or "")
-            )[-1600:],
+            "latest_unittest_output_excerpt": self._review_file_excerpt(
+                (
+                    str((latest_unittest_result or {}).get("stderr") or "")
+                    or str((latest_unittest_result or {}).get("stdout") or "")
+                ),
+                head_chars=1200,
+                tail_chars=1200,
+            ),
             "latest_unittest_failed_paths": latest_failed_unittest_paths,
+            "state_space_test_fixture_repair_mode": state_space_test_fixture_repair_mode,
+            "state_space_test_fixture_value_suspected": state_space_test_fixture_value_suspected,
+            "state_space_test_impl_contract_suspected": state_space_test_impl_contract_suspected,
             "repeated_unittest_failure_signature": repeated_unittest_failure_signature,
             "latest_unittest_failure_signature": latest_unittest_failure_signature,
+            "unittest_repair_hints": unittest_repair_hints,
+            "latest_unittest_missing_import": latest_unittest_missing_import,
+            "latest_edit_blocked": self._latest_edit_blocked_details(session_id=session_id),
             "previous_same_unittest_failure_index": previous_same_unittest_failure_index,
             "latest_failed_unittest_index": latest_failed_unittest_index,
+            "latest_edit_after_failed_unittest_index": latest_edit_after_failed_unittest,
+            "successful_edit_after_failed_unittest": latest_edit_after_failed_unittest > latest_failed_unittest_index,
             "same_signature_nonreducing_edit_paths": same_signature_nonreducing_edit_paths,
             "same_signature_read_paths": same_signature_read_paths,
             "latest_edit_match_failure_recovery": latest_edit_match_failure_recovery,
             "failed_unittest_recovery_read_consumed": failed_unittest_recovery_read_consumed,
             "failed_unittest_recovery_read_paths": failed_unittest_recovery_read_paths,
             "failed_unittest_recovery_read_consumed_paths": sorted(latest_read_paths_after_failed_unittest),
+            "failed_unittest_recovery_editable_paths": failed_unittest_recovery_editable_paths,
+            "state_space_no_match_exact_replace_paths": state_space_no_match_exact_replace_paths,
+            "state_space_fixture_value_impl_blocked_paths": state_space_fixture_value_impl_blocked_paths,
             "failed_unittest_no_match_write_only_paths": failed_unittest_no_match_write_only_paths,
+            "failed_unittest_repeated_noop_paths": failed_unittest_repeated_noop_paths,
+            "failed_unittest_noop_alternate_paths": failed_unittest_noop_alternate_paths,
+            "failed_unittest_noop_blocked_paths": failed_unittest_noop_blocked_paths,
+            **plan_context,
         }
+
+    def _blocked_failed_unittest_replace_paths(self, *, session_id: str | None) -> list[str]:
+        if not session_id:
+            return []
+        path = self.paths.session_events_path(session_id)
+        if not path.exists():
+            return []
+        paths: list[str] = []
+        for event in read_jsonl(path, limit=5000):
+            if str(event.get("type") or "") != "system_note":
+                continue
+            if str(event.get("code") or "") != "implementation_task_progress_blocked":
+                continue
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            reason_code = str(details.get("reason_code") or event.get("reason_code") or "")
+            if reason_code not in {
+                "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                "implementation_task_failed_unittest_blocks_broad_replace_text",
+                "implementation_task_failed_unittest_blocks_block_header_replace_text",
+            }:
+                continue
+            if str(details.get("phase") or "") != "unittest_failed_needs_fix":
+                continue
+            blocked_path = str(details.get("path") or "").replace("\\", "/")
+            if blocked_path and blocked_path not in paths:
+                paths.append(blocked_path)
+        return paths
+
+    def _latest_edit_blocked_details(self, *, session_id: str | None) -> dict[str, Any]:
+        if not session_id:
+            return {}
+        path = self.paths.session_events_path(session_id)
+        if not path.exists():
+            return {}
+        latest: dict[str, Any] = {}
+        same_reason_count = 0
+        latest_key: tuple[str, str, str] | None = None
+        events = read_jsonl(path, limit=5000)
+        for event in events:
+            if str(event.get("type") or "") != "system_note":
+                continue
+            if str(event.get("code") or "") != "edit_blocked":
+                continue
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            reason_code = str(event.get("reason_code") or details.get("reason_code") or "")
+            blocked_tool = str(details.get("blocked_tool") or "")
+            blocked_path = str(details.get("path") or "").replace("\\", "/")
+            key = (reason_code, blocked_tool, blocked_path)
+            if latest_key is None or key != latest_key:
+                latest_key = key
+                same_reason_count = 1
+            else:
+                same_reason_count += 1
+            latest = {
+                "reason_code": reason_code,
+                "blocked_tool": blocked_tool,
+                "path": blocked_path,
+                "message": str(event.get("content") or ""),
+                "suggested_fix": str(details.get("suggested_fix") or ""),
+                "next_required_action": str(details.get("next_required_action") or ""),
+                "same_reason_count": same_reason_count,
+            }
+        return latest
 
     def _implementation_contract_final_answer(
         self,
@@ -4016,7 +7514,7 @@ class AgentRuntime:
             if str(step.get("tool_name") or "") != "run_command":
                 continue
             result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
-            if "unittest" in str(result.get("command") or "").lower() and bool(result.get("ok")):
+            if _unittest_command_is_acceptance(str(result.get("command") or "")) and bool(result.get("ok")):
                 latest_unittest = result
                 break
         if latest_unittest is None:
@@ -4072,7 +7570,53 @@ class AgentRuntime:
                 paths.append(rel_text)
         return paths
 
+    def _unittest_missing_import_details(self, *, output: str) -> dict[str, str]:
+        """Extract the actionable symbol/module from unittest import errors."""
+
+        text = str(output or "")
+        if not text.strip():
+            return {}
+        missing_match = re.search(
+            r"ImportError:\s+cannot import name ['\"]([^'\"]+)['\"] from ['\"]([^'\"]+)['\"]",
+            text,
+        )
+        if not missing_match:
+            return {}
+        source_file = ""
+        source_line = ""
+        file_matches = list(re.finditer(r'File "([^"]+\.py)", line (\d+), in ([^\n]+)', text))
+        if file_matches:
+            source_file = str(Path(file_matches[-1].group(1)).name)
+            source_line = file_matches[-1].group(2)
+        return {
+            "name": missing_match.group(1),
+            "module": missing_match.group(2),
+            "source_file": source_file,
+            "source_line": source_line,
+        }
+
     def _implementation_task_effective_phase(self, *, fallback_phase: str, state: dict[str, Any]) -> str:
+        if fallback_phase in {"PLANNING_REQUIRED", "PLAN_REVISION"}:
+            if bool(state.get("applicable")) and str(state.get("contract_state") or "") != "satisfied":
+                phase = str(state.get("phase") or "").strip()
+                has_progress_material = bool(
+                    state.get("implementation_paths")
+                    or state.get("test_paths")
+                    or state.get("unittest_run")
+                )
+                if has_progress_material and phase in {
+                    "implementation_present_needs_semantic_review",
+                    "tests_missing",
+                    "tests_present_needs_semantic_review",
+                    "unittest_not_run",
+                    "unittest_failed_needs_fix",
+                }:
+                    return f"IMPLEMENTATION_TASK_PROGRESS:{phase}"
+            return fallback_phase
+        if fallback_phase == "PLAN_EXECUTION":
+            current = self.frame_manager.current_frame()
+            if current is not None and current.parent_frame_id is not None:
+                return fallback_phase
         if not bool(state.get("applicable")):
             return fallback_phase
         if str(state.get("contract_state") or "") == "satisfied":
@@ -4108,8 +7652,96 @@ class AgentRuntime:
         steps: list[dict[str, Any]],
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        del state
-        return steps
+        phase = str(state.get("phase") or "")
+        if phase == "unittest_failed_needs_fix":
+            latest_read_indexes: set[int] = set()
+            seen_read_paths: set[str] = set()
+            for index in range(len(steps) - 1, -1, -1):
+                step = steps[index]
+                if str(step.get("tool_name") or "") != "read_file":
+                    continue
+                result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
+                if not bool(result.get("ok")):
+                    continue
+                step_args = step.get("tool_args") if isinstance(step.get("tool_args"), dict) else {}
+                path = str(result.get("path") or step_args.get("path") or "").replace("\\", "/")
+                if not path or path in seen_read_paths:
+                    continue
+                latest_read_indexes.add(index)
+                seen_read_paths.add(path)
+                if len(latest_read_indexes) >= 2:
+                    break
+            if not latest_read_indexes:
+                return []
+
+            compacted_reads: list[dict[str, Any]] = []
+            for index, step in enumerate(steps):
+                if index not in latest_read_indexes:
+                    continue
+                item = {
+                    "tool_name": step.get("tool_name"),
+                    "tool_args": dict(step.get("tool_args") or {})
+                    if isinstance(step.get("tool_args"), dict)
+                    else step.get("tool_args"),
+                }
+                result = (
+                    dict(step.get("tool_result") or {})
+                    if isinstance(step.get("tool_result"), dict)
+                    else step.get("tool_result")
+                )
+                if isinstance(result, dict):
+                    result_content = str(result.get("content") or "")
+                    if len(result_content) > 2500:
+                        result["content"] = self._compact_context_text(result_content, limit=2500)
+                item["tool_result"] = result
+                compacted_reads.append(item)
+            return compacted_reads
+
+        latest_read_content_limit = 2500 if phase == "unittest_failed_needs_fix" else 6000
+        latest_read_indexes: set[int] = set()
+        seen_read_paths: set[str] = set()
+        for index in range(len(steps) - 1, -1, -1):
+            step = steps[index]
+            if str(step.get("tool_name") or "") != "read_file":
+                continue
+            result = step.get("tool_result") if isinstance(step.get("tool_result"), dict) else {}
+            if not bool(result.get("ok")):
+                continue
+            step_args = step.get("tool_args") if isinstance(step.get("tool_args"), dict) else {}
+            path = str(result.get("path") or step_args.get("path") or "").replace("\\", "/")
+            if not path or path in seen_read_paths:
+                continue
+            latest_read_indexes.add(index)
+            seen_read_paths.add(path)
+            if len(latest_read_indexes) >= 2:
+                break
+
+        compacted: list[dict[str, Any]] = []
+        for index, step in enumerate(steps):
+            item = {
+                "tool_name": step.get("tool_name"),
+                "tool_args": dict(step.get("tool_args") or {})
+                if isinstance(step.get("tool_args"), dict)
+                else step.get("tool_args"),
+            }
+            result = (
+                dict(step.get("tool_result") or {})
+                if isinstance(step.get("tool_result"), dict)
+                else step.get("tool_result")
+            )
+            args = item.get("tool_args") if isinstance(item.get("tool_args"), dict) else {}
+            if isinstance(args, dict) and "content" in args:
+                content = str(args.get("content") or "")
+                args["content"] = f"<omitted {len(content)} chars from prior {step.get('tool_name')} content>"
+            if isinstance(result, dict):
+                result_content = str(result.get("content") or "")
+                if result_content and index not in latest_read_indexes:
+                    result["content"] = f"<omitted {len(result_content)} chars from earlier read_file content>"
+                elif len(result_content) > latest_read_content_limit:
+                    result["content"] = self._compact_context_text(result_content, limit=latest_read_content_limit)
+            item["tool_result"] = result
+            compacted.append(item)
+        return compacted
 
     def _implementation_task_prompt_events(
         self,
@@ -4117,7 +7749,34 @@ class AgentRuntime:
         recent_events: list[dict[str, Any]],
         state: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        del state
+        phase = str(state.get("phase") or "")
+        if phase == "unittest_failed_needs_fix":
+            selected_indexes: set[int] = set()
+            seen_read_paths: set[str] = set()
+            latest_run_command_index: int | None = None
+            for index in range(len(recent_events) - 1, -1, -1):
+                event = recent_events[index]
+                if str(event.get("type") or "") != "tool_result":
+                    continue
+                tool_name = str(event.get("tool_name") or "")
+                if tool_name == "run_command" and latest_run_command_index is None:
+                    latest_run_command_index = index
+                    selected_indexes.add(index)
+                    continue
+                if tool_name != "read_file":
+                    continue
+                try:
+                    payload = json.loads(str(event.get("content") or "{}"))
+                except json.JSONDecodeError:
+                    payload = {}
+                path = str(payload.get("path") or "").replace("\\", "/")
+                if not path or path in seen_read_paths:
+                    continue
+                seen_read_paths.add(path)
+                selected_indexes.add(index)
+                if len(seen_read_paths) >= 2 and latest_run_command_index is not None:
+                    break
+            return [event for index, event in enumerate(recent_events) if index in selected_indexes]
         return recent_events
 
     def _implementation_task_should_suppress_frame_operations(self, state: dict[str, Any]) -> bool:
@@ -4155,6 +7814,10 @@ class AgentRuntime:
         tool_args: dict[str, Any],
         state: dict[str, Any],
     ) -> dict[str, Any] | None:
+        if tool_name == "create_plan":
+            return None
+        if tool_name == "return_to_parent" and self._child_frame_has_tool_evidence():
+            return None
         if tool_name not in FRAME_OPERATION_TOOL_SET:
             return None
         if not self._implementation_task_progress_is_incomplete(state):
@@ -4193,6 +7856,33 @@ class AgentRuntime:
             parts.append("- implementation_paths: " + json.dumps(implementation_paths, ensure_ascii=False))
         if test_paths:
             parts.append("- test_paths: " + json.dumps(test_paths, ensure_ascii=False))
+        plan_obligations = [str(item) for item in state.get("plan_execution_obligations") or [] if str(item).strip()]
+        if state.get("plan_strategy") or plan_obligations:
+            parts.append("PlanRecord実行契約:")
+            if state.get("plan_id"):
+                parts.append(f"- plan_id: {state.get('plan_id')}")
+            if state.get("plan_strategy"):
+                parts.append(f"- strategy: {state.get('plan_strategy')}")
+            if state.get("plan_verification_contract"):
+                parts.append(
+                    "- verification_contract: "
+                    + json.dumps(state.get("plan_verification_contract") or [], ensure_ascii=False)
+                )
+            work_units_summary = state.get("plan_work_units_summary") or []
+            if work_units_summary:
+                parts.append(
+                    "- work_units: "
+                    + self._compact_context_text(json.dumps(work_units_summary, ensure_ascii=False), limit=900)
+                )
+            if plan_obligations:
+                parts.append("PlanRecord由来の未達にしてはいけない実行義務:")
+                for obligation in plan_obligations[:6]:
+                    parts.append(f"- {obligation}")
+                parts.append(
+                    "実装・テスト・修復はこのPlanRecord義務を満たしてください。"
+                    "unittestが通っても、manual UIだけ、曖昧な'works correctly'だけ、"
+                    "またはlegal action replayのないテストはfinish証拠として不足です。"
+                )
         repo_map_excerpt = str(state.get("repo_map_excerpt") or "").strip()
         if repo_map_excerpt:
             parts.append("read_fileを減らすためのworkspace索引:")
@@ -4216,11 +7906,20 @@ class AgentRuntime:
                     line = int(hint.get("line") or 0)
                     current = str(hint.get("current_text") or "").strip()
                     reason = str(hint.get("reason") or "").strip()
+                    suggested_action = str(hint.get("suggested_action") or "").strip()
+                    suggested_old = str(hint.get("suggested_old_text") or "").strip()
+                    suggested_strategy = str(hint.get("suggested_strategy") or "").strip()
                     suggested = str(hint.get("suggested_new_text") or "").strip()
                     prefix = f"line {line}" if line > 0 else "source context"
                     parts.append(f"- {prefix}: {current}")
                     if reason:
                         parts.append(f"  reason: {reason}")
+                    if suggested_action:
+                        parts.append(f"  suggested_action: {suggested_action}")
+                    if suggested_old:
+                        parts.append(f"  suggested_old_text: {suggested_old}")
+                    if suggested_strategy:
+                        parts.append(f"  suggested_strategy: {suggested_strategy}")
                     if suggested:
                         parts.append(f"  suggested_new_text: {suggested}")
                 if any(hint.get("suggested_action") == "append_top_level_wrappers" for hint in repair_hints):
@@ -4230,10 +7929,50 @@ class AgentRuntime:
                     parts.append(
                         "既存class全体を巨大 replace_text で再生成せず、public API未達を減らすwrapper追加に限定してください。"
                     )
+                if any(hint.get("suggested_action") == "add_state_space_replay_verifier" for hint in repair_hints):
+                    parts.append(
+                        "state_space_search final_verifier修復では、既存solver/search全体の再生成ではなく、"
+                        "action列を initial_state から1手ずつ legal check -> transition -> goal check する "
+                        "verify/replay/validate callable の追加に限定してください。"
+                    )
+                    parts.append(
+                        "提示された suggested_new_text を、既存の合法手関数・遷移関数・goal表現に合わせて追加し、"
+                        "solver/searchの戻り値をそのcallableで検証できる形にしてください。"
+                    )
         if state.get("semantic_review_issues"):
             parts.append("semantic review 未達:")
             for issue in list(state.get("semantic_review_issues") or [])[:6]:
                 parts.append(f"- {issue}")
+        if state.get("test_source_issues"):
+            parts.append("test artifact 未達:")
+            for issue in list(state.get("test_source_issues") or [])[:6]:
+                parts.append(f"- {issue}")
+        latest_edit_blocked = state.get("latest_edit_blocked") if isinstance(state.get("latest_edit_blocked"), dict) else {}
+        if latest_edit_blocked and str(latest_edit_blocked.get("path") or "").startswith("tests/"):
+            reason_code = str(latest_edit_blocked.get("reason_code") or "").strip()
+            message = str(latest_edit_blocked.get("message") or "").strip()
+            suggested_fix = str(latest_edit_blocked.get("suggested_fix") or "").strip()
+            next_required_action = str(latest_edit_blocked.get("next_required_action") or "").strip()
+            same_reason_count = int(latest_edit_blocked.get("same_reason_count") or 0)
+            parts.append("直近のtest artifact生成はruntimeに拒否されました:")
+            if reason_code:
+                parts.append(f"- reason_code: {reason_code}")
+            if message:
+                parts.append(f"- message: {self._compact_context_text(message, limit=700)}")
+            if suggested_fix:
+                parts.append(f"- suggested_fix: {suggested_fix}")
+            if next_required_action:
+                parts.append(f"- next_required_action: {next_required_action}")
+            if same_reason_count >= 2:
+                parts.append(
+                    "- 同じtest生成拒否が反復しています。前回候補は保存されていません。"
+                    "次の write_file は同じcandidateを少し言い換えず、拒否理由を消した完全な tests/test_*.py にしてください。"
+                )
+            if reason_code == "test_artifact_contract_incomplete":
+                parts.append(
+                    "- 同じliteral input/fixtureに対して solve/search の None と not None を同時に期待してはいけません。"
+                    "解けるfixtureとno-solution fixtureを別入力に分け、各assertの期待を一貫させてください。"
+                )
         if state.get("latest_unittest_failed"):
             parts.append("unittest失敗後の修正契約:")
             if str(state.get("latest_unittest_failure_type") or "") == "external_audit_failed_after_previous_success":
@@ -4248,6 +7987,50 @@ class AgentRuntime:
             parts.append("- read後は同じreadを繰り返さず、対象ファイルを小さいtargeted replace_textまたはwrite_fileで修正してください。")
             parts.append("- replace_textは現在sourceに一意一致する数行のold_textだけ許可します。長い関数やファイル全体のreplace_textはstream浪費とno_match反復になりやすいため禁止です。")
             parts.append("- 成功編集後だけ unittest 再実行に進めます。")
+            if state.get("successful_edit_after_failed_unittest"):
+                parts.append("成功編集後の唯一の次アクション:")
+                parts.append("- 直近の failed unittest 後に少なくとも1つの対象ファイル編集が成功しています。")
+                parts.append("- 失敗signatureが減ったか変わったかを観測するまで、追加の read_file / replace_text / write_file は禁止です。")
+                if (
+                    str(state.get("latest_unittest_failure_type") or "") == "command_timeout"
+                    and state.get("repeated_unittest_failure_signature")
+                ):
+                    parts.append(
+                        "- 直近の失敗は同一command_timeoutの再発です。全体unittest discoverをそのまま再実行せず、"
+                        "特定module/test methodなどの狭いunittest targetでtimeout箇所を切り分けてください。"
+                    )
+                else:
+                    parts.append("- 次は必ず `run_command python3 -m unittest discover -s tests` だけを実行してください。")
+            if state.get("repair_generation_repetitive_output"):
+                parts.append("直近のrepair生成は repetitive_output/stream_char_limit でJSON未完了になりました。次の修復はさらに小さくしてください。")
+                parts.append("- replace_textを使う場合、old_textは失敗行に関係する1つの関数または数行だけ、new_textも同じ範囲だけにしてください。")
+                parts.append("- ファイル全体、class全体、長いhelper群、説明コメントをold_text/new_textに入れてはいけません。")
+                parts.append("- 失敗tracebackがtest期待値の誤りを示す場合は、実装を歪めず該当test methodだけを小さく修正してください。")
+                parts.append("- 迷ったら、すでにread済みのtraceback対象から1箇所だけ選び、失敗signatureを変える最小編集にしてください。")
+            repeated_noop_paths = [
+                str(item).strip()
+                for item in state.get("failed_unittest_repeated_noop_paths") or []
+                if str(item).strip()
+            ]
+            noop_blocked_paths = [
+                str(item).strip()
+                for item in state.get("failed_unittest_noop_blocked_paths") or []
+                if str(item).strip()
+            ]
+            noop_alternates = [
+                str(item).strip()
+                for item in state.get("failed_unittest_noop_alternate_paths") or []
+                if str(item).strip()
+            ]
+            if repeated_noop_paths:
+                parts.append("no_op edit反復の修復契約:")
+                parts.append("- 直近の修復で、同じ対象に実差分のないreplace_text/write_fileが連続しています。")
+                parts.append("- 同じcontent、同じold_text/new_text、コメントだけ・空白だけの再提出は禁止です。")
+                if noop_blocked_paths:
+                    parts.append("- 一時的に編集禁止の対象: " + json.dumps(noop_blocked_paths, ensure_ascii=False))
+                if noop_alternates:
+                    parts.append("- 次に照合・修正すべき別対象: " + json.dumps(noop_alternates, ensure_ascii=False))
+                parts.append("- allowed_next_actionsから、別対象のread_fileまたは実差分を含む編集を1つだけ選んでください。")
             output_excerpt = str(
                 state.get("latest_unittest_output_excerpt")
                 or state.get("latest_unittest_stderr_excerpt")
@@ -4275,10 +8058,23 @@ class AgentRuntime:
                     parts.append(f"- latest_unittest_failure_signature: {signature}")
                 if edit_paths:
                     parts.append("- nonreducing_edit_paths: " + json.dumps(edit_paths, ensure_ascii=False))
+                    parts.append(
+                        "- 非進捗だった対象への次の全面write_fileは許可しません。"
+                        "同じ失敗を減らす小さいreplace_text、または別のtraceback対象ファイルの修正に絞ってください。"
+                    )
                 if read_paths:
                     parts.append("- already_read_for_this_signature: " + json.dumps(read_paths, ensure_ascii=False))
                 parts.append("- 同じ内容のwrite_fileや同じread_fileの反復は禁止です。")
                 parts.append("- 次のwrite_fileはtracebackの具体行と読んだsourceに基づき、失敗signatureを変える修正だけにしてください。")
+            unittest_repair_hints = [
+                str(item).strip()
+                for item in state.get("unittest_repair_hints") or []
+                if str(item).strip()
+            ]
+            if unittest_repair_hints:
+                parts.append("unittest失敗triage:")
+                for hint in unittest_repair_hints[:6]:
+                    parts.append(f"- {hint}")
         phase = str(state.get("phase") or "")
         if phase == "implementation_missing":
             parts.append("次は実行可能なPython実装を write_file してください。tests/unittest/finishへ先に進めません。")
@@ -4289,6 +8085,11 @@ class AgentRuntime:
             parts.append("- 高度な内部構造より、要求仕様から直接導ける最小の完結アルゴリズムを優先してください。")
             parts.append("- 実装本文の中で設計を考え直すコメント、TODO、pass、後で埋める前提の分岐を書いてはいけません。迷ったら書く前により単純な完結アルゴリズムへ縮小してください。")
             parts.append("- 4000 bytesを超えそうなら、大きい設計を途中まで書くのではなく、より小さい完全実装に縮小してください。")
+            if state.get("implementation_generation_repetitive_output"):
+                parts.append("直近の初回実装生成は repetitive_output/stream_char_limit でJSON未完了になりました。次の write_file はさらに小さいライブラリ実装だけに縮小してください。")
+                parts.append("- content は目安2500 bytes以下。unittest、demo main、random scramble、長い説明コメント、網羅的helperは入れないでください。")
+                parts.append("- state_space_searchの場合は、state表現、legal_moves/apply_move、goal判定、solve/search、verify/replayの最小callableだけを書いてください。")
+                parts.append("- tests/test_*.py と実行デモは、実装artifactが受理された後の別ステップで作成・実行します。")
         elif phase == "implementation_missing_needs_semantic_revision":
             parts.append("次はreject済み候補と同型でない、placeholder-freeの完全なPython実装を write_file してください。")
             parts.append("受理条件:")
@@ -4296,6 +8097,8 @@ class AgentRuntime:
             parts.append("- 要求された公開関数がある場合、class methodだけでなくmodule-level defとして定義すること。")
             parts.append("- 全callableが実行可能な制御/データ処理を持つこと。骨組み、stub、後で実装するコメントは禁止です。")
             parts.append("- 前回と同じplaceholder構造を少し言い換えるのではなく、成果物契約を満たす別実装に切り替えること。")
+            if state.get("implementation_generation_repetitive_output"):
+                parts.append("直近の修正版初回実装生成は repetitive_output/stream_char_limit でした。次は既存案を長く再出力せず、未達を満たす最小の完全実装だけに縮小してください。")
         elif phase == "implementation_present_but_placeholder":
             parts.append("placeholderを具体実装に置き換えてからtestsへ進んでください。")
         elif phase == "implementation_present_needs_semantic_review":
@@ -4337,6 +8140,22 @@ class AgentRuntime:
                 )
         elif phase == "tests_missing":
             parts.append("次は意味のある tests/test_*.py を作成してください。assertなし/pass-only testは完了証拠になりません。")
+            if str(state.get("plan_strategy") or "") == "state_space_search":
+                parts.append("state_space_search test fixture契約:")
+                parts.append("- solver/search統合testは、短い合法transitionで導出できるnear-goal start stateに縮小してください。")
+                parts.append("- 手書きの長いsolution列、任意に作ったsolvable/unsolvable盤面、または由来を説明できないfixtureを使わないでください。")
+                parts.append("- solve/searchの戻り値は verify/replay/final_verifier で合法手として再生し、goal到達をassertしてください。")
+                parts.append("- no-solution系はsolver全探索に投げず、solvability_check単体または明示境界付きの小さい検証にしてください。")
+            if state.get("test_generation_repetitive_output"):
+                parts.append("直近のtest生成は repetitive_output/stream_char_limit でJSON未完了になりました。次のtest write_fileは包括テストではなく最小verification testに縮小してください。")
+                parts.append("- 目安は1 test class / 2-3 test methods / 1200 bytes前後です。全近傍、全ケース、長い表、説明コメントを列挙しないでください。")
+                parts.append("- まずsolver/searchを1回呼び、返ったaction列をfinal_verifierまたはlegal replayで検証するtestを1つ書いてください。")
+                parts.append("- 追加するならillegal actionが拒否されるtestを1つだけにしてください。網羅テストはunittest成功後の改善対象です。")
+            if state.get("latest_unittest_missing_tests_artifact"):
+                parts.append(
+                    "直近のunittest失敗は tests ディレクトリ未作成が原因です。"
+                    "同じ実装ファイルの再生成では解消しないため、次は tests/test_*.py を作成してください。"
+                )
         elif phase == "tests_present_needs_semantic_review":
             parts.append("次は semantic review 未達を減らす test artifact 修正を行ってください。")
             parts.append("テストファイル全体の巨大 replace_text は禁止です。全面的に書き直す必要がある場合は write_file を使い、小さいassert/fixture差し替えだけ replace_text できます。")
@@ -4374,7 +8193,7 @@ class AgentRuntime:
         if not normalized_path:
             return {}
         edit_tools = {"write_file", "append_file", "replace_text"}
-        match_failure_types = {"replace_text_no_match", "replace_text_ambiguous_match"}
+        match_failure_types = {"replace_text_no_match", "replace_text_ambiguous_match", "no_op_edit"}
         latest_failure_index = -1
         read_after_failure_index = -1
         successful_edit_after_failure_index = -1
@@ -4458,12 +8277,28 @@ class AgentRuntime:
         if tool_name == "replace_text":
             old_text = str(tool_args.get("old_text") or "")
             new_text = str(tool_args.get("new_text") or "")
+            if self._replace_text_uses_block_header_only(old_text=old_text, new_text=new_text):
+                return True
             return (
                 len(old_text) >= max(1200, int(source_len * 0.45))
                 or len(new_text) >= max(1200, int(source_len * 0.45))
                 or (len(old_text) + len(new_text)) >= max(1800, int(source_len * 0.80))
             )
         return False
+
+    def _replace_text_uses_block_header_only(self, *, old_text: str, new_text: str) -> bool:
+        """Detect replacements that would insert a whole block after only its header."""
+        old_lines = [line for line in str(old_text or "").replace("\r\n", "\n").split("\n") if line.strip()]
+        new_lines = [line for line in str(new_text or "").replace("\r\n", "\n").split("\n") if line.strip()]
+        if len(old_lines) != 1 or len(new_lines) <= 1:
+            return False
+        header = old_lines[0].strip()
+        return bool(
+            re.match(
+                r"^(?:async\s+def|def|class|if|elif|else|for|async\s+for|while|try|except|finally|with|async\s+with|match|case)\b.*:\s*(?:#.*)?$",
+                header,
+            )
+        )
 
     def _normalized_source_for_write_compare(self, source: str) -> str:
         return str(source or "").replace("\r\n", "\n").rstrip()
@@ -4664,8 +8499,8 @@ class AgentRuntime:
             )
         if "branch-local 探索状態を作っていますが、再帰呼び出しへ渡していません" in issue_text:
             suggestions.append(
-                "next_/branch_ stateを作るだけでは不十分です。作成したnext_rows/next_columns/next_stateを"
-                "search(..., next_rows, next_columns)の引数としてthreadしてください。"
+                "next_/branch_ stateを作るだけでは不十分です。作成した次状態を"
+                "recursive callの引数としてthreadしてください。"
             )
         if "IDを保持するmapping入力" in issue_text:
             suggestions.append(
@@ -5393,8 +9228,10 @@ class AgentRuntime:
         if phase == "tests_present_needs_semantic_review":
             semantic_repair_target = str(state.get("semantic_repair_target") or "")
             test_issue_paths = [str(item).replace("\\", "/") for item in state.get("semantic_test_repair_paths") or [] if str(item).strip()]
-            if semantic_repair_target == "test_artifact" and not test_issue_paths:
-                latest_test = str(state.get("latest_test_path") or "").replace("\\", "/")
+            latest_test = str(state.get("latest_test_path") or "").replace("\\", "/")
+            if not test_issue_paths and (
+                semantic_repair_target == "test_artifact" or state.get("test_source_issues")
+            ):
                 if latest_test:
                     test_issue_paths = [latest_test]
             consumed_test_reads = {str(item).replace("\\", "/") for item in state.get("semantic_repair_read_consumed_paths") or [] if str(item).strip()}
@@ -5486,51 +9323,230 @@ class AgentRuntime:
             failed_paths = [str(item).replace("\\", "/") for item in state.get("failed_unittest_recovery_read_paths") or [] if str(item).strip()]
             consumed_paths = {str(item).replace("\\", "/") for item in state.get("failed_unittest_recovery_read_consumed_paths") or [] if str(item).strip()}
             unread_paths = [item for item in failed_paths if item not in consumed_paths]
+            editable_after_read_paths = [
+                str(item).replace("\\", "/")
+                for item in state.get("failed_unittest_recovery_editable_paths") or []
+                if str(item).strip()
+            ]
             write_only_paths = [
                 str(item).replace("\\", "/")
                 for item in state.get("failed_unittest_no_match_write_only_paths") or []
                 if str(item).strip()
             ]
-            if write_only_paths:
-                if tool_name == "write_file" and path in write_only_paths:
+            noop_blocked_paths = {
+                str(item).replace("\\", "/")
+                for item in state.get("failed_unittest_noop_blocked_paths") or []
+                if str(item).strip()
+            }
+            state_space_exact_replace_paths = {
+                str(item).replace("\\", "/")
+                for item in state.get("state_space_no_match_exact_replace_paths") or []
+                if str(item).strip()
+            }
+            state_space_fixture_value_impl_blocked_paths = {
+                str(item).replace("\\", "/")
+                for item in state.get("state_space_fixture_value_impl_blocked_paths") or []
+                if str(item).strip()
+            }
+            repeated_nonreducing_paths_for_phase = (
+                {
+                    str(item).replace("\\", "/")
+                    for item in state.get("same_signature_nonreducing_edit_paths") or []
+                    if str(item).strip()
+                }
+                if bool(state.get("repeated_unittest_failure_signature"))
+                else set()
+            )
+            if state.get("successful_edit_after_failed_unittest"):
+                repeated_timeout = (
+                    str(state.get("latest_unittest_failure_type") or "") == "command_timeout"
+                    and bool(state.get("repeated_unittest_failure_signature"))
+                )
+                full_unittest_command = "python3 -m unittest discover -s tests"
+                normalized_command = " ".join(command.split()).lower()
+                if repeated_timeout:
+                    if (
+                        tool_name == "run_command"
+                        and "unittest" in command.lower()
+                        and normalized_command != full_unittest_command
+                    ):
+                        return None
+                    return {
+                        "reason_code": "implementation_task_failed_unittest_requires_narrow_rerun_after_timeout",
+                        "phase": phase,
+                        "path": path,
+                        "message": (
+                            "unittest失敗後に対象ファイルの成功編集がありますが、直近の失敗は同一command_timeoutの再発です。"
+                            "全体unittest discoverを同じまま繰り返してもtimeout箇所を特定できません。"
+                        ),
+                        "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                        "suggested_fix": (
+                            "python3 -m unittest tests.<module>.<Class>.<test_method> など、"
+                            "失敗しそうな最小test targetへ狭めたrun_commandを実行してください。"
+                        ),
+                        "blocked_by": "implementation_task_progress_controller",
+                        "next_required_action": "run_command with a narrower unittest target",
+                        "state": state,
+                    }
+                if tool_name == "run_command" and "unittest" in command.lower():
                     return None
                 return {
-                    "reason_code": "implementation_task_failed_unittest_requires_write_after_no_match",
+                    "reason_code": "implementation_task_failed_unittest_requires_rerun_after_edit",
                     "phase": phase,
                     "path": path,
                     "message": (
-                        "unittest失敗の修復対象はすでにread_file済みで、その後のreplace_text old_textが一致しませんでした。"
-                        "同じread_fileや曖昧なreplace_textを繰り返さず、対象ファイルをwrite_fileで完全に修正してください。"
+                        "unittest失敗後に対象ファイルの成功編集があります。"
+                        "同じread_fileや追加編集を続けず、同じunittestを再実行して"
+                        "失敗signatureが解消または変化したかを確認してください。"
                     ),
-                    "allowed_next_actions": [f"write_file {target}" for target in write_only_paths],
-                    "suggested_fix": "直近に読んだ内容とtracebackに基づき、失敗を解消した完全なファイル内容をwrite_fileしてください。",
-                    "state": state,
-                }
-            if tool_name == "read_file" and path in consumed_paths:
-                return {
-                    "reason_code": "implementation_task_failed_unittest_read_already_consumed",
-                    "phase": phase,
-                    "path": path,
-                    "message": f"{path} はunittest失敗後にすでにread_file済みです。同じ観測を繰り返さず、未読対象を読むか修正へ進んでください。",
                     "allowed_next_actions": list(state.get("allowed_next_actions") or []),
-                    "suggested_fix": "unittest traceback対象と関連implementationを各1回だけ確認し、その後は編集してください。",
+                    "suggested_fix": "python3 -m unittest discover -s tests を再実行してください。",
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": "run_command python3 -m unittest discover -s tests",
                     "state": state,
                 }
             if unread_paths:
                 if tool_name == "read_file" and path in unread_paths:
                     return None
+                if tool_name == "read_file" and path in consumed_paths and not write_only_paths:
+                    return {
+                        "reason_code": "implementation_task_failed_unittest_read_already_consumed",
+                        "phase": phase,
+                        "path": path,
+                        "message": f"{path} はunittest失敗後にすでにread_file済みです。同じ観測を繰り返さず、未読対象を読むか読了済み対象の修正へ進んでください。",
+                        "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                        "suggested_fix": "allowed_next_actions に出ている未読対象のread_fileを1つ実行してください。",
+                        "state": state,
+                    }
                 return {
                     "reason_code": "implementation_task_failed_unittest_requires_recovery_read",
                     "phase": phase,
                     "path": path,
-                    "message": "unittest失敗後は修正前にtraceback対象test/implementationを各1回だけread_fileしてください。",
+                    "message": (
+                        "unittest失敗後は修正前にtraceback対象test/implementationをread_fileできます。"
+                        "未読対象が残っている間は編集を混ぜず、観測を揃えてからtargeted editへ進んでください。"
+                    ),
                     "allowed_next_actions": list(state.get("allowed_next_actions") or []),
-                    "suggested_fix": "allowed_next_actions の read_file を先に実行してください。",
+                    "suggested_fix": "allowed_next_actions の read_file を実行し、未読対象の具体ソースを確認してください。",
+                    "state": state,
+                }
+            if path in noop_blocked_paths and tool_name in {"read_file", "append_file", "replace_text", "write_file"}:
+                return {
+                    "reason_code": "implementation_task_failed_unittest_blocks_repeated_noop_target",
+                    "phase": phase,
+                    "path": path,
+                    "message": (
+                        "unittest失敗後、この対象には実差分のない編集が連続しています。"
+                        "同じ内容を再提出しても失敗signatureは変わりません。"
+                    ),
+                    "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                    "suggested_fix": (
+                        "allowed_next_actionsに出ている別のtraceback関連対象を読み直すか、"
+                        "別対象へ実差分を含む修正を出してください。"
+                    ),
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": "choose a different allowed target; do not repeat the no-op file",
+                    "state": state,
+                }
+            if path in state_space_fixture_value_impl_blocked_paths and tool_name in {"append_file", "replace_text", "write_file"}:
+                return {
+                    "reason_code": "implementation_task_failed_unittest_prioritizes_fixture_repair_after_impl_noop",
+                    "phase": phase,
+                    "path": path,
+                    "message": (
+                        "state_space_searchのunittest失敗はtest artifact内のfixture期待値を強く示しており、"
+                        "implementation側への直前編集は無変更または無一致でした。"
+                        "同じimplementation targetを再試行せず、読了済みtest artifactのfixture/action/expected値を"
+                        "state/action/goal契約から導ける形へ修正してください。"
+                    ),
+                    "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                    "suggested_fix": (
+                        "allowed_next_actionsに出ているtest artifactを修正してください。"
+                        "分析でtest fixtureが矛盾していると判断した場合、tool targetもtests/test_*.pyにしてください。"
+                    ),
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": "repair the read test artifact fixture instead of repeating implementation no-op edit",
+                    "state": state,
+                }
+            if tool_name == "write_file" and path in state_space_exact_replace_paths:
+                current_source = self._current_artifact_source_for_path(path, turn_workspace=turn_workspace)
+                current_source_excerpt = self._replace_text_current_source_excerpt(
+                    current_source=current_source,
+                    old_text="",
+                )
+                return {
+                    "reason_code": "implementation_task_failed_unittest_requires_exact_replace_after_fixture_no_match",
+                    "phase": phase,
+                    "path": path,
+                    "message": (
+                        "state_space_searchのunittest失敗はtest artifact内のhardcoded fixture期待値を指しており、"
+                        "このimplementation pathでは直前のreplace_text old_textが現在sourceに一致していません。"
+                        "実装全体を再生成せず、現行sourceに一意一致する小さいold_textでtargeted replace_textしてください。"
+                    ),
+                    "allowed_next_actions": [
+                        f"replace_text {target} with a small unique old_text"
+                        for target in sorted(state_space_exact_replace_paths)
+                    ]
+                    + [f"write_file {target}" for target in write_only_paths],
+                    "suggested_fix": (
+                        "current_source_excerptがある場合はそこからold_textを正確にコピーしてください。"
+                        "test fixtureが契約違反ならtest artifactを修正し、implementationを直す場合も小さいreplace_textに限定してください。"
+                    ),
+                    "blocked_by": "implementation_task_progress_controller",
+                    "next_required_action": f"replace_text {path} with a small unique old_text",
+                    "current_source_excerpt": current_source_excerpt,
+                    "state": state,
+                }
+            if write_only_paths:
+                if tool_name == "write_file" and path in write_only_paths:
+                    return None
+                if not (
+                    tool_name in {"replace_text", "write_file"}
+                    and path in repeated_nonreducing_paths_for_phase
+                ):
+                    allowed_after_no_match = [
+                        *[
+                            f"replace_text {target} with a small unique old_text"
+                            for target in repeated_nonreducing_paths_for_phase
+                            if target in editable_after_read_paths
+                        ],
+                        *[f"write_file {target}" for target in write_only_paths],
+                    ]
+                    return {
+                        "reason_code": "implementation_task_failed_unittest_requires_write_after_no_match",
+                        "phase": phase,
+                        "path": path,
+                        "message": (
+                            "unittest失敗の修復対象はすでにread_file済みで、その後のreplace_textが無一致または無変更でした。"
+                            "同じread_fileや曖昧なreplace_textを繰り返さず、"
+                            "非改善pathは小さいexact replace_text、その他の既読対象はwrite_fileで修正してください。"
+                        ),
+                        "allowed_next_actions": allowed_after_no_match,
+                        "suggested_fix": "直近に読んだ実装/テスト内容とtracebackに基づき、非改善pathなら現在sourceに一意一致する小さいold_textでreplace_textし、別対象なら完全なwrite_fileで失敗signatureを変えてください。",
+                        "state": state,
+                    }
+            if tool_name == "read_file" and path in consumed_paths:
+                return {
+                    "reason_code": "implementation_task_failed_unittest_read_already_consumed",
+                    "phase": phase,
+                    "path": path,
+                    "message": f"{path} はunittest失敗後にすでにread_file済みです。同じ観測を繰り返さず、未読対象を読むか読了済み対象の修正へ進んでください。",
+                    "allowed_next_actions": list(state.get("allowed_next_actions") or []),
+                    "suggested_fix": "allowed_next_actions から、未読対象のread_file、または読了済み対象のreplace_text/write_fileを1つ選んでください。",
                     "state": state,
                 }
             if tool_name in {"append_file", "replace_text"} and (_artifact_path_is_test(path) or _artifact_path_is_python_implementation(path)):
                 repair_targets = self._implementation_unittest_repair_target_paths(state)
                 if not repair_targets or path in repair_targets:
+                    repeated_nonreducing_paths = (
+                        {
+                            str(item).replace("\\", "/")
+                            for item in state.get("same_signature_nonreducing_edit_paths") or []
+                            if str(item).strip()
+                        }
+                        if bool(state.get("repeated_unittest_failure_signature"))
+                        else set()
+                    )
                     target_actions = [
                         *[
                             f"replace_text {target} with a small unique old_text"
@@ -5540,36 +9556,57 @@ class AgentRuntime:
                         *[
                             f"write_file {target}"
                             for target in repair_targets
-                            if _artifact_path_is_test(target) or _artifact_path_is_python_implementation(target)
+                            if (
+                                (_artifact_path_is_test(target) or _artifact_path_is_python_implementation(target))
+                                and target not in repeated_nonreducing_paths
+                            )
                         ],
                     ] or list(state.get("allowed_next_actions") or [])
                     if tool_name == "replace_text":
                         current_source = self._current_artifact_source_for_path(path, turn_workspace=turn_workspace)
                         old_text = str(tool_args.get("old_text") or "")
                         new_text = str(tool_args.get("new_text") or "")
+                        block_header_only_replace = self._replace_text_uses_block_header_only(
+                            old_text=old_text,
+                            new_text=new_text,
+                        )
                         broad_replace = self._implementation_edit_is_broad_rewrite(
                             tool_name=tool_name,
                             tool_args=tool_args,
                             current_source=current_source,
                         )
                         exact_match_count = current_source.count(old_text) if current_source and old_text else 0
-                        if not broad_replace and exact_match_count == 1:
+                        if not block_header_only_replace and not broad_replace and exact_match_count == 1:
                             return None
-                        reason_code = (
-                            "implementation_task_failed_unittest_blocks_broad_replace_text"
-                            if broad_replace
-                            else "implementation_task_failed_unittest_blocks_unmatched_replace_text"
+                        current_source_excerpt = self._replace_text_current_source_excerpt(
+                            current_source=current_source,
+                            old_text=old_text,
                         )
-                        allowed_actions: list[str] = []
-                        for action in [f"replace_text {path} with a small unique old_text", *target_actions]:
-                            if action not in allowed_actions:
-                                allowed_actions.append(action)
+                        if block_header_only_replace:
+                            reason_code = "implementation_task_failed_unittest_blocks_block_header_replace_text"
+                        elif broad_replace:
+                            reason_code = "implementation_task_failed_unittest_blocks_broad_replace_text"
+                        else:
+                            reason_code = "implementation_task_failed_unittest_blocks_unmatched_replace_text"
+                        if block_header_only_replace:
+                            allowed_actions = (
+                                [f"replace_text {path} with a small unique old_text"]
+                                if path in repeated_nonreducing_paths
+                                else [f"write_file {path}"]
+                            )
+                        else:
+                            allowed_actions: list[str] = []
+                            for action in [f"replace_text {path} with a small unique old_text", *target_actions]:
+                                if action not in allowed_actions:
+                                    allowed_actions.append(action)
                         message = (
                             "unittest失敗後の必要ファイルはread_file済みです。"
                             "小さいtargeted replace_textは許可しますが、現在sourceに一意一致しないold_text、"
-                            "または長い関数/ファイル全体を置換するreplace_textは許可しません。"
+                            "長い関数/ファイル全体を置換するreplace_text、"
+                            "またはPythonブロックヘッダ1行だけをold_textにした複数行replace_textは許可しません。"
                             f" proposed_old_text_chars={len(old_text)}, proposed_new_text_chars={len(new_text)}, "
-                            f"exact_old_text_matches={exact_match_count}。"
+                            f"exact_old_text_matches={exact_match_count}, "
+                            f"block_header_only_replace={block_header_only_replace}。"
                         )
                         return {
                             "reason_code": reason_code,
@@ -5579,12 +9616,20 @@ class AgentRuntime:
                             "allowed_next_actions": allowed_actions,
                             "suggested_fix": (
                                 "replace_textを使うなら、read_file済みの現在sourceから数行だけを正確にコピーした"
-                                "一意なold_textにしてください。大きい修正や一致確認できない修正は完全なwrite_fileで出してください。"
+                                "一意なold_textにしてください。関数やclassを置換する場合はヘッダだけではなく現在のブロック全体を含めるか、"
+                                "大きい修正なら完全なwrite_fileで出してください。"
+                                " current_source_excerptがある場合は、そこからold_textを作ってください。"
                             ),
                             "blocked_by": "implementation_task_progress_controller",
-                            "next_required_action": "retry with a small exact replace_text, or write_file the complete corrected target file",
+                            "next_required_action": (
+                                "write_file the complete corrected target file"
+                                if block_header_only_replace
+                                else "retry with a small exact replace_text, or write_file the complete corrected target file"
+                            ),
                             "broad_rewrite": broad_replace,
+                            "block_header_only_replace": block_header_only_replace,
                             "exact_old_text_matches": exact_match_count,
+                            "current_source_excerpt": current_source_excerpt,
                             "state": state,
                         }
                     return {
@@ -5605,6 +9650,49 @@ class AgentRuntime:
                 if not repair_targets or path in repair_targets:
                     candidate_source = str(tool_args.get("content") or "")
                     current_source = self._current_artifact_source_for_path(path, turn_workspace=turn_workspace)
+                    missing_import = (
+                        state.get("latest_unittest_missing_import")
+                        if isinstance(state.get("latest_unittest_missing_import"), dict)
+                        else {}
+                    )
+                    latest_impl_path = str(state.get("latest_implementation_path") or "").replace("\\", "/")
+                    repeated_nonreducing_paths = {
+                        str(item).replace("\\", "/")
+                        for item in state.get("same_signature_nonreducing_edit_paths") or []
+                        if str(item).strip()
+                    }
+                    if (
+                        missing_import
+                        and latest_impl_path
+                        and path == latest_impl_path
+                        and self._implementation_edit_is_broad_rewrite(
+                            tool_name="write_file",
+                            tool_args=tool_args,
+                            current_source=current_source,
+                        )
+                    ):
+                        missing_name = str(missing_import.get("name") or "")
+                        missing_module = str(missing_import.get("module") or "")
+                        return {
+                            "reason_code": "implementation_task_failed_unittest_blocks_broad_write_for_import_error",
+                            "phase": phase,
+                            "path": path,
+                            "message": (
+                                "直近unittestは単一のImportErrorです。"
+                                f"{missing_module}.{missing_name} のmodule-level export不足を直すために、"
+                                "既存実装全体のwrite_fileは広すぎます。"
+                            ),
+                            "allowed_next_actions": [f"replace_text {path} with a small unique old_text"],
+                            "suggested_fix": (
+                                "read済みsourceの数行だけをold_textにして、欠けているexport名のalias追加またはrenameだけを行ってください。"
+                                "同等の小文字/camelCase名が既にある場合は、その定義行の直後に互換aliasを追加する小さいreplace_textにしてください。"
+                            ),
+                            "latest_unittest_missing_import": missing_import,
+                            "latest_unittest_output_excerpt": str(state.get("latest_unittest_output_excerpt") or "")[-1200:],
+                            "blocked_by": "implementation_task_progress_controller",
+                            "next_required_action": f"replace_text {path} with a small unique old_text",
+                            "state": state,
+                        }
                     if not bool(state.get("repeated_unittest_failure_signature")):
                         nonreducing_reason = self._write_file_nonreducing_reason(
                             candidate_source=candidate_source,
@@ -5622,7 +9710,13 @@ class AgentRuntime:
                             *[
                                 f"write_file {target}"
                                 for target in repair_targets
-                                if _artifact_path_is_test(target) or _artifact_path_is_python_implementation(target)
+                                if (
+                                    (_artifact_path_is_test(target) or _artifact_path_is_python_implementation(target))
+                                    and (
+                                        not bool(state.get("repeated_unittest_failure_signature"))
+                                        or target not in repeated_nonreducing_paths
+                                    )
+                                )
                             ],
                         ] or list(state.get("allowed_next_actions") or [])
                         output_excerpt = str(state.get("latest_unittest_output_excerpt") or "").strip()
@@ -5646,6 +9740,48 @@ class AgentRuntime:
                             "nonreducing_reason": nonreducing_reason,
                             "blocked_by": "implementation_task_progress_controller",
                             "next_required_action": "write_file a semantically changed repair for one traceback-related target",
+                            "state": state,
+                        }
+                    if bool(state.get("repeated_unittest_failure_signature")) and path in repeated_nonreducing_paths:
+                        target_actions = [
+                            *[
+                                f"replace_text {target} with a small unique old_text"
+                                for target in repair_targets
+                                if _artifact_path_is_test(target) or _artifact_path_is_python_implementation(target)
+                            ],
+                            *[
+                                f"write_file {target}"
+                                for target in repair_targets
+                                if (
+                                    (_artifact_path_is_test(target) or _artifact_path_is_python_implementation(target))
+                                    and target not in repeated_nonreducing_paths
+                                )
+                            ],
+                        ] or list(state.get("allowed_next_actions") or [])
+                        output_excerpt = str(state.get("latest_unittest_output_excerpt") or "").strip()
+                        return {
+                            "reason_code": "implementation_task_failed_unittest_blocks_repeated_full_write_after_nonreducing_signature",
+                            "phase": phase,
+                            "path": path,
+                            "message": (
+                                "前回編集後もunittest failure signatureが同一で、このpathへの全文writeは失敗を減らしていません。"
+                                "同じ対象への次の全面write_fileは、同型反復を避けるため許可しません。"
+                            ),
+                            "allowed_next_actions": target_actions,
+                            "suggested_fix": (
+                                "read済みsourceの具体行に対する小さいreplace_text、"
+                                "または別のtraceback対象ファイルのwrite_fileで失敗signatureを変えてください。"
+                            ),
+                            "latest_unittest_failure_signature": str(
+                                state.get("latest_unittest_failure_signature") or ""
+                            ),
+                            "latest_unittest_output_excerpt": output_excerpt[-1200:],
+                            "nonreducing_edit_paths": sorted(repeated_nonreducing_paths),
+                            "blocked_by": "implementation_task_progress_controller",
+                            "next_required_action": (
+                                "use a small targeted replace_text on the nonreducing path, "
+                                "or write_file a different traceback-related target"
+                            ),
                             "state": state,
                         }
                     if bool(state.get("repeated_unittest_failure_signature")):
@@ -5694,11 +9830,14 @@ class AgentRuntime:
                                     if _artifact_path_is_test(target) or _artifact_path_is_python_implementation(target)
                                 ],
                                 *[
-                                    f"write_file {target}"
-                                    for target in repair_targets
-                                    if _artifact_path_is_test(target) or _artifact_path_is_python_implementation(target)
-                                ],
-                            ] or list(state.get("allowed_next_actions") or [])
+                                f"write_file {target}"
+                                for target in repair_targets
+                                if (
+                                    (_artifact_path_is_test(target) or _artifact_path_is_python_implementation(target))
+                                    and target not in repeated_nonreducing_paths
+                                )
+                            ],
+                        ] or list(state.get("allowed_next_actions") or [])
                             output_excerpt = str(state.get("latest_unittest_output_excerpt") or "").strip()
                             return {
                                 "reason_code": "implementation_task_failed_unittest_blocks_noop_write",
@@ -5740,7 +9879,11 @@ class AgentRuntime:
                 }
             if tool_name == "run_command" and "unittest" in command.lower():
                 latest_edit_recovery = state.get("latest_edit_match_failure_recovery") if isinstance(state.get("latest_edit_match_failure_recovery"), dict) else {}
-                if state.get("failed_unittest_recovery_read_consumed") and not latest_edit_recovery:
+                if (
+                    state.get("failed_unittest_recovery_read_consumed")
+                    and not state.get("successful_edit_after_failed_unittest")
+                    and not latest_edit_recovery
+                ):
                     return {
                         "reason_code": "implementation_task_failed_unittest_requires_edit_before_rerun",
                         "phase": phase,
@@ -5780,10 +9923,26 @@ class AgentRuntime:
         steps: list[dict[str, Any]],
         step_index: int,
         max_steps: int,
+        turn_workspace: Path | None = None,
     ) -> dict[str, Any] | None:
         """Return a deterministic next action when generic contract evidence is missing."""
         contract = _finish_acceptance_contract(user_message)
         evidence = _finish_acceptance_evidence(steps)
+        progress_state: dict[str, Any] | None = None
+
+        def unittest_recovery_is_currently_allowed() -> bool:
+            nonlocal progress_state
+            if progress_state is None:
+                progress_state = self._implementation_task_progress_state(
+                    user_message=user_message,
+                    steps=steps,
+                    session_id=session_id,
+                    turn_workspace=turn_workspace,
+                )
+            return "run_command python3 -m unittest discover -s tests" in [
+                str(item) for item in progress_state.get("allowed_next_actions") or []
+            ]
+
         if (
             "unittest_run" in contract
             and bool(evidence.get("python_artifact_written"))
@@ -5792,6 +9951,8 @@ class AgentRuntime:
             and not bool(evidence.get("unittest_run"))
         ):
             if self._latest_semantic_review_requires_revision(session_id=session_id):
+                return None
+            if not unittest_recovery_is_currently_allowed():
                 return None
             return {
                 "tool_name": "run_command",
@@ -5808,6 +9969,8 @@ class AgentRuntime:
             and self._successful_unittest_run_count(steps) < 2
         ):
             if self._latest_semantic_review_requires_revision(session_id=session_id):
+                return None
+            if not unittest_recovery_is_currently_allowed():
                 return None
             return {
                 "tool_name": "run_command",
@@ -6263,6 +10426,31 @@ class AgentRuntime:
             return True
         return bool(progress_state.get("missing_requirements"))
 
+    def _implementation_progress_allows_repeated_command(
+        self,
+        *,
+        user_message: str,
+        tool_args: dict[str, Any],
+        steps: list[dict[str, Any]],
+        session_id: str,
+        turn_workspace: Path,
+    ) -> bool:
+        command = str(tool_args.get("command") or "").strip().lower()
+        if "unittest" not in command:
+            return False
+        state = self._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id=session_id,
+            turn_workspace=turn_workspace,
+        )
+        if state.get("phase") != "external_audit_required":
+            return False
+        return any(
+            "run_command" in str(action).lower() and "unittest" in str(action).lower()
+            for action in state.get("allowed_next_actions") or []
+        )
+
     def _finish_status_is_accepted(self, status: Any) -> bool:
         return str(status or "") == "success"
 
@@ -6350,6 +10538,9 @@ class AgentRuntime:
             "finish_acceptance",
             "first_action_required",
             "plan_acceptance_blocked",
+            "plan_record_autorepaired",
+            "plan_revision_returned_to_root",
+            "plan_execution_paused_for_progress",
             "completion_contract_recovery",
             "contract_incomplete",
             "step_limit_reached",
@@ -6400,6 +10591,7 @@ class AgentRuntime:
         steps: list[dict[str, Any]] | None = None,
         user_message: str = "",
         current_model: str = "",
+        skip_acceptance: bool = False,
     ) -> dict[str, Any]:
         parent = self.frame_manager.current_frame()
         blocked = self._child_contract_blocks_decomposition(
@@ -6411,15 +10603,7 @@ class AgentRuntime:
             tool_name="decompose_tasks",
         )
         if blocked is not None:
-            self._force_return_after_child_contract_block(
-                session_id=session_id,
-                turn_id=turn_id,
-                queue_id=queue_id,
-                step_index=step_index,
-                turn_workspace=turn_workspace,
-                blocked_tool="decompose_tasks",
-            )
-            return {"ok": False, "event": blocked, "error": "child contract requires return"}
+            return {"ok": False, "event": blocked, "error": "child contract blocks decomposition"}
         tasks = self._normalize_child_tasks(tool_args.get("tasks") or [])
         if not tasks:
             note = self._append_session_event(
@@ -6472,19 +10656,20 @@ class AgentRuntime:
                 "error": "invalid work package",
                 "terminal_failure": bool(details.get("terminal_failure")),
             }
-        acceptance = self._plan_acceptance_gate(
-            session_id=session_id,
-            turn_id=turn_id,
-            queue_id=queue_id,
-            step_index=step_index,
-            turn_workspace=turn_workspace,
-            tool_name="decompose_tasks",
-            user_message=user_message,
-            tasks=tasks,
-            current_model=current_model,
-        )
-        if not bool(acceptance.get("ok")):
-            return {"ok": False, "event": acceptance.get("event"), "error": "plan semantic mismatch"}
+        if not skip_acceptance:
+            acceptance = self._plan_acceptance_gate(
+                session_id=session_id,
+                turn_id=turn_id,
+                queue_id=queue_id,
+                step_index=step_index,
+                turn_workspace=turn_workspace,
+                tool_name="decompose_tasks",
+                user_message=user_message,
+                tasks=tasks,
+                current_model=current_model,
+            )
+            if not bool(acceptance.get("ok")):
+                return {"ok": False, "event": acceptance.get("event"), "error": "plan semantic mismatch"}
         active_tasks: list[dict[str, Any]] = []
         skipped_tasks: list[dict[str, Any]] = []
         for task in tasks:
@@ -6592,15 +10777,7 @@ class AgentRuntime:
             tool_name="open_child_frame",
         )
         if blocked is not None:
-            self._force_return_after_child_contract_block(
-                session_id=session_id,
-                turn_id=turn_id,
-                queue_id=queue_id,
-                step_index=step_index,
-                turn_workspace=turn_workspace,
-                blocked_tool="open_child_frame",
-            )
-            return {"ok": False, "event": blocked, "error": "child contract requires return"}
+            return {"ok": False, "event": blocked, "error": "child contract blocks decomposition"}
         parent_id = parent.frame_id if parent else None
         planned_task = None
         requested_task_id = str(tool_args.get("child_task_id") or "").strip()
@@ -7141,12 +11318,109 @@ class AgentRuntime:
     def _dedicated_llm_workspace_enabled(self) -> bool:
         return bool(self.runtime_config.get("dedicated_llm_workspace", True))
 
-    def _prepare_turn_workspace(self, *, turn_id: str) -> Path:
+    @staticmethod
+    def _message_requests_runtime_continuation(message: str) -> bool:
+        text = str(message or "").lower()
+        markers = (
+            "続け",
+            "続きを",
+            "再開",
+            "前回",
+            "未完",
+            "同じworkspace",
+            "同じ work",
+            "workspace",
+            "events",
+            "resume",
+            "continue",
+            "continuation",
+            "previous",
+            "last workspace",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _runtime_status_allows_workspace_resume(status: dict[str, Any]) -> bool:
+        if not status:
+            return False
+        status_text = "\n".join(
+            str(status.get(key) or "")
+            for key in ("status", "current_phase", "last_error", "last_system_note", "current_stream_text")
+        ).lower()
+        return (
+            "step limit" in status_text
+            or "interrupted_by_operator" in status_text
+            or "operator_interrupt" in status_text
+            or "operator interrupt" in status_text
+        )
+
+    def _resume_workspace_for_message(self, message: str) -> Path | None:
+        if not self._dedicated_llm_workspace_enabled():
+            return None
+        if not self._message_requests_runtime_continuation(message):
+            return None
+        status = read_json(self.paths.runtime_status_path, fallback={})
+        if not self._runtime_status_allows_workspace_resume(status):
+            return None
+        candidate_text = str(status.get("current_llm_workspace") or status.get("last_llm_workspace") or "").strip()
+        if not candidate_text:
+            return None
+        candidate = Path(candidate_text).expanduser().resolve()
+        runs_dir = self.paths.llm_runs_dir.resolve()
+        try:
+            candidate.relative_to(runs_dir)
+        except ValueError:
+            return None
+        if not candidate.exists() or not candidate.is_dir():
+            return None
+        return candidate
+
+    def _event_sourced_steps_for_workspace(self, *, session_id: str, workspace: Path) -> list[dict[str, Any]]:
+        target = str(Path(workspace).resolve())
+        events = read_jsonl(self.paths.session_events_path(session_id))
+        tool_calls: dict[tuple[str, int, str], dict[str, Any]] = {}
+        steps: list[dict[str, Any]] = []
+        for event in events:
+            if str(event.get("llm_workspace") or "") != target:
+                continue
+            event_type = str(event.get("type") or "")
+            tool_name = str(event.get("tool_name") or "")
+            if not tool_name:
+                continue
+            turn = str(event.get("turn_id") or "")
+            try:
+                index = int(event.get("step_index") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            key = (turn, index, tool_name)
+            if event_type == "tool_call":
+                args = event.get("tool_args") if isinstance(event.get("tool_args"), dict) else {}
+                tool_calls[key] = dict(args)
+                continue
+            if event_type != "tool_result":
+                continue
+            args = dict(tool_calls.get(key) or {})
+            raw_result = event.get("content")
+            result: dict[str, Any]
+            if isinstance(raw_result, str) and raw_result.strip():
+                try:
+                    parsed = json.loads(raw_result)
+                except json.JSONDecodeError:
+                    parsed = {}
+                result = dict(parsed) if isinstance(parsed, dict) else {}
+            else:
+                result = {}
+            if "ok" not in result:
+                result["ok"] = bool(event.get("ok"))
+            steps.append({"tool_name": tool_name, "tool_args": args, "tool_result": result})
+        return steps
+
+    def _prepare_turn_workspace(self, *, turn_id: str, resume_workspace: Path | None = None) -> Path:
         if not self._dedicated_llm_workspace_enabled():
             self.execution_root = self.base_execution_root
             self.tools = ToolExecutor(self.execution_root, content_chunk_max_bytes=self.tool_content_chunk_bytes)
             return self.execution_root
-        workspace = (self.paths.llm_runs_dir / turn_id).resolve()
+        workspace = Path(resume_workspace).resolve() if resume_workspace is not None else (self.paths.llm_runs_dir / turn_id).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         self.execution_root = workspace
         self.tools = ToolExecutor(self.execution_root, content_chunk_max_bytes=self.tool_content_chunk_bytes)
@@ -7402,7 +11676,14 @@ class AgentRuntime:
         queue_id = str(item.get("queue_id") or "")
         operation_id = str(item.get("operation_id") or queue_id or uuid.uuid4().hex)
         turn_id = uuid.uuid4().hex
-        turn_workspace = self._prepare_turn_workspace(turn_id=turn_id)
+        resume_workspace = self._resume_workspace_for_message(recent_user_message)
+        resume_existing_frame = resume_workspace is not None and self.frame_manager.current_frame() is not None
+        turn_workspace = self._prepare_turn_workspace(turn_id=turn_id, resume_workspace=resume_workspace)
+        resumed_steps = (
+            self._event_sourced_steps_for_workspace(session_id=session_id, workspace=turn_workspace)
+            if resume_workspace is not None
+            else []
+        )
         operation_started_at = now_iso()
 
         def finish_operation(status: str, *, output_preview: str = "") -> None:
@@ -7457,8 +11738,32 @@ class AgentRuntime:
                 "llm_workspace": str(turn_workspace),
             },
         )
-        self._start_turn_frame(user_message=recent_user_message)
-        steps: list[dict[str, Any]] = []
+        self._start_turn_frame(user_message=recent_user_message, resume_existing=resume_existing_frame)
+        if resume_workspace is not None:
+            self._append_session_event(
+                self.root,
+                session_id,
+                {
+                    "type": "system_note",
+                    "role": "system",
+                    "content": "未完runの継続要求として前回workspaceとevent由来tool履歴を再利用します。",
+                    "code": "workspace_resume",
+                    "reason_code": "resume_incomplete_run_workspace",
+                    "details": {
+                        "resumed_workspace": str(turn_workspace),
+                        "resumed_step_count": len(resumed_steps),
+                        "resume_existing_frame": bool(resume_existing_frame),
+                        "contract_state": "continuation",
+                        "blocked_by": "runtime_workspace_controller",
+                        "next_required_action": "continue from event-sourced progress in the resumed workspace",
+                    },
+                    "turn_id": turn_id,
+                    "queue_id": queue_id,
+                    "step_index": 0,
+                    "llm_workspace": str(turn_workspace),
+                },
+            )
+        steps: list[dict[str, Any]] = list(resumed_steps)
         planning_note = self._build_planning_note(user_message=recent_user_message, goal_text=str(read_json(self.paths.goal_path, fallback={}).get("text") or ""))
         append_jsonl(
             self.paths.planning_path,
@@ -7545,6 +11850,91 @@ class AgentRuntime:
                 recent_events=recent_events,
                 current_phase=current_phase,
             )
+            pending_task_for_auto_open = self._pending_plan_child_task()
+            pending_plan_open = None
+            if pending_task_for_auto_open is not None:
+                progress_gate_state = self._implementation_task_progress_state(
+                    user_message=recent_user_message,
+                    steps=steps,
+                    session_id=session_id,
+                    turn_workspace=turn_workspace,
+                )
+                if self._plan_run_test_should_wait_for_progress(
+                    pending_task=pending_task_for_auto_open,
+                    progress_state=progress_gate_state,
+                ):
+                    self._append_session_event(
+                        self.root,
+                        session_id,
+                        {
+                            "type": "system_note",
+                            "role": "system",
+                            "content": (
+                                "PLAN_EXECUTION paused before verifier WorkUnit because implementation progress is incomplete. "
+                                "Satisfy implementation/tests progress before opening the planned run_test WorkUnit."
+                            ),
+                            "code": "plan_execution_paused_for_progress",
+                            "reason_code": "implementation_progress_before_plan_verifier",
+                            "details": {
+                                "pending_task": pending_task_for_auto_open,
+                                "progress_phase": progress_gate_state.get("phase"),
+                                "missing_requirements": list(progress_gate_state.get("missing_requirements") or []),
+                                "allowed_next_actions": list(progress_gate_state.get("allowed_next_actions") or []),
+                                "blocked_by": "plan_execution_contract",
+                                "next_required_action": "satisfy implementation_task_progress before run_test WorkUnit",
+                            },
+                            "turn_id": turn_id,
+                            "queue_id": queue_id,
+                            "step_index": step_index,
+                            "llm_workspace": str(turn_workspace),
+                        },
+                    )
+                else:
+                    pending_plan_open = self._auto_open_pending_plan_child(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        queue_id=queue_id,
+                        step_index=step_index,
+                        turn_workspace=turn_workspace,
+                        user_message=recent_user_message,
+                        current_model=str(selection.get("model") or ""),
+                    )
+            if pending_plan_open is not None:
+                steps.extend(list(pending_plan_open.get("auto_steps") or []))
+                open_message = (
+                    f"Opened pending planned WorkUnit ({(pending_plan_open.get('event') or {}).get('content') or 'PLAN_EXECUTION'})."
+                    if bool(pending_plan_open.get("ok"))
+                    else str((pending_plan_open.get("event") or {}).get("content") or pending_plan_open.get("error") or "pending planned WorkUnit blocked")
+                )
+                self._write_runtime_status(
+                    status="running",
+                    current_role=selection["role"],
+                    current_turn_id=turn_id,
+                    current_queue_id=queue_id,
+                    current_user_message=recent_user_message,
+                    current_prompt_preview=None,
+                    current_stream_text=open_message,
+                    current_plan=planning_note,
+                    current_phase="PLAN_EXECUTION",
+                    current_model=selection["model"],
+                    current_model_reason=selection["reason"],
+                    current_tool="open_child_frame",
+                    current_llm_workspace=str(turn_workspace),
+                    last_llm_workspace=str(turn_workspace),
+                    last_error=None if bool(pending_plan_open.get("ok")) else open_message,
+                    current_finished_at=now_iso(),
+                    worker_running=self._worker_running(),
+                )
+                if bool(pending_plan_open.get("terminal_failure")):
+                    finish_operation("failed", output_preview=open_message)
+                    return {
+                        "ok": False,
+                        "session_id": session_id,
+                        "steps": steps,
+                        "final_answer": open_message,
+                        "error": open_message,
+                    }
+                continue
             block_count, trigger_reason = self._consecutive_finish_block_summary(recent_events)
             if steps and block_count >= 3:
                 fallback_answer = self._synthesize_terminal_final_answer(
@@ -7908,6 +12298,7 @@ class AgentRuntime:
                 steps=steps,
                 step_index=step_index,
                 max_steps=max_steps,
+                turn_workspace=turn_workspace,
             )
             if recovery_action is not None:
                 recovery_tool_name = str(recovery_action.get("tool_name") or "")
@@ -8153,13 +12544,68 @@ class AgentRuntime:
                 state=progress_state,
                 trigger="before_model",
             )
+            if (
+                bool(progress_state.get("applicable"))
+                and str(progress_state.get("phase") or "") == "external_contract_satisfied"
+            ):
+                final_answer = (
+                    "auto_finish: implementation artifact, meaningful tests, unittest success, "
+                    "and external audit success are present."
+                )
+                self._append_session_event(
+                    self.root,
+                    session_id,
+                    {
+                        "type": "finish",
+                        "role": "assistant",
+                        "content": final_answer,
+                        "model": selection["model"],
+                        "model_reason": f"{selection['reason']} + implementation-contract-auto-finish",
+                        "llm_attempt_count": 0,
+                        "turn_id": turn_id,
+                        "queue_id": queue_id,
+                        "step_index": step_index,
+                        "llm_workspace": str(turn_workspace),
+                    },
+                )
+                self._write_runtime_status(
+                    status="idle",
+                    current_role=selection["role"],
+                    current_turn_id=None,
+                    current_queue_id=None,
+                    current_user_message=None,
+                    current_prompt_preview=None,
+                    current_stream_text=final_answer,
+                    current_plan=planning_note,
+                    current_phase="FINISH",
+                    current_model=selection["model"],
+                    current_model_reason=f"{selection['reason']} + implementation-contract-auto-finish",
+                    current_tool="finish",
+                    current_operation_id=None,
+                    current_llm_workspace=None,
+                    last_llm_workspace=str(turn_workspace),
+                    last_error=None,
+                    last_system_note=final_answer,
+                    current_started_at=None,
+                    current_finished_at=now_iso(),
+                    worker_running=self._worker_running(),
+                )
+                finish_operation("finished", output_preview=final_answer)
+                return {"ok": True, "session_id": session_id, "steps": steps, "final_answer": final_answer}
             current_phase = self._implementation_task_effective_phase(
                 fallback_phase=current_phase,
                 state=progress_state,
             )
             progress_prompt = self._implementation_task_progress_prompt(progress_state)
-            suppress_frame_operations = self._implementation_task_should_suppress_frame_operations(progress_state)
-            schema_tool_names = self._implementation_task_schema_tool_names(progress_state)
+            if current_phase in {"PLANNING_REQUIRED", "PLAN_REVISION"}:
+                suppress_frame_operations = False
+                schema_tool_names = ["create_plan"]
+            elif current_phase == "PLAN_EXECUTION":
+                suppress_frame_operations = self._implementation_task_should_suppress_frame_operations(progress_state)
+                schema_tool_names = self._implementation_task_schema_tool_names(progress_state)
+            else:
+                suppress_frame_operations = self._implementation_task_should_suppress_frame_operations(progress_state)
+                schema_tool_names = self._implementation_task_schema_tool_names(progress_state)
             prompt_recent_events = self._implementation_task_prompt_events(
                 recent_events=recent_events,
                 state=progress_state,
@@ -8252,6 +12698,14 @@ class AgentRuntime:
                 )
             if telemetry.get("parse_issue"):
                 issue = str(telemetry.get("parse_issue") or "invalid_tool_envelope")
+                stream_abort_reason = str((telemetry.get("stream_metadata") or {}).get("client_abort_reason") or "")
+                if stream_abort_reason in {
+                    "plan_record_embedded_edit_stream",
+                    "stream_char_limit",
+                    "repetitive_output",
+                    "json_envelope_followed_by_extra_text",
+                }:
+                    issue = stream_abort_reason
                 transport_error = "; ".join(
                     str(item)
                     for item in (telemetry.get("schema_validation") or {}).get("errors") or []
@@ -8337,7 +12791,7 @@ class AgentRuntime:
                     session_id=session_id,
                     turn_workspace=turn_workspace,
                 )
-                issue_allowed_actions = list(schema_tool_names)
+                issue_allowed_actions = list(schema_tool_names or [])
                 if bool(issue_progress_state.get("applicable")) and issue_progress_state.get("allowed_next_actions"):
                     issue_allowed_actions = [
                         str(item)
@@ -8349,7 +12803,18 @@ class AgentRuntime:
                     if bool(issue_progress_state.get("applicable"))
                     else []
                 )
-                if issue in {"stream_char_limit", "repetitive_output"}:
+                if issue == "plan_record_embedded_edit_stream":
+                    issue_blocked_by = "runtime_stream_guard"
+                    issue_suggested_fix = (
+                        "create_plan のstream中に PlanRecord.first_action が write_file/append_file/replace_text を含むことを検出したため停止しました。"
+                        "PlanRecordは小さい計画契約だけにし、first_actionは list_files/read_file/search_code/run_command のどれかにしてください。"
+                        "edit WorkUnit の first_action は {\"tool\":\"list_files\",\"args\":{\"path\":\".\"}} のような観測専用actionにしてください。"
+                        "実装コード本文は、該当WorkUnitの子フレームが開いた後のPLAN_EXECUTIONで write_file として返してください。"
+                    )
+                    issue_next_required_action = (
+                        "retry create_plan with a concise PlanRecord; use list_files/read_file/search_code/run_command first_action only"
+                    )
+                elif issue in {"stream_char_limit", "repetitive_output"}:
                     issue_blocked_by = "runtime_stream_guard"
                     issue_suggested_fix = (
                         "直前のLLM出力は長大または反復的で、完全なtool JSONとして閉じる前に停止しました。"
@@ -8393,7 +12858,7 @@ class AgentRuntime:
                             "schema_validation": telemetry.get("schema_validation") or {},
                             "current_phase": current_phase,
                             "missing_requirements": issue_missing_requirements,
-                            "allowed_tool_names": list(schema_tool_names),
+                            "allowed_tool_names": list(schema_tool_names or []),
                             "allowed_next_actions": issue_allowed_actions,
                             "suggested_fix": issue_suggested_fix,
                             "next_required_action": issue_next_required_action,
@@ -8424,6 +12889,43 @@ class AgentRuntime:
                     reason=f"llm output did not satisfy machine-control schema: {issue}",
                     steps=steps,
                 )
+                if issue == "plan_record_embedded_edit_stream":
+                    autorepair_result = self._auto_create_minimal_plan_after_repeated_stream_issue(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        queue_id=queue_id,
+                        step_index=step_index,
+                        turn_workspace=turn_workspace,
+                        user_message=recent_user_message,
+                        current_phase=current_phase,
+                        steps=steps,
+                        current_model=str(selection["model"]),
+                    )
+                    if autorepair_result and bool(autorepair_result.get("ok")):
+                        message = "PlanRecord was auto-repaired after repeated embedded edit streams; continuing with PLAN_EXECUTION."
+                        self._write_runtime_status(
+                            status="running",
+                            current_role=selection["role"],
+                            current_turn_id=turn_id,
+                            current_queue_id=queue_id,
+                            current_user_message=recent_user_message,
+                            current_prompt_preview=prompt[:2000],
+                            current_stream_text=message,
+                            current_plan=planning_note,
+                            current_phase="PLAN_EXECUTION",
+                            current_model=selection["model"],
+                            current_model_reason=selection["reason"],
+                            current_tool=None,
+                            current_operation_id=operation_id,
+                            current_llm_workspace=str(turn_workspace),
+                            last_llm_workspace=str(turn_workspace),
+                            last_error=None,
+                            last_system_note=message,
+                            current_started_at=read_json(self.paths.runtime_status_path, fallback={}).get("current_started_at") or now_iso(),
+                            current_finished_at=None,
+                            worker_running=self._worker_running(),
+                        )
+                        continue
                 message = f"LLM output did not satisfy machine-control schema: {issue}"
                 if issue == "llm_transport_error":
                     message = f"LLM transport failed during machine-control generation: {transport_error or 'unknown transport error'}"
@@ -8513,6 +13015,40 @@ class AgentRuntime:
                     current_stream_text=message,
                     current_plan=planning_note,
                     current_phase="FIRST_ACTION_REQUIRED",
+                    current_model=selection["model"],
+                    current_model_reason=selection["reason"],
+                    current_tool=None,
+                    current_llm_workspace=str(turn_workspace),
+                    last_llm_workspace=str(turn_workspace),
+                    last_error=message,
+                    last_system_note=message,
+                    worker_running=self._worker_running(),
+                )
+                continue
+            planner_block = self._planner_action_blocked_event(
+                session_id=session_id,
+                turn_id=turn_id,
+                queue_id=queue_id,
+                step_index=step_index,
+                turn_workspace=turn_workspace,
+                tool_name=tool_name,
+                user_message=recent_user_message,
+                current_phase=current_phase,
+                recent_events=recent_events,
+                steps=steps,
+            )
+            if planner_block is not None:
+                message = str(planner_block.get("content") or "")
+                self._write_runtime_status(
+                    status="running",
+                    current_role=selection["role"],
+                    current_turn_id=turn_id,
+                    current_queue_id=queue_id,
+                    current_user_message=recent_user_message,
+                    current_prompt_preview=prompt[:2000],
+                    current_stream_text=message,
+                    current_plan=planning_note,
+                    current_phase=current_phase,
                     current_model=selection["model"],
                     current_model_reason=selection["reason"],
                     current_tool=None,
@@ -8661,6 +13197,55 @@ class AgentRuntime:
                     last_system_note=message,
                     worker_running=self._worker_running(),
                 )
+                continue
+            if tool_name == "create_plan":
+                create_plan_result = self._handle_create_plan(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    queue_id=queue_id,
+                    step_index=step_index,
+                    tool_args=tool_args,
+                    turn_workspace=turn_workspace,
+                    steps=steps,
+                    user_message=recent_user_message,
+                    current_model=str(selection["model"]),
+                )
+                create_plan_ok = bool(create_plan_result.get("ok"))
+                if create_plan_result.get("auto_steps"):
+                    steps.extend(list(create_plan_result.get("auto_steps") or []))
+                create_plan_message = (
+                    f"Accepted PlanRecord and opened first WorkUnit ({len(create_plan_result.get('tasks') or [])} work units)."
+                    if create_plan_ok
+                    else str((create_plan_result.get("event") or {}).get("content") or create_plan_result.get("error") or "create_plan blocked")
+                )
+                self._write_runtime_status(
+                    status="running",
+                    current_role=selection["role"],
+                    current_turn_id=turn_id,
+                    current_queue_id=queue_id,
+                    current_user_message=recent_user_message,
+                    current_prompt_preview=prompt[:2000],
+                    current_stream_text=create_plan_message,
+                    current_plan=planning_note,
+                    current_phase="PLAN_EXECUTION" if create_plan_ok else "PLANNING_REQUIRED",
+                    current_model=selection["model"],
+                    current_model_reason=selection["reason"],
+                    current_tool="create_plan",
+                    current_llm_workspace=str(turn_workspace),
+                    last_llm_workspace=str(turn_workspace),
+                    last_error=None if create_plan_ok else create_plan_message,
+                    last_system_note=None if create_plan_ok else create_plan_message,
+                    current_finished_at=now_iso(),
+                    worker_running=self._worker_running(),
+                )
+                if bool(create_plan_result.get("terminal_failure")):
+                    finish_operation("failed", output_preview=create_plan_message)
+                    return {
+                        "ok": False,
+                        "session_id": session_id,
+                        "steps": steps,
+                        "error": create_plan_message,
+                    }
                 continue
             if tool_name == "decompose_tasks":
                 decompose_result = self._handle_decompose_tasks(
@@ -8911,6 +13496,38 @@ class AgentRuntime:
                         current_stream_text=message,
                         current_plan=planning_note,
                         current_phase="RETURN_TO_PARENT_REQUIRED",
+                        current_model=selection["model"],
+                        current_model_reason=selection["reason"],
+                        current_tool=None,
+                        current_llm_workspace=str(turn_workspace),
+                        last_llm_workspace=str(turn_workspace),
+                        last_error=message,
+                        last_system_note=message,
+                        worker_running=self._worker_running(),
+                    )
+                    continue
+                pending_task = self._pending_plan_child_task()
+                if pending_task is not None:
+                    event = self._plan_execution_pending_block_event(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        queue_id=queue_id,
+                        step_index=step_index,
+                        turn_workspace=turn_workspace,
+                        blocked_tool="finish",
+                        pending_task=pending_task,
+                    )
+                    message = str(event.get("content") or "finish blocked by pending planned WorkUnit")
+                    self._write_runtime_status(
+                        status="running",
+                        current_role=selection["role"],
+                        current_turn_id=turn_id,
+                        current_queue_id=queue_id,
+                        current_user_message=recent_user_message,
+                        current_prompt_preview=prompt[:2000],
+                        current_stream_text=message,
+                        current_plan=planning_note,
+                        current_phase="PLAN_EXECUTION",
                         current_model=selection["model"],
                         current_model_reason=selection["reason"],
                         current_tool=None,
@@ -9373,7 +13990,18 @@ class AgentRuntime:
                 },
             )
             if tool_name == "run_command":
-                redundant_reason = self._redundant_command_reason(tool_args=tool_args, steps=steps)
+                repeated_command_allowed = self._implementation_progress_allows_repeated_command(
+                    user_message=recent_user_message,
+                    tool_args=dict(tool_args),
+                    steps=steps,
+                    session_id=session_id,
+                    turn_workspace=turn_workspace,
+                )
+                redundant_reason = (
+                    ""
+                    if repeated_command_allowed
+                    else self._redundant_command_reason(tool_args=tool_args, steps=steps)
+                )
                 if redundant_reason:
                     previous_result = (steps[-1].get("tool_result") if steps else {}) or {}
                     previous_failed = not bool(previous_result.get("ok"))
@@ -9458,7 +14086,7 @@ class AgentRuntime:
                             "error": redundant_reason,
                         }
                     continue
-                similar_warning = self._similar_command_warning(tool_args=tool_args, steps=steps)
+                similar_warning = "" if repeated_command_allowed else self._similar_command_warning(tool_args=tool_args, steps=steps)
                 if similar_warning:
                     self._append_session_event(
                         self.root,
@@ -9485,10 +14113,15 @@ class AgentRuntime:
                 turn_workspace=turn_workspace,
             )
             if implementation_phase_block is not None:
-                message = str(implementation_phase_block.get("message") or "")
-                reason_code = str(implementation_phase_block.get("reason_code") or "implementation_task_phase_blocked")
-                blocked_path = str(implementation_phase_block.get("path") or tool_args.get("path") or "")
-                block_signature = str(implementation_phase_block.get("block_signature") or "")
+                progress_block = ProgressBlockDecision.from_phase_block(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    phase_block=implementation_phase_block,
+                )
+                message = progress_block.message
+                reason_code = progress_block.reason_code
+                blocked_path = progress_block.path
+                block_signature = progress_block.block_signature
                 repeated_block_count = self._recent_same_blocked_action_count(
                     session_id=session_id,
                     code="implementation_task_progress_blocked",
@@ -9503,42 +14136,17 @@ class AgentRuntime:
                     {
                         "type": "system_note",
                         "role": "system",
-                        "content": f"{tool_name} がブロックされました: {message}",
+                        "content": progress_block.visible_message(),
                         "code": "implementation_task_progress_blocked",
                         "reason_code": reason_code,
-                        "details": {
-                            "reason_code": reason_code,
-                            "blocked_tool": tool_name,
-                            "path": blocked_path,
-                            "phase": str(implementation_phase_block.get("phase") or ""),
-                            "route_phase": str(implementation_phase_block.get("route_phase") or ""),
-                            "blocked_by": str(implementation_phase_block.get("blocked_by") or "implementation_task_progress_controller"),
-                            "failure_type": str(implementation_phase_block.get("failure_type") or "implementation_task_progress_blocked"),
-                            "allowed_next_actions": list(implementation_phase_block.get("allowed_next_actions") or []),
-                            "suggested_fix": str(implementation_phase_block.get("suggested_fix") or ""),
-                            "next_required_action": str(
-                                implementation_phase_block.get("next_required_action")
-                                or implementation_phase_block.get("suggested_fix")
-                                or ""
-                            ),
-                            "missing_requirements": list(implementation_phase_block.get("missing_requirements") or []),
-                            "candidate_missing_requirements": list(implementation_phase_block.get("candidate_missing_requirements") or []),
-                            "repair_hints": list(implementation_phase_block.get("repair_hints") or []),
-                            "block_signature": block_signature,
-                            "state": implementation_phase_block.get("state") or {},
-                            "latest_edit_match_failure_recovery": implementation_phase_block.get("latest_edit_match_failure_recovery") or {},
-                            "broad_rewrite": bool(implementation_phase_block.get("broad_rewrite")),
-                            "fixture_repair_mode": bool(implementation_phase_block.get("fixture_repair_mode")),
-                            "fixture_review_items": implementation_phase_block.get("fixture_review_items") or [],
-                            "repeated_semantic_issue": implementation_phase_block.get("repeated_semantic_issue") or {},
-                        },
+                        "details": progress_block.event_details(),
                         "turn_id": turn_id,
                         "queue_id": queue_id,
                         "step_index": step_index,
                         "llm_workspace": str(turn_workspace),
                     },
                 )
-                if repeated_block_count >= 2 and not bool(implementation_phase_block.get("terminal_failure")):
+                if repeated_block_count >= 2 and not progress_block.terminal_failure:
                     failure_message = (
                         "同じ implementation task progress block が繰り返されました。runtimeは現在許可される"
                         "次アクションを提示しましたが、同じ不許可アクションが再提案されたため、このrunを"
@@ -9562,9 +14170,9 @@ class AgentRuntime:
                                 "failure_type": "blocked_action_ignored",
                                 "blocked_by": "implementation_task_progress_controller",
                                 "repeated_block_count": repeated_block_count + 1,
-                                "allowed_next_actions": list(implementation_phase_block.get("allowed_next_actions") or []),
-                                "suggested_fix": str(implementation_phase_block.get("suggested_fix") or "許可された次アクションだけを実行してください。"),
-                                "next_required_action": str(implementation_phase_block.get("next_required_action") or implementation_phase_block.get("suggested_fix") or "choose one allowed_next_actions item"),
+                                "allowed_next_actions": list(progress_block.allowed_next_actions),
+                                "suggested_fix": progress_block.suggested_fix or "許可された次アクションだけを実行してください。",
+                                "next_required_action": progress_block.next_required_action or "choose one allowed_next_actions item",
                             },
                             "turn_id": turn_id,
                             "queue_id": queue_id,
@@ -9608,7 +14216,7 @@ class AgentRuntime:
                     current_queue_id=queue_id,
                     current_user_message=recent_user_message,
                     current_prompt_preview=prompt[:2000],
-                    current_stream_text=f"{tool_name} blocked by implementation task progress phase. {message}",
+                    current_stream_text=progress_block.status_stream_text(),
                     current_plan=planning_note,
                     current_phase="IMPLEMENTATION_TASK_PROGRESS",
                     current_model=selection["model"],
@@ -9620,7 +14228,7 @@ class AgentRuntime:
                     last_system_note=message,
                     worker_running=self._worker_running(),
                 )
-                if bool(implementation_phase_block.get("terminal_failure")):
+                if progress_block.terminal_failure:
                     failure_message = message
                     self._append_session_event(
                         self.root,
@@ -10548,6 +15156,7 @@ class AgentRuntime:
                     step_index=step_index,
                     turn_workspace=turn_workspace,
                     tool_name=tool_name,
+                    tool_args=tool_args,
                     tool_result=tool_result,
                 )
             elif bool(tool_result.get("ok")) and self._current_child_should_return_after_tool_success(tool_name=tool_name):
@@ -10558,6 +15167,7 @@ class AgentRuntime:
                     step_index=step_index,
                     turn_workspace=turn_workspace,
                     tool_name=tool_name,
+                    tool_args=tool_args,
                     tool_result=tool_result,
                 )
             if int(telemetry.get("attempt_count") or 0) > 0:
@@ -10676,12 +15286,48 @@ class AgentRuntime:
             ),
             current_phase="STEP_LIMIT_FINAL_GATE",
         )
-        step_limit_finish = self._controller_terminal_finish(
-            selection=final_selection,
-            goal_text=goal_text,
-            user_message=recent_user_message,
-            steps=steps,
-        )
+        active_frame = self.frame_manager.current_frame()
+        plan_incomplete_at_step_limit = False
+        if active_frame is not None and active_frame.parent_frame_id is not None:
+            if self._child_frame_successful_tool_evidence() and not self._child_frame_has_unresolved_failure():
+                self._force_return_after_child_contract_block(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    queue_id=queue_id,
+                    step_index=max_steps,
+                    turn_workspace=turn_workspace,
+                    blocked_tool="step_limit_final_gate",
+                )
+                active_frame = self.frame_manager.current_frame()
+            if active_frame is not None and active_frame.parent_frame_id is not None:
+                self._step_limit_active_frame_block_event(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    queue_id=queue_id,
+                    step_index=max_steps,
+                    turn_workspace=turn_workspace,
+                )
+                plan_incomplete_at_step_limit = True
+        pending_plan_task = self._pending_plan_child_task()
+        if pending_plan_task is not None:
+            self._plan_execution_pending_block_event(
+                session_id=session_id,
+                turn_id=turn_id,
+                queue_id=queue_id,
+                step_index=max_steps,
+                turn_workspace=turn_workspace,
+                blocked_tool="step_limit_final_gate",
+                pending_task=pending_plan_task,
+            )
+            plan_incomplete_at_step_limit = True
+        step_limit_finish = None
+        if not plan_incomplete_at_step_limit:
+            step_limit_finish = self._controller_terminal_finish(
+                selection=final_selection,
+                goal_text=goal_text,
+                user_message=recent_user_message,
+                steps=steps,
+            )
         if step_limit_finish is not None and self._latest_successful_tool_name(steps) == "run_command":
             acceptance = self._finish_acceptance_evaluation(
                 user_message=recent_user_message,
@@ -11159,6 +15805,7 @@ AgentRuntime._chat_with_repair = _chat_with_repair
 AgentRuntime._extract_stream_metadata = _extract_stream_metadata
 AgentRuntime._machine_control_stream_stop_reason = _machine_control_stream_stop_reason
 AgentRuntime._looks_like_in_progress_write_file_content_stream = _looks_like_in_progress_write_file_content_stream
+AgentRuntime._looks_like_plan_record_embedded_edit_stream = _looks_like_plan_record_embedded_edit_stream
 AgentRuntime._looks_like_repetitive_machine_control_output = _looks_like_repetitive_machine_control_output
 AgentRuntime._format_llm_stream_text = _format_llm_stream_text
 AgentRuntime._tail_stream_text = _tail_stream_text

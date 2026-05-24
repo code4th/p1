@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from p4_core.runtime import AgentRuntime
+from p4_core.schemas import FIRST_ACTION_CONTENT_MAX_LENGTH, PLAN_RECORD_SCHEMA, tool_action_schema
 from p4_core.workspace import bootstrap_workspace, enqueue_message, read_jsonl
 
 
@@ -80,17 +81,28 @@ def tool_step(tool_name: str, path: str = "", *, content: str = "", ok: bool = T
     return {"tool_name": tool_name, "tool_args": args, "tool_result": tool_result}
 
 
-def run_step(command: str, *, ok: bool, stderr: str = "", stdout: str = "") -> dict:
+def run_step(
+    command: str,
+    *,
+    ok: bool,
+    stderr: str = "",
+    stdout: str = "",
+    failure_type: str = "",
+    returncode: int | None = None,
+) -> dict:
+    tool_result: dict[str, object] = {
+        "ok": ok,
+        "command": command,
+        "returncode": 0 if ok else (1 if returncode is None else returncode),
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    if failure_type:
+        tool_result["failure_type"] = failure_type
     return {
         "tool_name": "run_command",
         "tool_args": {"command": command},
-        "tool_result": {
-            "ok": ok,
-            "command": command,
-            "returncode": 0 if ok else 1,
-            "stdout": stdout,
-            "stderr": stderr,
-        },
+        "tool_result": tool_result,
     }
 
 
@@ -101,8 +113,134 @@ class GenericRuntimeContractTests(unittest.TestCase):
         bootstrap_workspace(root)
         return AgentRuntime(root, llm_backend=FakeBackend(responses or []))
 
+    def state_space_plan(self, runtime: AgentRuntime, user_message: str | None = None) -> dict:
+        profile = runtime._planning_profile_for_message(
+            user_message
+            or "4x4 sliding puzzle の状態、合法手、ゴール、探索方針を使って解く実装を作ってください。"
+        )
+        return {
+            "plan_id": "plan-state-space",
+            "profile": profile,
+            "strategy": "state_space_search",
+            "work_units": [
+                {
+                    "unit_id": "inspect-workspace",
+                    "goal": "Inspect the current workspace before implementing the generic state-space solver.",
+                    "depends_on": [],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "Workspace files are listed so implementation targets can be chosen.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-state-space-solution",
+                    "goal": "Run a final verifier that replays the legal action path and confirms it reaches the goal.",
+                    "depends_on": ["inspect-workspace"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "final_verifier replays legal actions from the start state and reaches the goal.",
+                    "should_open_child_frame": True,
+                }
+            ],
+            "verification_contract": {
+                "state": "state representation is explicit and serializable",
+                "action": "moves are explicit actions",
+                "goal": "goal predicate is checked",
+                "legal_move_validator": "illegal moves are rejected",
+                "solvability_check": "unsolvable inputs are rejected or reported",
+                "heuristic_or_search_policy": "search policy is explicit",
+                "final_verifier": "returned move sequence is replayed and reaches the goal",
+            },
+            "status": "proposed",
+            "revision_count": 0,
+        }
+
+    def dynamic_programming_plan(self, runtime: AgentRuntime, user_message: str | None = None) -> dict:
+        profile = runtime._planning_profile_for_message(
+            user_message
+            or "動的計画で部分問題、基底ケース、漸化式を使うPython実装とunittestを作ってください。"
+        )
+        return {
+            "plan_id": "plan-dynamic-programming",
+            "profile": profile,
+            "strategy": "dynamic_programming",
+            "work_units": [
+                {
+                    "unit_id": "inspect-workspace",
+                    "goal": "Inspect the current workspace before implementing the generic dynamic-programming solver.",
+                    "depends_on": [],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "Workspace files are listed so implementation targets can be chosen.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-dp-contract",
+                    "goal": "Run tests that verify base case behavior and recurrence/sample oracle behavior.",
+                    "depends_on": ["inspect-workspace"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "base case assertions and recurrence/sample oracle assertions pass.",
+                    "should_open_child_frame": True,
+                },
+            ],
+            "verification_contract": {
+                "subproblem_state": "subproblem state is explicit",
+                "base_case_verifier": "base cases are verified",
+                "recurrence_verifier": "recurrence or transition is verified",
+                "evaluation_order_or_memoization": "iteration order or memoization is explicit",
+                "sample_oracle": "sample oracle cases are asserted",
+            },
+            "status": "proposed",
+            "revision_count": 0,
+        }
+
+    def constraint_satisfaction_plan(self, runtime: AgentRuntime, user_message: str | None = None) -> dict:
+        profile = runtime._planning_profile_for_message(
+            user_message
+            or "制約、変数、ドメイン、割当を使うPython実装とunittestを作ってください。"
+        )
+        return {
+            "plan_id": "plan-constraint-satisfaction",
+            "profile": profile,
+            "strategy": "constraint_satisfaction",
+            "work_units": [
+                {
+                    "unit_id": "inspect-workspace",
+                    "goal": "Inspect the current workspace before implementing the generic constraint solver.",
+                    "depends_on": [],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "Workspace files are listed so implementation targets can be chosen.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-constraint-contract",
+                    "goal": "Run tests that validate constraint satisfaction and reject invalid negative assignments.",
+                    "depends_on": ["inspect-workspace"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "constraint validator accepts a satisfying assignment and rejects an invalid negative assignment.",
+                    "should_open_child_frame": True,
+                },
+            ],
+            "verification_contract": {
+                "variables": "variables are explicit",
+                "domains": "domains are explicit",
+                "constraints": "constraints are explicit",
+                "constraint_checker": "individual constraints can be checked",
+                "solution_validator": "complete assignments can be validated",
+                "negative_case": "invalid assignments are rejected",
+            },
+            "status": "proposed",
+            "revision_count": 0,
+        }
+
     def test_runtime_contains_no_benchmark_task_specializations(self) -> None:
-        source = Path("p4_core/runtime.py").read_text(encoding="utf-8")
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(Path("p4_core").rglob("*.py"))
+        )
         forbidden = [
             "ExactCover",
             "Sudoku",
@@ -122,6 +260,19 @@ class GenericRuntimeContractTests(unittest.TestCase):
             "row_id",
             "column_id",
             "row_id -> set",
+            "solve_one",
+            "solve_all",
+            "validate_solution",
+            "make the world better",
+            "improve the world",
+            "better world",
+            "15-puzzle",
+            "puzzle15",
+            "sliding puzzle",
+            "tuple(range(1, 16))",
+            "tuple(range(1, 17))",
+            "knapsack",
+            "edit distance",
         ]
         for marker in forbidden:
             self.assertNotIn(marker, source)
@@ -183,6 +334,138 @@ class GenericRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(missing, [])
 
+    def test_plan_record_schema_limits_first_action_content_for_llm(self) -> None:
+        args_schema = PLAN_RECORD_SCHEMA["properties"]["work_units"]["items"]["properties"]["first_action"]["properties"]["args"]
+        tool_schema = PLAN_RECORD_SCHEMA["properties"]["work_units"]["items"]["properties"]["first_action"]["properties"]["tool"]
+
+        self.assertEqual(args_schema["properties"]["content"]["maxLength"], FIRST_ACTION_CONTENT_MAX_LENGTH)
+        self.assertEqual(args_schema["properties"]["new_text"]["maxLength"], FIRST_ACTION_CONTENT_MAX_LENGTH)
+        self.assertEqual(args_schema["properties"]["old_text"]["maxLength"], FIRST_ACTION_CONTENT_MAX_LENGTH)
+        self.assertNotIn("write_file", tool_schema["enum"])
+        self.assertIn("list_files", tool_schema["enum"])
+
+    def test_create_plan_tool_schema_exposes_nested_plan_record_contract(self) -> None:
+        schema = tool_action_schema(allowed_tool_names=["create_plan"])
+        tool_args = schema["properties"]["tool_args"]
+        first_action_tool = (
+            tool_args["properties"]["plan"]["properties"]["work_units"]["items"]["properties"]["first_action"]["properties"]["tool"]
+        )
+
+        self.assertEqual(schema["properties"]["tool_name"]["enum"], ["create_plan"])
+        self.assertEqual(tool_args["required"], ["plan"])
+        self.assertNotIn("write_file", first_action_tool["enum"])
+        self.assertIn("list_files", first_action_tool["enum"])
+
+    def test_planning_stream_guard_aborts_embedded_edit_before_large_code_dump(self) -> None:
+        runtime = self.runtime()
+        partial_plan = (
+            '{"tool_name":"create_plan","tool_args":{"plan":{"plan_id":"p",'
+            '"profile":{"strategy":"state_space_search"},"strategy":"state_space_search",'
+            '"work_units":[{"unit_id":"impl","goal":"write implementation","depends_on":[],'
+            '"work_type":"edit","first_action":{"tool":"write_file","args":{"path":"solver.py","content":"'
+        )
+
+        reason = runtime._machine_control_stream_stop_reason(
+            content_text=partial_plan,
+            thinking_text="",
+            max_stream_chars=24000,
+            schema=PLAN_RECORD_SCHEMA,
+            current_phase="PLANNING_REQUIRED",
+        )
+
+        self.assertEqual(reason, "plan_record_embedded_edit_stream")
+
+    def test_planning_stream_guard_does_not_abort_state_space_signal_prefix(self) -> None:
+        runtime = self.runtime()
+        partial_plan = (
+            '{\n'
+            '  "tool_name": "create_plan",\n'
+            '  "tool_args": {"plan": {"plan_id": "p", "profile": {"complexity": "complex", "signals": [\n'
+            '    "state_space:状態", "state_space:ゴール", "state_space:合法手", "state_space:探索", "state_space'
+        )
+
+        reason = runtime._machine_control_stream_stop_reason(
+            content_text=partial_plan,
+            thinking_text="",
+            max_stream_chars=24000,
+            schema=PLAN_RECORD_SCHEMA,
+            current_phase="PLANNING_REQUIRED",
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_plan_record_embedded_edit_stream_feedback_is_specific_not_length_repair(self) -> None:
+        runtime = self.runtime()
+        metadata = {"client_abort_reason": "plan_record_embedded_edit_stream"}
+
+        issue = runtime._classify_llm_parse_issue(
+            raw_text='{"tool_name":"create_plan","tool_args":{"plan":{"work_units":[{"first_action":{"tool":"write_file",',
+            thinking_text="",
+            envelope={},
+            stream_metadata=metadata,
+            schema=PLAN_RECORD_SCHEMA,
+        )
+        prompt = runtime._json_repair_prompt(
+            parse_target_text="",
+            stream_metadata=metadata,
+            schema_errors=["$.tool_name: value 'finish' is not in enum ['create_plan']"],
+            allowed_tool_names=["create_plan"],
+        )
+
+        self.assertEqual(issue, "plan_record_embedded_edit_stream")
+        self.assertTrue(
+            runtime._parse_issue_should_exit_repair_loop(
+                parse_issue=issue,
+                stream_metadata=metadata,
+                current_phase="PLANNING_REQUIRED",
+            )
+        )
+        self.assertIn("not a length problem", prompt)
+        self.assertIn("Do not put implementation edits inside create_plan", prompt)
+        self.assertIn("list_files, read_file, search_code, or run_command", prompt)
+
+    def test_repeated_plan_record_embedded_stream_autorepairs_minimal_plan(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。"
+        for _ in range(3):
+            runtime._append_session_event(
+                "main",
+                {
+                    "type": "system_note",
+                    "role": "system",
+                    "content": "LLM応答がツール呼び出しJSONとして解釈できませんでした: plan_record_embedded_edit_stream",
+                    "code": "llm_output_issue",
+                    "reason_code": "plan_record_embedded_edit_stream",
+                    "details": {"failure_type": "plan_record_embedded_edit_stream"},
+                },
+            )
+
+        result = runtime._auto_create_minimal_plan_after_repeated_stream_issue(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=3,
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_phase="PLANNING_REQUIRED",
+            steps=[],
+            current_model="fake",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result["ok"], result.get("error"))
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertTrue(any(event.get("code") == "plan_record_autorepaired" for event in events))
+        plan_events = [event for event in events if event.get("type") == "plan_record"]
+        self.assertTrue(plan_events)
+        plan = plan_events[-1]["plan"]
+        self.assertEqual(plan["strategy"], "state_space_search")
+        edit_units = [unit for unit in plan["work_units"] if unit["work_type"] == "edit"]
+        self.assertTrue(edit_units)
+        self.assertEqual(edit_units[0]["first_action"]["tool"], "list_files")
+        self.assertTrue(any(event.get("type") == "task_plan" for event in events))
+
     def test_implementation_missing_requires_python_write_first(self) -> None:
         runtime = self.runtime()
         message = "Pythonで未知の文字列整形ツールを実装し、tests/ にunittestを追加して検証してください。"
@@ -222,6 +505,195 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertEqual(blocked["reason_code"], "implementation_task_phase_requires_placeholder_fix")
+
+    def test_placeholder_phase_prompt_carries_exact_local_repair_anchor(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで未知の探索ツールを実装し、tests/ にunittestを追加して検証してください。"
+        impl = (
+            "class Solver:\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "\n"
+            "    def solve(self, state):\n"
+            "        return [state]\n"
+        )
+        steps = [tool_step("write_file", "solver.py", content=impl)]
+
+        state = runtime._implementation_task_progress_state(user_message=message, steps=steps)
+        self.assertEqual(state["phase"], "implementation_present_but_placeholder")
+        hints = state["implementation_source_repair_hints"]
+        self.assertEqual(hints[0]["suggested_action"], "replace_placeholder_callable")
+        self.assertIn("def __init__(self):", hints[0]["suggested_old_text"])
+        self.assertIn("pass", hints[0]["suggested_old_text"])
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("replace_placeholder_callable", prompt)
+        self.assertIn("suggested_old_text", prompt)
+        self.assertIn("before editing unrelated functions or tests", prompt)
+
+    def test_implementation_prompt_steps_omit_prior_large_write_content(self) -> None:
+        runtime = self.runtime()
+        large_source = "def solve():\n" + "    return 1\n" * 500
+        steps = [
+            tool_step("write_file", "solver.py", content=large_source),
+            tool_step("read_file", "old.py"),
+            tool_step("read_file", "solver.py"),
+        ]
+        steps[1]["tool_result"]["content"] = "old content"
+        steps[2]["tool_result"]["content"] = "current content"
+
+        compacted = runtime._implementation_task_prompt_steps(steps=steps, state={})
+
+        self.assertIn("<omitted", compacted[0]["tool_args"]["content"])
+        self.assertIn("prior write_file content", compacted[0]["tool_args"]["content"])
+        self.assertEqual(compacted[1]["tool_result"]["content"], "old content")
+        self.assertEqual(compacted[2]["tool_result"]["content"], "current content")
+
+    def test_failed_unittest_prompt_steps_compact_latest_large_reads(self) -> None:
+        runtime = self.runtime()
+        large_read = "\n".join(f"line {index}: x = {index}" for index in range(180))
+        steps = [
+            tool_step("read_file", "tests/test_solver.py"),
+            tool_step("read_file", "solver.py"),
+        ]
+        steps[0]["tool_result"]["content"] = large_read
+        steps[1]["tool_result"]["content"] = large_read
+
+        default_compacted = runtime._implementation_task_prompt_steps(
+            steps=steps,
+            state={"phase": "tests_missing"},
+        )
+        failed_compacted = runtime._implementation_task_prompt_steps(
+            steps=steps,
+            state={"phase": "unittest_failed_needs_fix"},
+        )
+
+        self.assertEqual(default_compacted[0]["tool_result"]["content"], large_read)
+        self.assertEqual(default_compacted[1]["tool_result"]["content"], large_read)
+        self.assertLess(len(failed_compacted[0]["tool_result"]["content"]), len(large_read))
+        self.assertLess(len(failed_compacted[1]["tool_result"]["content"]), len(large_read))
+        self.assertIn("truncated", failed_compacted[0]["tool_result"]["content"])
+        self.assertIn("truncated", failed_compacted[1]["tool_result"]["content"])
+
+    def test_failed_unittest_prompt_makes_progress_gate_authoritative_inside_plan_child(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        root = runtime.frame_manager.create_root_frame(user_message)
+        runtime.frame_manager.register_child_task(
+            parent=root,
+            task={
+                "task_id": "task-run-test",
+                "goal": "Run final verifier",
+                "work_type": "run_test",
+                "first_action": {
+                    "tool": "run_command",
+                    "args": {"command": "python3 -m unittest discover -s tests"},
+                },
+                "success_evidence": "final verifier passes",
+                "context_summary": "planner_strategy=state_space_search; profile_strategy=state_space_search",
+                "why_not_direct_action": "PlanRecord requires this WorkUnit to run under the existing child-frame contract.",
+            },
+        )
+        runtime.frame_manager.open_child_frame(
+            "Run final verifier",
+            {
+                "child_task_id": "task-run-test",
+                "context_summary": "planner_strategy=state_space_search; profile_strategy=state_space_search",
+            },
+        )
+
+        prompt = runtime._build_prompt(
+            goal_text="",
+            recent_events=[],
+            steps=[],
+            current_phase="IMPLEMENTATION_TASK_PROGRESS:unittest_failed_needs_fix",
+            user_message=user_message,
+            suppress_frame_operations=True,
+        )
+
+        self.assertIn("implementation task progress gate が未完了", prompt)
+        self.assertIn("allowed_next_actions", prompt)
+        self.assertIn("read_file once / targeted edit / unittest再実行", prompt)
+        self.assertNotIn("run_test なら run_command", prompt)
+
+    def test_failed_unittest_prompt_context_keeps_only_failure_and_latest_reads(self) -> None:
+        runtime = self.runtime()
+        state = {"phase": "unittest_failed_needs_fix"}
+        events = [
+            {"type": "planning_note", "content": "large plan text"},
+            {
+                "type": "tool_result",
+                "tool_name": "write_file",
+                "content": json.dumps({"ok": True, "path": "solver.py", "content": "X" * 5000}),
+            },
+            {
+                "type": "tool_result",
+                "tool_name": "run_command",
+                "content": json.dumps(
+                    {
+                        "ok": False,
+                        "command": "python3 -m unittest discover -s tests",
+                        "stderr": "FAILED (failures=1)",
+                    }
+                ),
+            },
+            {
+                "type": "tool_result",
+                "tool_name": "read_file",
+                "content": json.dumps({"ok": True, "path": "solver.py", "content": "def solve():\n    return 1\n"}),
+            },
+        ]
+
+        compact_events = runtime._implementation_task_prompt_events(recent_events=events, state=state)
+        compact_steps_before_read = runtime._implementation_task_prompt_steps(
+            steps=[run_step("python3 -m unittest discover -s tests", ok=False, stderr="FAILED")],
+            state=state,
+        )
+        compact_steps_after_read = runtime._implementation_task_prompt_steps(
+            steps=[
+                run_step("python3 -m unittest discover -s tests", ok=False, stderr="FAILED"),
+                tool_step("read_file", "solver.py", ok=True, content="def solve():\n    return 1\n"),
+            ],
+            state=state,
+        )
+
+        self.assertEqual([event["tool_name"] for event in compact_events], ["run_command", "read_file"])
+        self.assertEqual(compact_steps_before_read, [])
+        self.assertEqual([step["tool_name"] for step in compact_steps_after_read], ["read_file"])
+
+    def test_progress_gate_overrides_plan_revision_after_unittest_material_exists(self) -> None:
+        runtime = self.runtime()
+        state = {
+            "applicable": True,
+            "contract_state": "incomplete",
+            "phase": "unittest_failed_needs_fix",
+            "implementation_paths": ["solver.py"],
+            "test_paths": ["tests/test_solver.py"],
+            "unittest_run": True,
+        }
+
+        self.assertEqual(
+            runtime._implementation_task_effective_phase(fallback_phase="PLAN_REVISION", state=state),
+            "IMPLEMENTATION_TASK_PROGRESS:unittest_failed_needs_fix",
+        )
+        self.assertEqual(
+            runtime._implementation_task_effective_phase(fallback_phase="PLANNING_REQUIRED", state=state),
+            "IMPLEMENTATION_TASK_PROGRESS:unittest_failed_needs_fix",
+        )
+        self.assertEqual(
+            runtime._implementation_task_effective_phase(
+                fallback_phase="PLANNING_REQUIRED",
+                state={
+                    "applicable": True,
+                    "contract_state": "incomplete",
+                    "phase": "implementation_missing",
+                    "implementation_paths": [],
+                    "test_paths": [],
+                    "unittest_run": False,
+                },
+            ),
+            "PLANNING_REQUIRED",
+        )
 
     def test_placeholder_phase_blocks_huge_replace_text_and_allows_write_file(self) -> None:
         runtime = self.runtime()
@@ -294,6 +766,76 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIn("normalize_name", "\n".join(issue["placeholder_markers"]))
         self.assertIn("全callable", issue["suggested_fix"])
 
+    def test_completion_recovery_does_not_run_unittest_while_placeholder_blocks_progress(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで normalize_name(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def normalize_name(value):\n    pass\n"
+        test = (
+            "import unittest\nfrom name_tools import normalize_name\n\n"
+            "class TestNameTools(unittest.TestCase):\n"
+            "    def test_normalize_name(self):\n"
+            "        self.assertEqual(normalize_name(' Alice '), 'alice')\n"
+        )
+        steps = [
+            tool_step("write_file", "name_tools.py", content=impl),
+            tool_step("write_file", "tests/test_name_tools.py", content=test),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "implementation_present_but_placeholder")
+
+        recovery = runtime._completion_contract_recovery_action(
+            session_id="main",
+            user_message=message,
+            steps=steps,
+            step_index=2,
+            max_steps=4,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertIsNone(recovery)
+
+    def test_completion_recovery_runs_unittest_only_when_progress_surface_allows_it(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで normalize_name(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def normalize_name(value):\n    return str(value).strip().lower()\n"
+        test = (
+            "import unittest\nfrom name_tools import normalize_name\n\n"
+            "class TestNameTools(unittest.TestCase):\n"
+            "    def test_normalize_name(self):\n"
+            "        self.assertEqual(normalize_name(' Alice '), 'alice')\n"
+        )
+        steps = [
+            tool_step("write_file", "name_tools.py", content=impl),
+            tool_step("write_file", "tests/test_name_tools.py", content=test),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "unittest_not_run")
+
+        recovery = runtime._completion_contract_recovery_action(
+            session_id="main",
+            user_message=message,
+            steps=steps,
+            step_index=2,
+            max_steps=4,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertIsNotNone(recovery)
+        assert recovery is not None
+        self.assertEqual(recovery["reason_code"], "completion_contract_unittest_recovery")
+
     def test_initial_semantic_revision_prompt_requires_full_non_stub_implementation(self) -> None:
         runtime = self.runtime()
         prompt = runtime._implementation_task_progress_prompt(
@@ -349,6 +891,61 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIn("stats_report", issue_text)
         self.assertNotIn("item_id", issue_text)
         self.assertNotIn("feature_id", issue_text)
+
+    def test_requested_public_functions_ignore_runtime_tool_names(self) -> None:
+        runtime = self.runtime()
+        message = (
+            "Pythonで15パズルを実装してください。read_file は必要最小限にし、"
+            "次は replace_text または write_file で修正し、run_command でunittestを実行してください。"
+            "solve(start, goal) と create_near_goal_fixture(goal, moves) は公開APIです。"
+        )
+
+        requested = runtime._requested_top_level_function_names(message)
+
+        self.assertIn("solve", requested)
+        self.assertIn("create_near_goal_fixture", requested)
+        self.assertNotIn("read_file", requested)
+        self.assertNotIn("replace_text", requested)
+        self.assertNotIn("write_file", requested)
+        self.assertNotIn("run_command", requested)
+
+    def test_requested_public_functions_ignore_formula_helper_calls(self) -> None:
+        runtime = self.runtime()
+        message = (
+            "Pythonで汎用状態探索ライブラリを作成してください。"
+            "公開APIは solve(start, goal), final_verifier(start, goal, actions), "
+            "solvability_check(start, goal) です。"
+            "重要: solvability_checkは ((inversions(start) + blank_row_from_bottom(start)) % 2) "
+            "== ((inversions(goal) + blank_row_from_bottom(goal)) % 2) で判定してください。"
+            "blank_row_from_bottomは下から1始まりです。"
+        )
+
+        requested = runtime._requested_top_level_function_names(message)
+
+        self.assertEqual(requested, ["solve", "final_verifier", "solvability_check"])
+        self.assertNotIn("inversions", requested)
+        self.assertNotIn("blank_row_from_bottom", requested)
+
+    def test_mutating_caller_owned_input_contract_is_parameter_name_generic(self) -> None:
+        runtime = self.runtime()
+        message = (
+            "Pythonで choose_options(data) を実装してください。"
+            "入力は dict[str, set[str]] で、caller-owned input を壊さないでください。"
+        )
+        source = (
+            "def choose_options(data):\n"
+            "    alias = data\n"
+            "    alias.pop('seen', None)\n"
+            "    return []\n"
+        )
+
+        issue = runtime._python_source_mutates_requested_input_collections(
+            user_message=message,
+            source=source,
+        )
+
+        self.assertIn("caller-owned public API 入力", issue)
+        self.assertNotIn("rows", issue)
 
     def test_requested_public_functions_must_be_exercised_directly_by_tests(self) -> None:
         runtime = self.runtime()
@@ -612,6 +1209,157 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertEqual(blocked["reason_code"], "implementation_task_phase_requires_tests")
+
+    def test_observed_unittest_missing_tests_artifact_becomes_generic_tests_missing(self) -> None:
+        runtime = self.runtime()
+        message = "１５パズルのプログラムを作り、それを実行して自分でクリアしてみて"
+        impl = (
+            "import random\n\n"
+            "class Puzzle15:\n"
+            "    def solve(self):\n"
+            "        while True:\n"
+            "            input('Press Enter')\n"
+        )
+        stderr = (
+            "Traceback (most recent call last):\n"
+            "  File \"<frozen runpy>\", line 198, in _run_module_as_main\n"
+            "  File \"/opt/homebrew/lib/python3.14/unittest/loader.py\", line 334, in discover\n"
+            "    raise ImportError('Start directory is not importable: %r' % start_dir)\n"
+            "ImportError: Start directory is not importable: 'tests'\n"
+        )
+        steps = [
+            tool_step("write_file", "src/puzzle15.py", content=impl),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "src/puzzle15.py", content=impl),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["applicable"])
+        self.assertEqual(state["phase"], "tests_missing")
+        self.assertEqual(state["latest_unittest_failure_type"], "missing_tests_artifact")
+        self.assertEqual(state["allowed_next_actions"], ["write_file tests/test_*.py"])
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("tests ディレクトリ未作成", prompt)
+        self.assertIn("tests/test_*.py", prompt)
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "src/puzzle15.py", "content": impl},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(blocked["reason_code"], "implementation_task_phase_requires_tests")
+        self.assertEqual(blocked["allowed_next_actions"], ["write_file tests/test_*.py"])
+
+    def test_root_level_test_file_does_not_satisfy_discover_contract(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、unittestも作ってください。"
+        impl = "def add_one(value):\n    return value + 1\n"
+        test = (
+            "import unittest\n"
+            "from math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "test_math_tools.py", content=test),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_missing")
+        self.assertEqual(state["test_paths"], [])
+        self.assertEqual(state["allowed_next_actions"], ["write_file tests/test_*.py"])
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="run_command",
+            tool_args={"command": "python3 -m unittest test_math_tools -v"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(blocked["reason_code"], "implementation_task_phase_requires_tests")
+        self.assertEqual(blocked["allowed_next_actions"], ["write_file tests/test_*.py"])
+
+    def test_unittest_missing_root_test_module_returns_to_tests_missing(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、unittestも作ってください。"
+        impl = "def add_one(value):\n    return value + 1\n"
+        stderr = (
+            "test_math_tools (unittest.loader._FailedTest.test_math_tools) ... ERROR\n\n"
+            "======================================================================\n"
+            "ERROR: test_math_tools (unittest.loader._FailedTest.test_math_tools)\n"
+            "----------------------------------------------------------------------\n"
+            "ImportError: Failed to import test module: test_math_tools\n"
+            "Traceback (most recent call last):\n"
+            "  File \"/opt/homebrew/lib/python3.14/unittest/loader.py\", line 137, in loadTestsFromName\n"
+            "    module = __import__(module_name)\n"
+            "ModuleNotFoundError: No module named 'test_math_tools'\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            run_step("python3 -m unittest test_math_tools -v", ok=False, stderr=stderr),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_missing")
+        self.assertEqual(state["latest_unittest_failure_type"], "missing_tests_artifact")
+        self.assertEqual(state["allowed_next_actions"], ["write_file tests/test_*.py"])
+
+    def test_missing_tests_artifact_after_test_write_allows_unittest_rerun(self) -> None:
+        runtime = self.runtime()
+        message = "１５パズルのプログラムを作り、それを実行して自分でクリアしてみて"
+        impl = "class Puzzle15:\n    pass\n"
+        tests = (
+            "import unittest\n"
+            "from puzzle import Puzzle15\n\n"
+            "class TestPuzzle15(unittest.TestCase):\n"
+            "    def test_constructs(self):\n"
+            "        self.assertIsInstance(Puzzle15(), Puzzle15)\n"
+        )
+        stderr = (
+            "Traceback (most recent call last):\n"
+            "  File \"/opt/homebrew/lib/python3.14/unittest/loader.py\", line 334, in discover\n"
+            "    raise ImportError('Start directory is not importable: %r' % start_dir)\n"
+            "ImportError: Start directory is not importable: 'tests'\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle.py", content=impl),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("write_file", "tests/test_puzzle.py", content=tests),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_not_run")
+        self.assertEqual(state["latest_unittest_failure_type"], "missing_tests_artifact")
+        self.assertEqual(state["allowed_next_actions"], ["run_command python3 -m unittest discover -s tests"])
 
     def test_unittest_not_run_blocks_finish_and_allows_unittest(self) -> None:
         runtime = self.runtime()
@@ -886,6 +1634,8 @@ class GenericRuntimeContractTests(unittest.TestCase):
         stderr = (
             "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
             f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            "    self.assertEqual(add_one(1), 2)\n"
+            "    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\n"
             "AssertionError: 1 != 2\n"
         )
         steps = [
@@ -904,6 +1654,9 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             state["allowed_next_actions"],
             ["read_file tests/test_math_tools.py once", "read_file math_tools.py once"],
+        )
+        self.assertTrue(
+            any("tracebackはtest artifact内のassert失敗" in hint for hint in state["unittest_repair_hints"])
         )
 
         steps_after_reads = [
@@ -943,6 +1696,99 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertEqual(state_after_edit["allowed_next_actions"], ["run_command python3 -m unittest discover -s tests"])
+
+    def test_failed_unittest_after_one_recovery_read_requires_remaining_traceback_read(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "math_tools.py", content=impl),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertEqual(state["failed_unittest_recovery_editable_paths"], ["math_tools.py"])
+        self.assertEqual(state["allowed_next_actions"], ["read_file tests/test_math_tools.py once"])
+
+        blocked_repeat_read = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="read_file",
+            tool_args={"path": "math_tools.py"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_repeat_read["reason_code"],
+            "implementation_task_failed_unittest_read_already_consumed",
+        )
+        self.assertEqual(blocked_repeat_read["allowed_next_actions"], ["read_file tests/test_math_tools.py once"])
+
+        blocked_write = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "math_tools.py", "content": "def add_one(value):\n    return value + 1\n"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_write["reason_code"],
+            "implementation_task_failed_unittest_requires_recovery_read",
+        )
+
+    def test_unittest_output_excerpt_preserves_first_error_and_tail_failure(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで Solver を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "class Solver:\n    pass\n"
+        test = "import unittest\nclass TestSolver(unittest.TestCase):\n    pass\n"
+        stderr = (
+            "ERROR: test_missing_api (tests.TestSolver.test_missing_api)\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_solver.py'}\", line 8, in test_missing_api\n"
+            "    self.assertTrue(self.solver.is_goal_state([]))\n"
+            "AttributeError: 'Solver' object has no attribute 'is_goal_state'\n"
+            + ("filler line\n" * 300)
+            + "FAIL: test_expected_value (tests.TestSolver.test_expected_value)\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_solver.py'}\", line 30, in test_expected_value\n"
+            "    self.assertEqual(value, 3)\n"
+            "AssertionError: 0 != 3\n"
+        )
+        steps = [
+            tool_step("write_file", "solver.py", content=impl),
+            tool_step("write_file", "tests/test_solver.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+
+        excerpt = state["latest_unittest_output_excerpt"]
+        self.assertIn("AttributeError", excerpt)
+        self.assertIn("AssertionError: 0 != 3", excerpt)
 
     def test_repeated_same_unittest_failure_after_edit_requires_edit_not_reread(self) -> None:
         runtime = self.runtime()
@@ -987,7 +1833,6 @@ class GenericRuntimeContractTests(unittest.TestCase):
                 "replace_text tests/test_math_tools.py with a small unique old_text",
                 "replace_text math_tools.py with a small unique old_text",
                 "write_file tests/test_math_tools.py",
-                "write_file math_tools.py",
             ],
         )
 
@@ -1006,6 +1851,42 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIn("直前の編集は失敗を減らしていません", prompt)
         self.assertIn("latest_unittest_failure_signature", prompt)
         self.assertIn("math_tools.py", prompt)
+
+    def test_repeated_unittest_signature_ignores_line_number_drift(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで board solver を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "class Board:\n    def __init__(self, board):\n        self.board = board\n"
+        test = "import unittest\nfrom board_solver import Board\n"
+        stderr_first = (
+            "ERROR: test_board (test_board_solver.TestBoard.test_board)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_board_solver.py'}\", line 8, in test_board\n"
+            f"  File \"{runtime.execution_root / 'board_solver.py'}\", line 19, in _find_blank\n"
+            "TypeError: 'int' object is not subscriptable\n"
+        )
+        stderr_second = (
+            "ERROR: test_board (test_board_solver.TestBoard.test_board)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_board_solver.py'}\", line 9, in test_board\n"
+            f"  File \"{runtime.execution_root / 'board_solver.py'}\", line 21, in _find_blank\n"
+            "TypeError: 'int' object is not subscriptable\n"
+        )
+        steps = [
+            tool_step("write_file", "board_solver.py", content=impl),
+            tool_step("write_file", "tests/test_board_solver.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr_first),
+            tool_step("read_file", "tests/test_board_solver.py", content=test),
+            tool_step("read_file", "board_solver.py", content=impl),
+            tool_step("write_file", "board_solver.py", content=impl + "\n"),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr_second),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["repeated_unittest_failure_signature"])
+        self.assertEqual(state["same_signature_nonreducing_edit_paths"], ["board_solver.py"])
 
     def test_repeated_same_unittest_failure_blocks_noop_write(self) -> None:
         runtime = self.runtime()
@@ -1041,7 +1922,10 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
 
-        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_blocks_noop_write")
+        self.assertEqual(
+            blocked["reason_code"],
+            "implementation_task_failed_unittest_blocks_repeated_full_write_after_nonreducing_signature",
+        )
         self.assertIn("failure signature", blocked["message"])
         self.assertRegex(blocked["latest_unittest_failure_signature"], r"^[0-9a-f]{16}$")
         self.assertEqual(blocked["nonreducing_edit_paths"], ["math_tools.py"])
@@ -1051,7 +1935,6 @@ class GenericRuntimeContractTests(unittest.TestCase):
                 "replace_text tests/test_math_tools.py with a small unique old_text",
                 "replace_text math_tools.py with a small unique old_text",
                 "write_file tests/test_math_tools.py",
-                "write_file math_tools.py",
             ],
         )
 
@@ -1063,7 +1946,11 @@ class GenericRuntimeContractTests(unittest.TestCase):
             session_id="main",
             turn_workspace=runtime.execution_root,
         )
-        self.assertIsNone(changed)
+        self.assertEqual(
+            changed["reason_code"],
+            "implementation_task_failed_unittest_blocks_repeated_full_write_after_nonreducing_signature",
+        )
+        self.assertEqual(changed["nonreducing_edit_paths"], ["math_tools.py"])
 
     def test_failed_unittest_blocks_initial_noop_write_after_reads(self) -> None:
         runtime = self.runtime()
@@ -1137,8 +2024,11 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
 
-        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_blocks_noop_write")
-        self.assertEqual(blocked["nonreducing_reason"], "semantic_noop_ast")
+        self.assertEqual(
+            blocked["reason_code"],
+            "implementation_task_failed_unittest_blocks_repeated_full_write_after_nonreducing_signature",
+        )
+        self.assertEqual(blocked["nonreducing_edit_paths"], ["math_tools.py"])
 
     def test_failed_unittest_after_reads_allows_small_targeted_replace_text(self) -> None:
         runtime = self.runtime()
@@ -1172,6 +2062,206 @@ class GenericRuntimeContractTests(unittest.TestCase):
                 "old_text": "    return value\n",
                 "new_text": "    return value + 1\n",
             },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed)
+
+    def test_successful_edit_after_failed_unittest_allows_unittest_rerun(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        fixed_impl = "def add_one(value):\n    return value + 1\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            f"  File \"{runtime.execution_root / 'math_tools.py'}\", line 2, in add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("read_file", "math_tools.py", content=impl),
+            tool_step("replace_text", "math_tools.py", content=fixed_impl),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertTrue(state["successful_edit_after_failed_unittest"])
+        self.assertEqual(state["allowed_next_actions"], ["run_command python3 -m unittest discover -s tests"])
+
+        allowed = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="run_command",
+            tool_args={"command": "python3 -m unittest discover -s tests"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed)
+
+        blocked_read = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="read_file",
+            tool_args={"path": "math_tools.py"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNotNone(blocked_read)
+        self.assertEqual(
+            blocked_read["reason_code"],
+            "implementation_task_failed_unittest_requires_rerun_after_edit",
+        )
+        self.assertEqual(
+            blocked_read["allowed_next_actions"],
+            ["run_command python3 -m unittest discover -s tests"],
+        )
+        self.assertIn("再実行", blocked_read["message"])
+
+    def test_successful_edit_after_failed_unittest_overrides_remaining_unread_paths(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        fixed_test = test.replace("add_one(1), 2", "add_one(1), 1")
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            f"  File \"{runtime.execution_root / 'math_tools.py'}\", line 2, in add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("replace_text", "tests/test_math_tools.py", content=fixed_test),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        prompt = runtime._implementation_task_progress_prompt(state)
+
+        self.assertTrue(state["successful_edit_after_failed_unittest"])
+        self.assertIn("math_tools.py", state["failed_unittest_recovery_read_paths"])
+        self.assertEqual(state["allowed_next_actions"], ["run_command python3 -m unittest discover -s tests"])
+        self.assertEqual(runtime._implementation_task_schema_tool_names(state), ["run_command"])
+        self.assertIn("成功編集後の唯一の次アクション", prompt)
+        self.assertIn("run_command python3 -m unittest discover -s tests", prompt)
+
+    def test_external_audit_required_allows_repeated_unittest_command(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value + 1\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        command = "python3 -m unittest discover -s tests"
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step(command, ok=True, stderr=".\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nOK\n"),
+        ]
+        tool_args = {"command": command}
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "external_audit_required")
+        self.assertIsNotNone(runtime._redundant_command_reason(tool_args=tool_args, steps=steps))
+        self.assertTrue(
+            runtime._implementation_progress_allows_repeated_command(
+                user_message=message,
+                tool_args=tool_args,
+                steps=steps,
+                session_id="main",
+                turn_workspace=runtime.execution_root,
+            )
+        )
+
+    def test_no_op_replace_after_failed_unittest_forces_write_file_repair(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            f"  File \"{runtime.execution_root / 'math_tools.py'}\", line 2, in add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("read_file", "math_tools.py", content=impl),
+            tool_step("replace_text", "math_tools.py", ok=False, failure_type="no_op_edit"),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            set(state["failed_unittest_no_match_write_only_paths"]),
+            {"tests/test_math_tools.py", "math_tools.py"},
+        )
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="replace_text",
+            tool_args={"path": "math_tools.py", "old_text": "return value", "new_text": "return value"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_requires_write_after_no_match")
+        self.assertEqual(
+            set(blocked["allowed_next_actions"]),
+            {"write_file tests/test_math_tools.py", "write_file math_tools.py"},
+        )
+
+        allowed = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "math_tools.py", "content": "def add_one(value):\n    return value + 1\n"},
             steps=steps,
             session_id="main",
             turn_workspace=runtime.execution_root,
@@ -1215,6 +2305,15 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_blocks_unmatched_replace_text")
+        self.assertIn("current_source_excerpt", blocked)
+        self.assertIn("def add_one(value):", blocked["current_source_excerpt"])
+        self.assertIn("return value", blocked["current_source_excerpt"])
+        visible_message = (
+            f"replace_text がブロックされました: {blocked['message']}"
+            "\ncurrent_source_excerpt for the next exact old_text:\n"
+            + blocked["current_source_excerpt"]
+        )
+        self.assertIn("current_source_excerpt for the next exact old_text", visible_message)
         self.assertEqual(
             blocked["allowed_next_actions"],
             [
@@ -1224,6 +2323,191 @@ class GenericRuntimeContractTests(unittest.TestCase):
                 "write_file math_tools.py",
             ],
         )
+
+    def test_failed_unittest_blocks_block_header_only_replace_text(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("read_file", "math_tools.py", content=impl),
+        ]
+        (runtime.execution_root / "math_tools.py").write_text(impl, encoding="utf-8")
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="replace_text",
+            tool_args={
+                "path": "math_tools.py",
+                "old_text": "def add_one(value):",
+                "new_text": "def add_one(value):\n    return value + 1\n",
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_blocks_block_header_replace_text")
+        self.assertEqual(blocked["exact_old_text_matches"], 1)
+        self.assertTrue(blocked["block_header_only_replace"])
+        self.assertEqual(blocked["allowed_next_actions"], ["write_file math_tools.py"])
+        self.assertIn("ブロックヘッダ1行だけ", blocked["message"])
+
+    def test_failed_unittest_after_block_header_replace_allows_write_only_next(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "math_tools.py", content=impl),
+        ]
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_block_header_replace_text",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_block_header_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "math_tools.py",
+                },
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertEqual(state["failed_unittest_no_match_write_only_paths"], ["math_tools.py"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            ["read_file tests/test_math_tools.py once"],
+        )
+
+    def test_failed_unittest_import_error_targets_missing_export_repair(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonでパズルsolverを実装し、tests/ にunittestを追加して検証してください。"
+        impl = "goal_state = [1, 2, 3, 0]\n\ndef solve():\n    return goal_state\n"
+        test = (
+            "import unittest\n"
+            "from puzzle import GOAL_STATE, solve\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def test_solve(self):\n"
+            "        self.assertEqual(solve(), GOAL_STATE)\n"
+        )
+        test_path = runtime.execution_root / "tests" / "test_puzzle.py"
+        stderr = (
+            "E\n"
+            "======================================================================\n"
+            "ERROR: test_puzzle (unittest.loader._FailedTest.test_puzzle)\n"
+            "----------------------------------------------------------------------\n"
+            "ImportError: Failed to import test module: test_puzzle\n"
+            "Traceback (most recent call last):\n"
+            f"  File \"{test_path}\", line 2, in <module>\n"
+            "    from puzzle import GOAL_STATE, solve\n"
+            "ImportError: cannot import name 'GOAL_STATE' from 'puzzle' "
+            f"({runtime.execution_root / 'puzzle.py'})\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle.py", content=impl),
+            tool_step("write_file", "tests/test_puzzle.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "puzzle.py", content=impl),
+        ]
+        (runtime.execution_root / "puzzle.py").write_text(impl, encoding="utf-8")
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["failed_unittest_recovery_read_paths"], ["puzzle.py"])
+        self.assertEqual(state["failed_unittest_recovery_read_consumed_paths"], ["puzzle.py"])
+        self.assertEqual(
+            state["allowed_next_actions"],
+            ["replace_text puzzle.py with a small unique old_text", "write_file puzzle.py"],
+        )
+        self.assertEqual(
+            state["latest_unittest_missing_import"],
+            {"name": "GOAL_STATE", "module": "puzzle", "source_file": "test_puzzle.py", "source_line": "2"},
+        )
+        self.assertTrue(
+            any("GOAL_STATE" in hint and "module-level export" in hint for hint in state["unittest_repair_hints"])
+        )
+
+        blocked_read = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="read_file",
+            tool_args={"path": "puzzle.py"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(blocked_read["reason_code"], "implementation_task_failed_unittest_read_already_consumed")
+        self.assertNotIn("read_file puzzle.py once", blocked_read["allowed_next_actions"])
+
+        broad_write = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "puzzle.py", "content": impl + ("\n# filler\n" * 200)},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            broad_write["reason_code"],
+            "implementation_task_failed_unittest_blocks_broad_write_for_import_error",
+        )
+        self.assertEqual(broad_write["allowed_next_actions"], ["replace_text puzzle.py with a small unique old_text"])
+
+        targeted_replace = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="replace_text",
+            tool_args={
+                "path": "puzzle.py",
+                "old_text": "goal_state = [1, 2, 3, 0]",
+                "new_text": "GOAL_STATE = [1, 2, 3, 0]\ngoal_state = GOAL_STATE",
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(targeted_replace)
 
     def test_failed_unittest_after_reads_blocks_broad_replace_text(self) -> None:
         runtime = self.runtime()
@@ -1501,6 +2785,27 @@ class GenericRuntimeContractTests(unittest.TestCase):
 
         ok = runtime.tools.execute("write_file", {"path": "math_tools.py", "content": "def add_one(value):\n    return value\n"})
         self.assertTrue(ok["ok"])
+        before = (runtime.tools.root / "math_tools.py").read_text(encoding="utf-8")
+        no_op_write_result = runtime.tools.execute(
+            "write_file",
+            {"path": "math_tools.py", "content": before},
+        )
+        self.assertFalse(no_op_write_result["ok"])
+        self.assertEqual(no_op_write_result["failure_type"], "no_op_edit")
+        self.assertEqual(no_op_write_result["blocked_by"], "runtime_edit_validation")
+        self.assertIn("next_required_action", no_op_write_result)
+        self.assertEqual((runtime.tools.root / "math_tools.py").read_text(encoding="utf-8"), before)
+
+        no_op_result = runtime.tools.execute(
+            "replace_text",
+            {"path": "math_tools.py", "old_text": "return value", "new_text": "return value"},
+        )
+        self.assertFalse(no_op_result["ok"])
+        self.assertEqual(no_op_result["failure_type"], "no_op_edit")
+        self.assertEqual(no_op_result["blocked_by"], "runtime_edit_validation")
+        self.assertIn("next_required_action", no_op_result)
+        self.assertEqual((runtime.tools.root / "math_tools.py").read_text(encoding="utf-8"), before)
+
         replace_result = runtime.tools.execute(
             "replace_text",
             {"path": "math_tools.py", "old_text": "return missing", "new_text": "return value + 1"},
@@ -2017,6 +3322,41 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIn("write_file math_tools.py", prompt)
         self.assertIn("write_file corrected implementation", prompt)
 
+    def test_planner_action_blocked_prompt_preserves_workunit_shape_hint(self) -> None:
+        runtime = self.runtime()
+        event = {
+            "type": "system_note",
+            "role": "system",
+            "content": "create_plan was blocked because PlanRecord is invalid",
+            "code": "planner_action_blocked",
+            "reason_code": "plan_record_invalid",
+            "details": {
+                "blocked_tool": "create_plan",
+                "failure_type": "plan_record_invalid",
+                "blocked_by": "planner_contract",
+                "allowed_next_actions": ["create_plan"],
+                "expected_shape": (
+                    "Expected create_plan shape. Do not put WorkUnit fields such as goal, work_type, "
+                    "success_evidence, should_open_child_frame, why_not_direct_action, context_summary, "
+                    "or done_when inside first_action. first_action may contain only tool and args."
+                ),
+                "suggested_fix": "Repair the PlanRecord schema exactly.",
+                "next_required_action": "retry create_plan with a valid PlanRecord",
+            },
+        }
+
+        prompt = runtime._build_prompt(
+            goal_text="",
+            recent_events=[event],
+            steps=[],
+            current_phase="PLAN_REVISION",
+            user_message="4x4 sliding puzzle を状態空間探索で解く実装を作ってください。",
+        )
+
+        self.assertIn("PlanRecord正本", prompt)
+        self.assertIn("Do not put WorkUnit fields", prompt)
+        self.assertIn("first_action may contain only tool and args", prompt)
+
     def test_first_action_required_prompt_preserves_expected_tool_call(self) -> None:
         runtime = self.runtime()
         event = {
@@ -2142,6 +3482,3276 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertIn("allowed_next_actions", return_details)
         self.assertIn("next_required_action", return_details)
 
+    def test_problem_profile_selects_state_space_search_for_puzzle_like_request(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を、状態、合法手、ゴール、探索方針で解くPython実装を作ってください。"
+
+        profile = runtime._planning_profile_for_message(user_message)
+        phase = runtime._current_phase(user_message=user_message, steps=[], recent_events=[])
+
+        self.assertEqual(profile["strategy"], "state_space_search")
+        self.assertEqual(phase, "PLANNING_REQUIRED")
+
+    def test_problem_profile_prefers_explicit_dynamic_programming_over_weak_scheduling_word(self) -> None:
+        runtime = self.runtime()
+        user_message = (
+            "Pythonで weighted interval scheduling を解く実装とunittestを作ってください。"
+            "動的計画法で、部分問題、基底ケース、漸化式を検証してください。"
+        )
+
+        profile = runtime._planning_profile_for_message(user_message)
+
+        self.assertEqual(profile["strategy"], "dynamic_programming")
+        self.assertIn("dynamic_programming:動的計画", profile["signals"])
+        self.assertIn("constraint_weak:scheduling", profile["signals"])
+
+    def test_stale_plan_record_before_latest_user_message_does_not_bypass_planning_required(self) -> None:
+        runtime = self.runtime()
+        old_message = "古い状態空間探索タスクを作ってください。"
+        new_message = "4x4 sliding puzzle を、状態、合法手、ゴール、探索方針で解くPython実装を作ってください。"
+        runtime._append_session_event(
+            "main",
+            {"type": "user_message", "role": "user", "content": old_message},
+        )
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "plan_record",
+                "role": "system",
+                "plan": self.state_space_plan(runtime, old_message),
+            },
+        )
+        runtime._append_session_event(
+            "main",
+            {"type": "user_message", "role": "user", "content": new_message},
+        )
+        recent_events = read_jsonl(runtime.paths.session_events_path("main"))
+
+        phase = runtime._current_phase(
+            user_message=new_message,
+            steps=[],
+            recent_events=recent_events,
+        )
+
+        self.assertEqual(phase, "PLANNING_REQUIRED")
+        blocked = runtime._planner_action_blocked_event(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            user_message=new_message,
+            current_phase=phase,
+            recent_events=recent_events,
+            steps=[],
+        )
+        self.assertIsNotNone(blocked)
+        assert blocked is not None
+        self.assertEqual(blocked["reason_code"], "planning_required_before_execution")
+
+    def test_create_plan_rejects_edit_work_unit_noop_run_command_first_action(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を、状態、合法手、ゴール、探索方針で解くPython実装を作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"][0]["first_action"] = {
+            "tool": "run_command",
+            "args": {"command": "echo 'Implementing solver'"},
+        }
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "edit WorkUnit first_action must not be a no-op run_command",
+            result["event"]["content"],
+        )
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertFalse(any(event.get("type") == "plan_record" for event in events))
+
+    def test_planning_execution_request_uses_verified_implementation_step_budget(self) -> None:
+        runtime = self.runtime()
+        runtime.runtime_config["verified_implementation_max_steps"] = 32
+        runtime.runtime_config["planned_implementation_max_steps"] = 48
+
+        budget = runtime._effective_max_steps_per_message(
+            user_message="１５パズルのプログラムを作り、それを実行して自分でクリアしてみて",
+            configured=12,
+        )
+
+        self.assertEqual(budget, 48)
+
+    def test_non_planning_implementation_request_uses_verified_budget(self) -> None:
+        runtime = self.runtime()
+        runtime.runtime_config["verified_implementation_max_steps"] = 32
+        runtime.runtime_config["planned_implementation_max_steps"] = 48
+
+        budget = runtime._effective_max_steps_per_message(
+            user_message="Pythonで add_one(value) を実装し、unittestで検証してください。",
+            configured=12,
+        )
+
+        self.assertEqual(budget, 32)
+
+    def test_simple_one_file_implementation_does_not_require_planning_record(self) -> None:
+        runtime = self.runtime()
+
+        phase = runtime._current_phase(
+            user_message="Pythonで add_one(value) を実装してください。",
+            steps=[],
+            recent_events=[],
+        )
+
+        self.assertNotEqual(phase, "PLANNING_REQUIRED")
+
+    def test_state_space_search_plan_requires_verification_contract(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態空間探索で解く実装を作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        del plan["verification_contract"]["final_verifier"]
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        event = result["event"]
+        self.assertEqual(event["code"], "planner_action_blocked")
+        self.assertEqual(event["details"]["failure_type"], "state_space_search_plan_missing_verifier")
+        self.assertIn("final_verifier", "\n".join(event["details"]["issues"]))
+        self.assertEqual(event["details"]["allowed_next_actions"], ["create_plan"])
+        self.assertIn("Expected create_plan shape", event["details"]["suggested_fix"])
+        self.assertIn("Do not put WorkUnit fields", event["content"])
+
+    def test_state_space_plan_strategy_mismatch_is_rejected_before_plan_record(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態空間探索で解く実装を作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["strategy"] = "task_decomposition"
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["event"]["details"]["failure_type"], "planner_strategy_mismatch")
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertFalse(any(event.get("type") == "plan_record" for event in events))
+
+    def test_state_space_plan_requires_execution_verifier_work_unit(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態空間探索で解く実装を作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"][1]["goal"] = "Verify the implementation works correctly."
+        plan["work_units"][1]["success_evidence"] = "tests pass"
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["event"]["details"]["failure_type"], "state_space_search_plan_missing_execution_verifier")
+        self.assertIn("legal action replay", "\n".join(result["event"]["details"]["issues"]))
+        self.assertIn("run_test WorkUnit", result["event"]["details"]["suggested_fix"])
+        self.assertIn("implement-artifact", result["event"]["details"]["suggested_fix"])
+        self.assertIn("verify-legal-replay", result["event"]["details"]["suggested_fix"])
+
+    def test_dynamic_programming_plan_requires_verification_contract(self) -> None:
+        runtime = self.runtime()
+        user_message = "動的計画で部分問題、基底ケース、漸化式を使うPython実装を作ってください。"
+        profile = runtime._planning_profile_for_message(user_message)
+        self.assertEqual(profile["strategy"], "dynamic_programming")
+        self.assertEqual(runtime._current_phase(user_message=user_message, steps=[], recent_events=[]), "PLANNING_REQUIRED")
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        del plan["verification_contract"]["recurrence_verifier"]
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["event"]["details"]["failure_type"], "dynamic_programming_plan_missing_verifier")
+        self.assertIn("recurrence_verifier", "\n".join(result["event"]["details"]["issues"]))
+        self.assertIn("For dynamic_programming", result["event"]["details"]["suggested_fix"])
+
+    def test_constraint_satisfaction_plan_requires_negative_validator_work_unit(self) -> None:
+        runtime = self.runtime()
+        user_message = "制約、変数、ドメイン、割当を使うPython実装を作ってください。"
+        profile = runtime._planning_profile_for_message(user_message)
+        self.assertEqual(profile["strategy"], "constraint_satisfaction")
+        plan = self.constraint_satisfaction_plan(runtime, user_message)
+        plan["work_units"][1]["goal"] = "Run tests for the implementation."
+        plan["work_units"][1]["success_evidence"] = "tests pass"
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["event"]["details"]["failure_type"], "constraint_satisfaction_plan_missing_execution_verifier")
+        issues = "\n".join(result["event"]["details"]["issues"])
+        self.assertIn("invalid/negative assignment", issues)
+        self.assertIn("For constraint_satisfaction", result["event"]["details"]["suggested_fix"])
+
+    def test_create_plan_rejects_direct_python_script_as_run_test_first_action(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"][1]["first_action"] = {
+            "tool": "run_command",
+            "args": {"command": "python puzzle_solver.py"},
+        }
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        issues = "\n".join(result["event"]["details"]["issues"])
+        self.assertIn("non-interactive verification command", issues)
+        self.assertIn("do not use direct `python script.py`", issues)
+
+    def test_create_plan_rejects_unittest_module_run_as_run_test_first_action(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"][1]["first_action"] = {
+            "tool": "run_command",
+            "args": {"command": "python3 -m unittest test_puzzle15 -v"},
+        }
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        issues = "\n".join(result["event"]["details"]["issues"])
+        self.assertIn("python3 -m unittest discover -s tests", issues)
+
+    def test_create_plan_rejects_embedded_edit_first_actions_before_plan_record(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態空間探索で解く実装を作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"][0] = {
+            "unit_id": "implementation",
+            "goal": "Write the puzzle implementation.",
+            "depends_on": [],
+            "work_type": "edit",
+            "first_action": {
+                "tool": "write_file",
+                "args": {"path": "fifteen_puzzle.py", "content": "class FifteenPuzzle:\n    pass\n"},
+            },
+            "success_evidence": "Implementation file exists.",
+            "should_open_child_frame": True,
+        }
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["event"]["details"]["failure_type"], "plan_work_unit_embedded_edit")
+        self.assertIn("write_file", "\n".join(result["event"]["details"]["issues"]))
+        self.assertIn("PLAN_EXECUTION", result["event"]["details"]["suggested_fix"])
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertFalse(any(event.get("type") == "plan_record_normalized" for event in events))
+        self.assertFalse(any(event.get("type") == "plan_record" for event in events))
+
+    def test_create_plan_rejects_inspect_only_plan_for_implementation_request(self) -> None:
+        runtime = self.runtime()
+        user_message = "15パズルのプログラムを作って実行してください。"
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"][0]["work_type"] = "inspect"
+        plan["work_units"][0]["goal"] = "Inspect the puzzle state space before doing implementation."
+        plan["work_units"][0]["success_evidence"] = "State-space notes are available."
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["event"]["details"]["failure_type"], "plan_scope_incomplete")
+        self.assertIn("work_type=edit", "\n".join(result["event"]["details"]["issues"]))
+        self.assertIn("implement-artifact", result["event"]["details"]["suggested_fix"])
+        self.assertIn("verify-legal-replay", result["event"]["details"]["suggested_fix"])
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertFalse(any(event.get("type") == "plan_record" for event in events))
+
+    def test_repeated_repairable_planner_failure_autorepairs_minimal_state_space_plan(self) -> None:
+        runtime = self.runtime()
+        user_message = "15パズルのプログラムを作って実行してください。"
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": "previous planner block",
+                "code": "planner_action_blocked",
+                "reason_code": "state_space_search_plan_missing_execution_verifier",
+                "details": {"failure_type": "state_space_search_plan_missing_execution_verifier"},
+            },
+        )
+        for index in range(400):
+            runtime._append_session_event(
+                "main",
+                {
+                    "type": "runtime_event",
+                    "role": "system",
+                    "content": f"stream chunk {index}",
+                    "phase": "PLAN_REVISION",
+                },
+            )
+        plan = self.state_space_plan(runtime, user_message)
+        plan["work_units"] = [
+            {
+                "unit_id": "inspect-only",
+                "goal": "Inspect the problem",
+                "depends_on": [],
+                "work_type": "inspect",
+                "first_action": {"tool": "list_files", "args": {"path": "."}},
+                "success_evidence": "workspace inspected",
+                "should_open_child_frame": True,
+            },
+            {
+                "unit_id": "verify-solution",
+                "goal": "Verify that it works correctly",
+                "depends_on": ["inspect-only"],
+                "work_type": "run_test",
+                "first_action": {"tool": "run_command", "args": {"command": "python 15_puzzle.py"}},
+                "success_evidence": "program works correctly",
+                "should_open_child_frame": True,
+            },
+        ]
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        unit_ids = [task["task_id"] for task in result["tasks"]]
+        self.assertEqual(unit_ids, ["inspect-workspace", "implement-artifact", "verify-legal-replay"])
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertTrue(any(event.get("code") == "plan_record_autorepaired" for event in events))
+        plan_events = [event for event in events if event.get("type") == "plan_record"]
+        self.assertTrue(plan_events)
+        accepted_units = plan_events[-1]["plan"]["work_units"]
+        self.assertEqual(accepted_units[-1]["first_action"]["args"]["command"], "python3 -m unittest discover -s tests")
+
+    def test_repeated_dynamic_programming_planner_failure_autorepairs_minimal_dp_plan(self) -> None:
+        runtime = self.runtime()
+        user_message = (
+            "Pythonで weighted interval scheduling を解く実装とunittestを作ってください。"
+            "動的計画法で、部分問題、基底ケース、漸化式を検証してください。"
+        )
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": "previous planner block",
+                "code": "planner_action_blocked",
+                "reason_code": "dynamic_programming_plan_missing_execution_verifier",
+                "details": {"failure_type": "dynamic_programming_plan_missing_execution_verifier"},
+            },
+        )
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        plan["work_units"] = [
+            {
+                "unit_id": "inspect-only",
+                "goal": "Inspect the problem",
+                "depends_on": [],
+                "work_type": "inspect",
+                "first_action": {"tool": "list_files", "args": {"path": "."}},
+                "success_evidence": "workspace inspected",
+                "should_open_child_frame": True,
+            },
+            {
+                "unit_id": "verify-vague",
+                "goal": "Verify that it works correctly",
+                "depends_on": ["inspect-only"],
+                "work_type": "run_test",
+                "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                "success_evidence": "tests pass",
+                "should_open_child_frame": True,
+            },
+        ]
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertTrue(any(event.get("code") == "plan_record_autorepaired" for event in events))
+        accepted_plan = [event for event in events if event.get("type") == "plan_record"][-1]["plan"]
+        self.assertEqual(accepted_plan["strategy"], "dynamic_programming")
+        unit_ids = [unit["unit_id"] for unit in accepted_plan["work_units"]]
+        self.assertEqual(unit_ids, ["inspect-workspace", "implement-artifact", "verify-dynamic-programming-contract"])
+        self.assertEqual(accepted_plan["verification_contract"], [
+            "subproblem_state",
+            "base_case_verifier",
+            "recurrence_verifier",
+            "evaluation_order_or_memoization",
+            "sample_oracle",
+        ])
+
+    def test_planning_required_blocks_direct_write_and_allows_create_plan(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。"
+        phase = runtime._current_phase(user_message=user_message, steps=[], recent_events=[])
+
+        blocked = runtime._planner_action_blocked_event(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            user_message=user_message,
+            current_phase=phase,
+            recent_events=[],
+            steps=[],
+        )
+        allowed = runtime._planner_action_blocked_event(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=2,
+            turn_workspace=runtime.execution_root,
+            tool_name="create_plan",
+            user_message=user_message,
+            current_phase=phase,
+            recent_events=[],
+            steps=[],
+        )
+
+        self.assertIsNotNone(blocked)
+        assert blocked is not None
+        self.assertEqual(blocked["details"]["blocked_by"], "planner_controller")
+        self.assertEqual(blocked["details"]["failure_type"], "planning_required_before_execution")
+        self.assertEqual(blocked["details"]["allowed_next_actions"], ["create_plan"])
+        self.assertIsNone(allowed)
+
+    def test_planning_required_phase_is_not_overwritten_by_implementation_progress(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=[],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        phase = runtime._implementation_task_effective_phase(
+            fallback_phase="PLANNING_REQUIRED",
+            state=state,
+        )
+
+        self.assertEqual(phase, "PLANNING_REQUIRED")
+
+    def test_accepted_create_plan_records_plan_and_task_plan_events(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["tasks"][0]["first_action"], {"tool": "list_files", "args": {"path": "."}})
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        event_types = [event.get("type") for event in events]
+        self.assertIn("problem_profile", event_types)
+        self.assertIn("planner_decision", event_types)
+        self.assertIn("plan_record", event_types)
+        self.assertIn("task_plan", event_types)
+        self.assertIn("frame_opened", event_types)
+        self.assertTrue(any(event.get("type") == "tool_result" and event.get("tool_name") == "list_files" for event in events))
+
+    def test_create_plan_rejects_unchanged_revised_plan_after_timeout(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        first = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(first["ok"], first.get("error"))
+        steps = [
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="Timed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            )
+        ]
+
+        second = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=2,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            steps=steps,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(second["ok"])
+        event = second["event"]
+        self.assertEqual(event["reason_code"], "plan_revision_no_change")
+        self.assertIn("Do not resubmit the same PlanRecord", event["details"]["suggested_fix"])
+
+    def test_create_plan_rejects_revision_that_only_changes_dependencies_after_timeout(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        first = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(first["ok"], first.get("error"))
+        revised_plan = json.loads(json.dumps(plan))
+        revised_plan["revision_count"] = 1
+        revised_plan["work_units"][1]["depends_on"] = []
+        revised_plan["work_units"][1]["should_open_child_frame"] = False
+        steps = [
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="Timed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            )
+        ]
+
+        second = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=2,
+            tool_args={"plan": revised_plan},
+            turn_workspace=runtime.execution_root,
+            steps=steps,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["event"]["reason_code"], "plan_revision_no_change")
+
+    def test_revised_create_plan_from_child_frame_returns_to_root_before_decompose(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        first = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(first["ok"], first.get("error"))
+        self.assertIsNotNone(runtime.frame_manager.current_frame())
+        self.assertEqual(runtime.frame_manager.current_frame().depth, 1)
+
+        revised_plan = json.loads(json.dumps(plan))
+        revised_plan["revision_count"] = 1
+        revised_plan["work_units"][0]["goal"] = "Narrow timed-out state-space tests to deterministic near-goal fixtures before rerunning validation."
+        revised_plan["work_units"][0]["success_evidence"] = "Timed-out tests are replaced with deterministic near-goal replay checks."
+        steps = [
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="Timed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            )
+        ]
+
+        second = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=2,
+            tool_args={"plan": revised_plan},
+            turn_workspace=runtime.execution_root,
+            steps=steps,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertTrue(second["ok"], second.get("error"))
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertTrue(any(event.get("code") == "plan_revision_returned_to_root" for event in events))
+        self.assertFalse(any(event.get("code") == "decompose_tasks_blocked" for event in events))
+
+    def test_plan_record_obligations_are_visible_to_implementation_progress_prompt(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        for index in range(400):
+            runtime._append_session_event(
+                "main",
+                {
+                    "type": "runtime_event",
+                    "role": "system",
+                    "content": f"stream chunk {index}",
+                    "phase": "PLAN_EXECUTION",
+                },
+            )
+
+        steps = [
+            tool_step(
+                "write_file",
+                "puzzle_solver.py",
+                content="def solve(start, goal):\n    return []\n",
+            )
+        ]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        prompt = runtime._implementation_task_progress_prompt(state)
+
+        self.assertEqual(state["plan_strategy"], "state_space_search")
+        self.assertIn("programmatic solver/search path", prompt)
+        self.assertIn("manual input loop alone does not satisfy", prompt)
+        self.assertIn("final_verifier/tests must replay", prompt)
+        self.assertIn("legal-move validator", prompt)
+
+    def test_plan_record_context_survives_large_event_stream_history(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        for index in range(5100):
+            runtime._append_session_event(
+                "main",
+                {
+                    "type": "runtime_event",
+                    "role": "system",
+                    "event_name": "llm_stream_chunk",
+                    "content": f"stream chunk {index}",
+                    "phase": "PLAN_EXECUTION",
+                },
+            )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=[tool_step("write_file", "puzzle_solver.py", content="def solve(start, goal):\n    return []\n")],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["plan_strategy"], "state_space_search")
+        self.assertEqual(runtime._plan_record_execution_context()["plan_strategy"], "state_space_search")
+        self.assertNotEqual(state["phase"], "not_applicable")
+
+    def test_state_space_plan_blocks_manual_ui_only_implementation_before_tests(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        manual_ui_source = (
+            "class Puzzle:\n"
+            "    def get_possible_moves(self):\n"
+            "        return [1]\n"
+            "    def make_move(self, move):\n"
+            "        return True\n"
+            "    def is_solved(self):\n"
+            "        return False\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    move = input('move: ')\n"
+            "    print(move)\n"
+        )
+        steps = [tool_step("write_file", "puzzle.py", content=manual_ui_source)]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "implementation_present_needs_semantic_review")
+        issues = "\n".join(state["implementation_source_issues"])
+        self.assertIn("state_space_search", issues)
+        self.assertIn("programmatic solver/search callable", issues)
+        self.assertIn("manual input loop alone", issues)
+
+        self.assertTrue(
+            runtime._plan_run_test_should_wait_for_progress(
+                pending_task={"work_type": "run_test"},
+                progress_state=state,
+            )
+        )
+        ready_without_test_artifact = {**state, "phase": "unittest_not_run", "missing_requirements": ["unittest_run"]}
+        self.assertTrue(
+            runtime._plan_run_test_should_wait_for_progress(
+                pending_task={"work_type": "run_test"},
+                progress_state=ready_without_test_artifact,
+            )
+        )
+        ready_state = {
+            **state,
+            "phase": "unittest_not_run",
+            "missing_requirements": ["unittest_run"],
+            "test_paths": ["tests/test_puzzle.py"],
+        }
+        self.assertFalse(
+            runtime._plan_run_test_should_wait_for_progress(
+                pending_task={"work_type": "run_test"},
+                progress_state=ready_state,
+            )
+        )
+
+    def test_state_space_plan_requires_tests_to_replay_solver_result(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "from collections import deque\n\n"
+            "def solve_state_space(start, goal, legal_moves):\n"
+            "    if start == goal:\n"
+            "        return []\n"
+            "    queue = deque([(start, [])])\n"
+            "    seen = {start}\n"
+            "    while queue:\n"
+            "        state, path = queue.popleft()\n"
+            "        for action, next_state in legal_moves(state):\n"
+            "            if next_state in seen:\n"
+            "                continue\n"
+            "            next_path = path + [action]\n"
+            "            if next_state == goal:\n"
+            "                return next_path\n"
+            "            seen.add(next_state)\n"
+            "            queue.append((next_state, next_path))\n"
+            "    return None\n"
+            "\n"
+            "def replay(start, moves, legal_moves):\n"
+            "    state = start\n"
+            "    for move in moves:\n"
+            "        state = legal_moves(state, move)\n"
+            "    return state\n"
+        )
+        weak_test_source = (
+            "import unittest\n"
+            "from puzzle_solver import solve_state_space\n"
+            "\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solve_returns_path(self):\n"
+            "        solution = solve_state_space((1, 2, 0), (1, 2, 0), lambda state: [])\n"
+            "        self.assertIsNotNone(solution)\n"
+            "        for move in solution:\n"
+            "            pass\n"
+        )
+
+        artifact_issue = runtime._python_artifact_contract_issue(
+            user_message=user_message,
+            tool_name="write_file",
+            tool_args={"path": "tests/test_puzzle_solver.py", "content": weak_test_source},
+        )
+        self.assertIsNotNone(artifact_issue)
+        self.assertEqual(artifact_issue["reason_code"], "test_artifact_contract_incomplete")
+        self.assertIn("state_space_search", artifact_issue["message"])
+        self.assertIn("replay", artifact_issue["message"])
+
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=weak_test_source),
+        ]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        self.assertEqual(state["allowed_next_actions"], ["read_file tests/test_puzzle_solver.py once"])
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("test artifact 未達", prompt)
+        self.assertIn("goal到達をassert", prompt)
+        block = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            tool_name="read_file",
+            tool_args={"path": "tests/test_puzzle_solver.py"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(block)
+
+    def test_state_space_implementation_requires_replay_verifier_not_only_legal_and_goal_helpers(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        source_without_replay = (
+            "def solve_state_space(start, goal):\n"
+            "    return ['advance'] if start != goal else []\n\n"
+            "def is_legal_move(state, action):\n"
+            "    return action == 'advance'\n\n"
+            "def make_move(state, action):\n"
+            "    return state + 1\n\n"
+            "def is_goal_state(state, goal):\n"
+            "    return state == goal\n"
+        )
+        steps = [tool_step("write_file", "puzzle_solver.py", content=source_without_replay)]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "implementation_present_needs_semantic_review")
+        issues = "\n".join(state["implementation_source_issues"])
+        self.assertIn("action列を独立にreplay/verifyするcallable", issues)
+        self.assertIn("is_legal_move や is_goal_state だけではfinal_verifierになりません", issues)
+        hints = state["implementation_source_repair_hints"]
+        self.assertTrue(
+            any(
+                isinstance(item, dict) and item.get("suggested_action") == "add_state_space_replay_verifier"
+                for item in hints
+            ),
+            hints,
+        )
+        suggested = "\n".join(str(item.get("suggested_new_text") or "") for item in hints if isinstance(item, dict))
+        self.assertIn("def verify_solution", suggested)
+        self.assertIn("is_legal_move", suggested)
+        self.assertIn("make_move", suggested)
+        self.assertIn("\n        if not is_legal_move(current_state, action):", suggested)
+        self.assertNotIn("\n            if not is_legal_move(current_state, action):", suggested)
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("state_space_search final_verifier修復", prompt)
+        self.assertIn("legal check -> transition -> goal check", prompt)
+
+    def test_state_space_replay_hint_does_not_treat_transition_as_legal_validator(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        source_without_legal_validator = (
+            "class Puzzle:\n"
+            "    def __init__(self):\n"
+            "        self.goal_state = 2\n\n"
+            "    def solve(self, start):\n"
+            "        return ['advance']\n\n"
+            "    def make_move(self, state, action):\n"
+            "        return state + 1\n\n"
+            "    def is_solved(self):\n"
+            "        return False\n"
+        )
+        steps = [tool_step("write_file", "puzzle_solver.py", content=source_without_legal_validator)]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        suggested = "\n".join(
+            str(item.get("suggested_new_text") or "")
+            for item in state["implementation_source_repair_hints"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("legal_move_validator", suggested)
+        self.assertNotIn("not self.make_move", suggested)
+
+    def test_state_space_replay_hint_handles_legal_moves_generator(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        source_without_replay = (
+            "def get_legal_moves(state):\n"
+            "    return [('advance', state + 1)]\n\n"
+            "def apply_move(state, action):\n"
+            "    return action[1]\n\n"
+            "def solve_state_space(start, goal):\n"
+            "    return [('advance', goal)]\n"
+        )
+        steps = [tool_step("write_file", "puzzle_solver.py", content=source_without_replay)]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        suggested = "\n".join(
+            str(item.get("suggested_new_text") or "")
+            for item in state["implementation_source_repair_hints"]
+            if isinstance(item, dict)
+        )
+        self.assertIn("action not in list(get_legal_moves(current_state))", suggested)
+        self.assertIn("\n        if action not in list(get_legal_moves(current_state)):", suggested)
+        self.assertNotIn("\n            if action not in list(get_legal_moves(current_state)):", suggested)
+        self.assertNotIn("get_legal_moves(current_state, action)", suggested)
+        self.assertIn("apply_move(current_state, action)", suggested)
+
+    def test_state_space_repeated_unittest_failure_prompts_action_contract_triage(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def legal_moves(state):\n"
+            "    return [('advance', state + 1)] if state < 2 else []\n\n"
+            "def solve_state_space(start, goal):\n"
+            "    return []\n\n"
+            "def replay(start, actions):\n"
+            "    state = start\n"
+            "    for action in actions:\n"
+            "        for legal_action, next_state in legal_moves(state):\n"
+            "            if action == legal_action:\n"
+            "                state = next_state\n"
+            "                break\n"
+            "        else:\n"
+            "            return None\n"
+            "    return state\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return replay(start, actions) == goal\n"
+        )
+        revised_implementation_source = implementation_source.replace(
+            "return []",
+            "return ['wait']",
+            1,
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import solve_state_space, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        actions = solve_state_space(0, 2)\n"
+            "        self.assertTrue(verify_solution(0, 2, actions))\n"
+        )
+        stderr = (
+            "FAIL: test_solver_reaches_goal (test_puzzle_solver.TestPuzzleSolver.test_solver_reaches_goal)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_puzzle_solver.py'}\", line 7, in test_solver_reaches_goal\n"
+            "AssertionError: False is not true\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+            tool_step("read_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "puzzle_solver.py", content=revised_implementation_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertTrue(state["repeated_unittest_failure_signature"])
+        self.assertTrue(state["unittest_repair_hints"])
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("unittest失敗triage", prompt)
+        self.assertIn("solver/search戻り値", prompt)
+        self.assertIn("action列", prompt)
+        self.assertIn("legal_move_validator", prompt)
+
+        signature = runtime._implementation_progress_event_signature(state)
+        self.assertIn("unittest_repair_hints", signature)
+        self.assertTrue(signature["repair_hints"])
+
+    def test_state_space_test_contract_rejects_random_shuffle_solver_fixture(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "class Puzzle:\n"
+            "    def __init__(self):\n"
+            "        self.goal_state = [1, 2, 3, 0]\n"
+            "        self.current_state = list(self.goal_state)\n"
+            "    def shuffle(self):\n"
+            "        self.current_state = [1, 2, 0, 3]\n"
+            "    def solve(self):\n"
+            "        return ['right']\n"
+            "    def verify_solution(self, start, goal, actions):\n"
+            "        return bool(actions) and goal == self.goal_state\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import Puzzle\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        puzzle = Puzzle()\n"
+            "        puzzle.shuffle()\n"
+            "        actions = puzzle.solve()\n"
+            "        self.assertTrue(puzzle.verify_solution(puzzle.current_state, puzzle.goal_state, actions))\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        issues = "\n".join(state["test_source_issues"])
+        self.assertIn("random/shuffle", issues)
+        self.assertIn("near-goal", issues)
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("決定的なnear-goal fixture", prompt)
+        self.assertIn("near-goal", prompt)
+
+    def test_state_space_source_contract_rejects_random_fixture_helper(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def solve_path(start, goal):\n"
+            "    return ['R']\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return bool(actions)\n\n"
+            "def create_near_goal_fixture(goal, moves):\n"
+            "    import random\n"
+            "    action = random.choice(['L', 'U'])\n"
+            "    return (goal, action, moves)\n"
+        )
+        steps = [tool_step("write_file", "puzzle_solver.py", content=implementation_source)]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "implementation_present_needs_semantic_review")
+        issues = "\n".join(state["implementation_source_issues"])
+        self.assertIn("fixture helperが random/shuffle", issues)
+        self.assertIn("create_near_goal_fixture", issues)
+        self.assertIn("決定的", issues)
+
+    def test_dynamic_programming_source_contract_rejects_formula_without_base_or_recurrence(self) -> None:
+        runtime = self.runtime()
+        user_message = "動的計画で部分問題、基底ケース、漸化式を使うPython実装とunittestを作ってください。"
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def compute_score(value):\n"
+            "    return value * 2\n"
+        )
+        steps = [tool_step("write_file", "dp_solver.py", content=implementation_source)]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "implementation_present_needs_semantic_review")
+        issues = "\n".join(state["implementation_source_issues"])
+        self.assertIn("dynamic_programming", issues)
+        self.assertIn("base_case_verifier", issues)
+        self.assertIn("recurrence_verifier", issues)
+
+    def test_dynamic_programming_source_contract_accepts_requested_api_name_with_dp_structure(self) -> None:
+        runtime = self.runtime()
+        user_message = (
+            "Pythonで weighted interval scheduling を解く実装を作ってください。"
+            "APIは weighted_interval_scheduling(intervals) としてください。動的計画法で検証してください。"
+        )
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def weighted_interval_scheduling(intervals):\n"
+            "    if not intervals:\n"
+            "        return {'max_weight': 0, 'selected_jobs': []}\n"
+            "    sorted_items = sorted(intervals, key=lambda item: item[1])\n"
+            "    dp = [0] * len(sorted_items)\n"
+            "    dp[0] = sorted_items[0][2]\n"
+            "    for index in range(1, len(sorted_items)):\n"
+            "        include_weight = sorted_items[index][2]\n"
+            "        dp[index] = max(dp[index - 1], include_weight)\n"
+            "    return {'max_weight': dp[-1], 'selected_jobs': []}\n"
+        )
+
+        issues = runtime._implementation_source_contract_issues(
+            user_message=user_message,
+            source=implementation_source,
+        )
+
+        self.assertNotIn("programmatic callableが見つかりません", "\n".join(issues))
+
+    def test_dynamic_programming_test_contract_accepts_requested_api_name_calls(self) -> None:
+        runtime = self.runtime()
+        user_message = (
+            "Pythonで weighted interval scheduling を解く実装とunittestを作ってください。"
+            "APIは weighted_interval_scheduling(intervals) としてください。動的計画法で検証してください。"
+        )
+        plan = self.dynamic_programming_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        test_source = (
+            "import unittest\n"
+            "from weighted_interval_scheduling import weighted_interval_scheduling\n\n"
+            "class TestDP(unittest.TestCase):\n"
+            "    def test_base_case(self):\n"
+            "        result = weighted_interval_scheduling([])\n"
+            "        self.assertEqual(result['max_weight'], 0)\n\n"
+            "    def test_recurrence_sample_oracle(self):\n"
+            "        intervals = [(1, 2, 5, 'a'), (3, 4, 7, 'b')]\n"
+            "        result = weighted_interval_scheduling(intervals)\n"
+            "        self.assertEqual(result['max_weight'], 12)\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message=user_message,
+            test_sources=[("tests/test_weighted_interval_scheduling.py", test_source)],
+        )
+
+        self.assertNotIn("solver/compute callableを直接呼んでいません", "\n".join(issues))
+
+    def test_constraint_satisfaction_tests_require_validator_and_negative_case(self) -> None:
+        runtime = self.runtime()
+        user_message = "制約、変数、ドメイン、割当を使うPython実装とunittestを作ってください。"
+        plan = self.constraint_satisfaction_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def check_constraints(variables, domains, constraints, assignment):\n"
+            "    return all(constraint(assignment) for constraint in constraints)\n\n"
+            "def validate_solution(variables, domains, constraints, assignment):\n"
+            "    return set(variables) <= set(assignment) and check_constraints(variables, domains, constraints, assignment)\n\n"
+            "def solve_assignment(variables, domains, constraints):\n"
+            "    return {variable: domains[variable][0] for variable in variables}\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from csp_solver import solve_assignment\n\n"
+            "class TestConstraintSolver(unittest.TestCase):\n"
+            "    def test_solver_returns_assignment(self):\n"
+            "        result = solve_assignment(['x'], {'x': [1]}, [])\n"
+            "        self.assertIsNotNone(result)\n"
+        )
+        steps = [
+            tool_step("write_file", "csp_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_csp_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        issues = "\n".join(state["test_source_issues"])
+        self.assertIn("constraint_satisfaction", issues)
+        self.assertIn("solution validator", issues)
+        self.assertIn("invalid/negative", issues)
+
+    def test_state_space_test_contract_rejects_handwritten_long_solution_fixture(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def solve_path(start, goal):\n"
+            "    return ['right']\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return actions is not None and goal is not None\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import solve_path, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        solution = solve_path('start', 'goal')\n"
+            "        actions = ['left', 'up', 'right', 'down', 'left']\n"
+            "        self.assertIsNotNone(solution)\n"
+            "        self.assertTrue(verify_solution('start', 'goal', actions))\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        issues = "\n".join(state["test_source_issues"])
+        self.assertIn("長い手書きaction/path/solution fixture", issues)
+        self.assertIn("solver/searchの戻り値", issues)
+        self.assertIn("短い合法遷移", issues)
+
+    def test_state_space_test_contract_rejects_literal_near_goal_fixture_not_derived(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "GOAL = [1, 2, 0]\n\n"
+            "def solve_path(start, goal):\n"
+            "    return ['right']\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return actions is not None and start != goal\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import GOAL, solve_path, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_reaches_goal_from_near_goal(self):\n"
+            "        near_goal = [1, 0, 2]\n"
+            "        solution = solve_path(near_goal, GOAL)\n"
+            "        self.assertTrue(verify_solution(near_goal, GOAL, solution))\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        issues = "\n".join(state["test_source_issues"])
+        self.assertIn("literal near-goal fixture", issues)
+        self.assertIn("基準stateから短いlegal move/transition", issues)
+        self.assertIn("テストコード上で観測", issues)
+
+    def test_state_space_test_contract_rejects_claimed_near_goal_literal_start_goal(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "class StateSpaceSolver:\n"
+            "    def __init__(self, initial_state, goal_state, legal_moves_func):\n"
+            "        self.initial_state = initial_state\n"
+            "        self.goal_state = goal_state\n"
+            "        self.legal_moves_func = legal_moves_func\n"
+            "    def solve(self):\n"
+            "        return [1, 2, 3]\n"
+            "    def verify_solution(self, actions):\n"
+            "        return actions[-1] == self.goal_state\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from state_space_solver import StateSpaceSolver\n\n"
+            "class TestStateSpaceSolver(unittest.TestCase):\n"
+            "    def test_solve_with_near_goal(self):\n"
+            "        initial_state = 0\n"
+            "        goal_state = 3\n"
+            "        def legal_moves_func(state):\n"
+            "            return [state + 1] if state < 3 else []\n"
+            "        solver = StateSpaceSolver(initial_state, goal_state, legal_moves_func)\n"
+            "        actions = solver.solve()\n"
+            "        self.assertTrue(solver.verify_solution(actions))\n"
+        )
+        steps = [
+            tool_step("write_file", "state_space_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_state_space_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        issues = "\n".join(state["test_source_issues"])
+        self.assertIn("literal near-goal fixture", issues)
+        self.assertIn("literal start/goal", issues)
+        self.assertIn("任意の値を直書きせず", issues)
+
+    def test_state_space_test_contract_rejects_unbounded_no_solution_solver_fixture(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "class Puzzle:\n"
+            "    def __init__(self):\n"
+            "        self.start = (1, 2, 0)\n"
+            "        self.goal = (1, 2, 3)\n"
+            "    def solve(self, max_depth=None):\n"
+            "        if self.start == self.goal:\n"
+            "            return []\n"
+            "        if max_depth == 0:\n"
+            "            return []\n"
+            "        return None\n"
+            "    def verify_solution(self, start, goal, actions):\n"
+            "        return actions is not None and start == goal\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import Puzzle\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def test_solve_unsolvable(self):\n"
+            "        puzzle = Puzzle()\n"
+            "        solution = puzzle.solve()\n"
+            "        self.assertIsNone(solution)\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "tests_present_needs_semantic_review")
+        issues = "\n".join(state["test_source_issues"])
+        self.assertIn("no-solution/unsolvable", issues)
+        self.assertIn("max_depth", issues)
+        self.assertIn("無制限探索", issues)
+
+    def test_state_space_unittest_timeout_prompts_near_goal_revision(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        implementation_source = (
+            "def solve_state_space(start, goal):\n"
+            "    while True:\n"
+            "        pass\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return False\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import solve_state_space, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        actions = solve_state_space((1, 2, 0), (1, 2, 0))\n"
+            "        self.assertTrue(verify_solution((1, 2, 0), (1, 2, 0), actions))\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="F\nTimed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            ),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["latest_unittest_failure_type"], "command_timeout")
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("command_timeout", prompt)
+        self.assertIn("deterministic near-goal fixture", prompt)
+        self.assertIn("同じrun_testだけのPlanRecordを再提出してはいけません", prompt)
+
+    def test_repeated_unittest_timeout_after_edit_requires_narrow_rerun(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        implementation_source = (
+            "def solve_state_space(start, goal):\n"
+            "    while True:\n"
+            "        pass\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return False\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import solve_state_space, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        actions = solve_state_space((1, 2, 0), (1, 2, 0))\n"
+            "        self.assertTrue(verify_solution((1, 2, 0), (1, 2, 0), actions))\n"
+        )
+        revised_test_source = test_source.replace("test_solver_reaches_goal", "test_solver_timeout_scope")
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="\nTimed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            ),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+            tool_step("read_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source + "\n"),
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="\nTimed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            ),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=revised_test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["successful_edit_after_failed_unittest"])
+        self.assertTrue(state["repeated_unittest_failure_signature"])
+        self.assertTrue(state["latest_unittest_timed_out"])
+        self.assertEqual(state["allowed_next_actions"], ["run_command with a narrower unittest target"])
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("全体unittest discoverをそのまま再実行せず", prompt)
+        self.assertIn("stdout/stderrにtracebackがない", prompt)
+
+        recovery = runtime._completion_contract_recovery_action(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            step_index=len(steps) + 1,
+            max_steps=20,
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(recovery)
+
+        blocked_full = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            tool_name="run_command",
+            tool_args={"command": "python3 -m unittest discover -s tests"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_full["reason_code"],
+            "implementation_task_failed_unittest_requires_narrow_rerun_after_timeout",
+        )
+
+        allowed_narrow = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            tool_name="run_command",
+            tool_args={
+                "command": "python3 -m unittest tests.test_puzzle_solver.TestPuzzleSolver.test_solver_timeout_scope"
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_narrow)
+
+    def test_narrow_unittest_success_after_timeout_is_diagnostic_not_acceptance(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        implementation_source = (
+            "def solve_state_space(start, goal):\n"
+            "    while True:\n"
+            "        pass\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return start == goal\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import solve_state_space, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_timeout_scope(self):\n"
+            "        actions = solve_state_space((1, 0, 2), (1, 2, 0))\n"
+            "        self.assertTrue(verify_solution((1, 0, 2), (1, 2, 0), actions))\n\n"
+            "    def test_find_empty_index(self):\n"
+            "        self.assertEqual((1, 2, 0).index(0), 2)\n"
+        )
+        revised_test_source = test_source + "\n"
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="F...FFF\nTimed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            ),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+            tool_step("read_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=revised_test_source),
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="F...FFF\nTimed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            ),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=revised_test_source + "\n"),
+            run_step(
+                "python3 -m unittest tests.test_puzzle_solver.TestPuzzleSolver.test_find_empty_index -v",
+                ok=True,
+                stderr=(
+                    "test_find_empty_index "
+                    "(tests.test_puzzle_solver.TestPuzzleSolver.test_find_empty_index) ... ok\n\n"
+                    "----------------------------------------------------------------------\n"
+                    "Ran 1 test in 0.000s\n\nOK\n"
+                ),
+            ),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertFalse(state["unittest_passed"])
+        self.assertEqual(state["successful_unittest_run_count"], 0)
+        self.assertEqual(state["latest_unittest_failure_type"], "command_timeout")
+        self.assertEqual(state["allowed_next_actions"], ["run_command with a narrower unittest target"])
+
+        recovery = runtime._completion_contract_recovery_action(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            step_index=len(steps) + 1,
+            max_steps=20,
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(recovery)
+
+    def test_narrow_unittest_failure_after_timeout_drives_repair_hints_not_acceptance(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        implementation_source = (
+            "goal_state = (1, 2, 0)\n\n"
+            "def solve_state_space(start):\n"
+            "    frontier = [(start, [])]\n"
+            "    seen = {start}\n"
+            "    while frontier:\n"
+            "        state, path = frontier.pop(0)\n"
+            "        if state == goal_state:\n"
+            "            return path\n"
+            "        for action in ('left', 'right'):\n"
+            "            candidate = tuple(reversed(state)) if action == 'left' else state\n"
+            "            if candidate not in seen:\n"
+            "                seen.add(candidate)\n"
+            "                frontier.append((candidate, path + [action]))\n"
+            "    return None\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import GOAL_STATE, solve_state_space\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_solver_timeout_scope(self):\n"
+            "        self.assertEqual(solve_state_space((1, 0, 2)), [])\n"
+        )
+        diagnostic_stderr = (
+            "test_puzzle_solver (unittest.loader._FailedTest.test_puzzle_solver) ... ERROR\n\n"
+            "======================================================================\n"
+            "ERROR: test_puzzle_solver (unittest.loader._FailedTest.test_puzzle_solver)\n"
+            "----------------------------------------------------------------------\n"
+            "ImportError: Failed to import test module: test_puzzle_solver\n"
+            "Traceback (most recent call last):\n"
+            "  File \"/tmp/work/tests/test_puzzle_solver.py\", line 2, in <module>\n"
+            "    from puzzle_solver import GOAL_STATE, solve_state_space\n"
+            "ImportError: cannot import name 'GOAL_STATE' from 'puzzle_solver' (/tmp/work/puzzle_solver.py)\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step(
+                "python3 -m unittest discover -s tests",
+                ok=False,
+                stderr="F...FFF\nTimed out after 60s",
+                failure_type="command_timeout",
+                returncode=None,
+            ),
+            run_step(
+                "python3 -m unittest tests.test_puzzle_solver.TestPuzzleSolver.test_solver_timeout_scope -v",
+                ok=False,
+                stderr=diagnostic_stderr,
+            ),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertFalse(state["unittest_passed"])
+        self.assertEqual(state["successful_unittest_run_count"], 0)
+        self.assertEqual(state["latest_unittest_missing_import"]["name"], "GOAL_STATE")
+        self.assertEqual(state["latest_unittest_missing_import"]["module"], "puzzle_solver")
+        self.assertEqual(state["allowed_next_actions"], ["read_file puzzle_solver.py once"])
+        self.assertTrue(any("GOAL_STATE" in item for item in state["unittest_repair_hints"]))
+
+    def test_tests_missing_after_repetitive_output_prompts_minimal_verification_test(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": "LLM応答がツール呼び出しJSONとして解釈できませんでした: repetitive_output",
+                "code": "llm_output_issue",
+                "reason_code": "schema_validation_failed",
+            },
+        )
+        implementation_source = (
+            "def legal_moves(state):\n"
+            "    return [('advance', state + 1)] if state < 1 else []\n\n"
+            "def solve_state_space(start, goal):\n"
+            "    return ['advance'] if start != goal else []\n\n"
+            "def replay(start, actions):\n"
+            "    state = start\n"
+            "    for action in actions:\n"
+            "        if action != 'advance':\n"
+            "            return None\n"
+            "        state += 1\n"
+            "    return state\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return replay(start, actions) == goal\n"
+        )
+        steps = [tool_step("write_file", "puzzle_solver.py", content=implementation_source)]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "tests_missing")
+        self.assertTrue(state["test_generation_repetitive_output"])
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("repetitive_output", prompt)
+        self.assertIn("最小verification test", prompt)
+        self.assertIn("2-3 test methods", prompt)
+        self.assertIn("solver/searchを1回呼び", prompt)
+
+    def test_implementation_missing_after_repetitive_output_prompts_small_library_implementation(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": "LLM応答がツール呼び出しJSONとして解釈できませんでした: repetitive_output",
+                "code": "llm_output_issue",
+                "reason_code": "repetitive_output",
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=[],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "implementation_missing")
+        self.assertTrue(state["implementation_generation_repetitive_output"])
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("初回実装生成は repetitive_output/stream_char_limit", prompt)
+        self.assertIn("2500 bytes以下", prompt)
+        self.assertIn("tests/test_*.py と実行デモ", prompt)
+
+    def test_implementation_missing_after_stream_limit_prompts_small_library_implementation(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": "LLM応答がツール呼び出しJSONとして解釈できませんでした: stream_char_limit",
+                "code": "llm_output_issue",
+                "reason_code": "stream_char_limit",
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=[],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "implementation_missing")
+        self.assertTrue(state["implementation_generation_repetitive_output"])
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("stream_char_limit", prompt)
+        self.assertIn("小さいライブラリ実装だけ", prompt)
+        self.assertIn("2500 bytes以下", prompt)
+
+    def test_unittest_repair_after_repetitive_output_prompts_minimal_targeted_edit(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "role": "system",
+                "content": "LLM応答がツール呼び出しJSONとして解釈できませんでした: repetitive_output",
+                "code": "llm_output_issue",
+                "reason_code": "schema_validation_failed",
+            },
+        )
+        implementation_source = (
+            "def solve_state_space(start, goal):\n"
+            "    return ['advance']\n\n"
+            "def is_legal_move(state, action):\n"
+            "    return action == 'advance'\n\n"
+            "def make_move(state, action):\n"
+            "    return state + 1\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    state = start\n"
+            "    for action in actions:\n"
+            "        if not is_legal_move(state, action):\n"
+            "            return False\n"
+            "        state = make_move(state, action)\n"
+            "    return state == goal\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_invalid_action_raises(self):\n"
+            "        with self.assertRaises(ValueError):\n"
+            "            verify_solution(0, 1, ['bad'])\n"
+        )
+        stderr = (
+            "F\n======================================================================\n"
+            "FAIL: test_invalid_action_raises (test_puzzle_solver.TestPuzzleSolver.test_invalid_action_raises)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 6, in test_invalid_action_raises\n"
+            "    with self.assertRaises(ValueError):\n"
+            "AssertionError: ValueError not raised\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+            tool_step("read_file", "puzzle_solver.py", content=implementation_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertTrue(state["repair_generation_repetitive_output"])
+        hints = "\n".join(state["unittest_repair_hints"])
+        self.assertIn("返却値・例外・入力検証契約", hints)
+        self.assertIn("根拠がある側だけを小さく修正", hints)
+
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("直近のrepair生成は repetitive_output", prompt)
+        self.assertIn("old_textは失敗行に関係する1つの関数または数行だけ", prompt)
+        self.assertIn("class全体", prompt)
+        self.assertIn("失敗signatureを変える最小編集", prompt)
+
+    def test_state_space_test_only_assertion_repair_prioritizes_fixture(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "GOAL = [1, 2, 0]\n\n"
+            "def apply_move(state, action):\n"
+            "    new_state = list(state)\n"
+            "    new_state[1], new_state[2] = new_state[2], new_state[1]\n"
+            "    return new_state\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    state = list(start)\n"
+            "    for action in actions:\n"
+            "        state = apply_move(state, action)\n"
+            "    return state == goal\n"
+            "\n"
+            "def solve_path(start, goal):\n"
+            "    return ['right']\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import apply_move\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_apply_move_expected_fixture(self):\n"
+            "        self.assertEqual(apply_move([1, 0, 2], 'right'), [0, 1, 2])\n"
+        )
+        stderr = (
+            "F\n======================================================================\n"
+            "FAIL: test_apply_move_expected_fixture (test_puzzle_solver.TestPuzzleSolver.test_apply_move_expected_fixture)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 6, in test_apply_move_expected_fixture\n"
+            "    self.assertEqual(apply_move([1, 0, 2], 'right'), [0, 1, 2])\n"
+            "AssertionError: Lists differ: [1, 2, 0] != [0, 1, 2]\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["state_space_test_fixture_repair_mode"])
+        self.assertEqual(state["allowed_next_actions"], ["read_file tests/test_puzzle_solver.py once"])
+        self.assertIn("tests/test_puzzle_solver.py", state["failed_unittest_recovery_read_paths"])
+        self.assertNotIn("puzzle_solver.py", state["failed_unittest_recovery_read_paths"])
+
+        state_after_test_read = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=[*steps, tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source)],
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(
+            state_after_test_read["allowed_next_actions"],
+            [
+                "replace_text tests/test_puzzle_solver.py with a small unique old_text",
+                "write_file tests/test_puzzle_solver.py",
+            ],
+        )
+        self.assertTrue(
+            any("test fixture" in hint for hint in state_after_test_read["unittest_repair_hints"])
+        )
+
+    def test_state_space_test_contract_assertion_keeps_implementation_recovery_path(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "GOAL = [1, 2, 0]\n\n"
+            "def is_solvable(state):\n"
+            "    return False\n\n"
+            "def get_legal_moves(state):\n"
+            "    return [(1, 2)]\n\n"
+            "def apply_move(state, action):\n"
+            "    new_state = list(state)\n"
+            "    src, dst = action\n"
+            "    new_state[src], new_state[dst] = new_state[dst], new_state[src]\n"
+            "    return new_state\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    return False\n\n"
+            "def solve_path(start, goal):\n"
+            "    return ['not-a-legal-action']\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import apply_move, is_solvable, solve_path, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_illegal_move_rejection(self):\n"
+            "        with self.assertRaises(Exception):\n"
+            "            apply_move([1, 2, 0], (0, 1))\n\n"
+            "    def test_is_solvable(self):\n"
+            "        self.assertTrue(is_solvable([1, 0, 2]))\n\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        solution = solve_path([1, 0, 2], [1, 2, 0])\n"
+            "        self.assertIsNotNone(solution)\n"
+            "        self.assertTrue(verify_solution([1, 0, 2], [1, 2, 0], solution))\n"
+        )
+        stderr = (
+            "FFF\n"
+            "======================================================================\n"
+            "FAIL: test_illegal_move_rejection (test_puzzle_solver.TestPuzzleSolver.test_illegal_move_rejection)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 6, in test_illegal_move_rejection\n"
+            "    with self.assertRaises(Exception):\n"
+            "AssertionError: Exception not raised\n"
+            "\n"
+            "======================================================================\n"
+            "FAIL: test_is_solvable (test_puzzle_solver.TestPuzzleSolver.test_is_solvable)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 10, in test_is_solvable\n"
+            "    self.assertTrue(is_solvable([1, 0, 2]))\n"
+            "AssertionError: False is not true\n"
+            "\n"
+            "======================================================================\n"
+            "FAIL: test_solver_reaches_goal (test_puzzle_solver.TestPuzzleSolver.test_solver_reaches_goal)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 14, in test_solver_reaches_goal\n"
+            "    self.assertIsNotNone(solution)\n"
+            "AssertionError: unexpectedly None\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertFalse(state["state_space_test_fixture_repair_mode"])
+        self.assertTrue(state["state_space_test_impl_contract_suspected"])
+        self.assertIn("tests/test_puzzle_solver.py", state["failed_unittest_recovery_read_paths"])
+        self.assertIn("puzzle_solver.py", state["failed_unittest_recovery_read_paths"])
+        self.assertEqual(state["allowed_next_actions"], ["read_file puzzle_solver.py once"])
+        self.assertTrue(
+            any("公開API契約" in hint for hint in state["unittest_repair_hints"])
+        )
+
+    def test_state_space_no_match_fixture_value_blocks_implementation_full_write(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "GOAL = [1, 2, 0]\n\n"
+            "def get_legal_moves(state):\n"
+            "    return [(1, 2), (2, 1)]\n\n"
+            "def apply_move(state, action):\n"
+            "    new_state = list(state)\n"
+            "    src, dst = action\n"
+            "    new_state[src], new_state[dst] = new_state[dst], new_state[src]\n"
+            "    return new_state\n\n"
+            "def verify_solution(start, goal, actions):\n"
+            "    state = list(start)\n"
+            "    for action in actions:\n"
+            "        state = apply_move(state, action)\n"
+            "    return state == goal\n\n"
+            "def solve_path(start, goal):\n"
+            "    return [(1, 2)]\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import apply_move, get_legal_moves, solve_path, verify_solution\n\n"
+            "class TestPuzzleSolver(unittest.TestCase):\n"
+            "    def test_apply_move_expected_state(self):\n"
+            "        state = [1, 0, 2]\n"
+            "        move = (1, 2)\n"
+            "        new_state = apply_move(state, move)\n"
+            "        expected_state = [0, 1, 2]\n"
+            "        self.assertEqual(new_state, expected_state)\n\n"
+            "    def test_legal_move_count(self):\n"
+            "        moves = list(get_legal_moves([1, 0, 2]))\n"
+            "        self.assertEqual(len(moves), 1)\n\n"
+            "    def test_solver_reaches_goal(self):\n"
+            "        solution = solve_path([1, 0, 2], [1, 2, 0])\n"
+            "        self.assertTrue(verify_solution([1, 0, 2], [1, 2, 0], solution))\n"
+        )
+        stderr = (
+            "FF.\n"
+            "======================================================================\n"
+            "FAIL: test_apply_move_expected_state (test_puzzle_solver.TestPuzzleSolver.test_apply_move_expected_state)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 10, in test_apply_move_expected_state\n"
+            "    self.assertEqual(new_state, expected_state)\n"
+            "AssertionError: Lists differ: [1, 2, 0] != [0, 1, 2]\n"
+            "\n"
+            "======================================================================\n"
+            "FAIL: test_legal_move_count (test_puzzle_solver.TestPuzzleSolver.test_legal_move_count)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 14, in test_legal_move_count\n"
+            "    self.assertEqual(len(moves), 1)\n"
+            "AssertionError: 2 != 1\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+            tool_step("read_file", "puzzle_solver.py", content=implementation_source),
+        ]
+        (runtime.execution_root / "puzzle_solver.py").write_text(implementation_source, encoding="utf-8")
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                "content": "replace_text was blocked after no exact match",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "puzzle_solver.py",
+                    "blocked_tool": "replace_text",
+                    "exact_old_text_matches": 0,
+                },
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["state_space_test_fixture_value_suspected"])
+        self.assertIn("puzzle_solver.py", state["state_space_fixture_value_impl_blocked_paths"])
+        self.assertNotIn("puzzle_solver.py", state["state_space_no_match_exact_replace_paths"])
+        self.assertNotIn("puzzle_solver.py", state["failed_unittest_no_match_write_only_paths"])
+        self.assertIn("write_file tests/test_puzzle_solver.py", state["allowed_next_actions"])
+        self.assertNotIn("replace_text puzzle_solver.py with a small unique old_text", state["allowed_next_actions"])
+        self.assertNotIn("write_file puzzle_solver.py", state["allowed_next_actions"])
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            tool_name="write_file",
+            tool_args={"path": "puzzle_solver.py", "content": implementation_source},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked["reason_code"],
+            "implementation_task_failed_unittest_prioritizes_fixture_repair_after_impl_noop",
+        )
+        self.assertIn("test artifact", blocked["next_required_action"])
+        self.assertNotIn("write_file puzzle_solver.py", blocked["allowed_next_actions"])
+
+    def test_state_space_fixture_value_after_impl_noop_prioritizes_test_artifact(self) -> None:
+        runtime = self.runtime()
+        user_message = "状態、合法手、ゴール、探索方針で解く小さなパズル実装とunittestを作ってください。"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        implementation_source = (
+            "class Puzzle:\n"
+            "    def __init__(self):\n"
+            "        self.goal = [1, 2, 3]\n\n"
+            "    def get_legal_moves(self, state):\n"
+            "        try:\n"
+            "            empty = state.index(0)\n"
+            "        except ValueError:\n"
+            "            return []\n"
+            "        moves = []\n"
+            "        if empty > 0:\n"
+            "            moves.append('left')\n"
+            "        if empty < len(state) - 1:\n"
+            "            moves.append('right')\n"
+            "        return moves\n"
+            "\n"
+            "    def apply_move(self, state, action):\n"
+            "        new_state = list(state)\n"
+            "        empty = new_state.index(0)\n"
+            "        delta = -1 if action == 'left' else 1\n"
+            "        target = empty + delta\n"
+            "        new_state[empty], new_state[target] = new_state[target], new_state[empty]\n"
+            "        return new_state\n"
+            "\n"
+            "    def solve(self, start=None):\n"
+            "        return ['right']\n"
+            "\n"
+            "    def verify_solution(self, initial_state, actions):\n"
+            "        current = list(initial_state)\n"
+            "        for action in actions:\n"
+            "            if action not in self.get_legal_moves(current):\n"
+            "                return False\n"
+            "            current = self.apply_move(current, action)\n"
+            "        return current == self.goal\n"
+        )
+        test_source = (
+            "import unittest\n"
+            "from puzzle_solver import Puzzle\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def test_get_legal_moves(self):\n"
+            "        self.assertEqual(Puzzle().get_legal_moves([1, 2, 3]), ['left', 'right'])\n"
+        )
+        stderr = (
+            "F\n"
+            "======================================================================\n"
+            "FAIL: test_get_legal_moves (test_puzzle_solver.TestPuzzle.test_get_legal_moves)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_puzzle_solver.py\", line 6, in test_get_legal_moves\n"
+            "    self.assertEqual(Puzzle().get_legal_moves([1, 2, 3]), ['left', 'right'])\n"
+            "AssertionError: Lists differ: [] != ['left', 'right']\n"
+        )
+        steps = [
+            tool_step("write_file", "puzzle_solver.py", content=implementation_source),
+            tool_step("write_file", "tests/test_puzzle_solver.py", content=test_source),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_puzzle_solver.py", content=test_source),
+            tool_step("read_file", "puzzle_solver.py", content=implementation_source),
+            {
+                "tool_name": "replace_text",
+                "tool_args": {
+                    "path": "puzzle_solver.py",
+                    "old_text": (
+                        "    def get_legal_moves(self, state):\n"
+                        "        try:\n"
+                        "            empty = state.index(0)\n"
+                        "        except ValueError:\n"
+                        "            return []\n"
+                    ),
+                    "new_text": (
+                        "    def get_legal_moves(self, state):\n"
+                        "        try:\n"
+                        "            empty = state.index(0)\n"
+                        "        except ValueError:\n"
+                        "            return []\n"
+                    ),
+                },
+                "tool_result": {"ok": False, "path": "puzzle_solver.py", "failure_type": "no_op_edit"},
+            },
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["state_space_test_fixture_value_suspected"])
+        self.assertEqual(state["state_space_fixture_value_impl_blocked_paths"], ["puzzle_solver.py"])
+        self.assertEqual(state["failed_unittest_no_match_write_only_paths"], ["tests/test_puzzle_solver.py"])
+        self.assertEqual(state["allowed_next_actions"], ["write_file tests/test_puzzle_solver.py"])
+        self.assertNotIn("replace_text puzzle_solver.py with a small unique old_text", state["allowed_next_actions"])
+        self.assertTrue(any("tool target" in hint for hint in state["unittest_repair_hints"]))
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=user_message,
+            tool_name="replace_text",
+            tool_args={
+                "path": "puzzle_solver.py",
+                "old_text": "return []",
+                "new_text": "return []",
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked["reason_code"],
+            "implementation_task_failed_unittest_prioritizes_fixture_repair_after_impl_noop",
+        )
+        self.assertEqual(blocked["allowed_next_actions"], ["write_file tests/test_puzzle_solver.py"])
+
+    def test_test_contract_rejects_contradictory_predicate_expectations(self) -> None:
+        runtime = self.runtime()
+        source = (
+            "import unittest\n"
+            "from puzzle import Puzzle\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.puzzle = Puzzle()\n\n"
+            "    def test_initial_state_is_not_solved(self):\n"
+            "        initial_state = [1, 2, 3, 0]\n"
+            "        self.assertFalse(self.puzzle.is_solved(initial_state))\n\n"
+            "    def test_goal_state_is_solved(self):\n"
+            "        goal_state = [1, 2, 3, 0]\n"
+            "        self.assertTrue(self.puzzle.is_solved(goal_state))\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message="Pythonでパズルを実装してunittestで検証してください。",
+            test_sources=[("tests/test_puzzle.py", source)],
+        )
+
+        issue_text = "\n".join(issues)
+        self.assertIn("contradictory predicate expectations", issue_text)
+        self.assertIn("is_solved", issue_text)
+        self.assertIn("tests/test_puzzle.py", issue_text)
+
+        issue = runtime._python_artifact_contract_issue(
+            user_message="Pythonでパズルを実装してunittestで検証してください。",
+            tool_name="write_file",
+            tool_args={
+                "path": "tests/test_puzzle.py",
+                "content": source,
+            },
+        )
+
+        self.assertIsNotNone(issue)
+        assert issue is not None
+        self.assertEqual(issue["reason_code"], "test_artifact_contract_incomplete")
+        self.assertIn("contradictory predicate expectations", issue["message"])
+
+    def test_test_contract_allows_distinct_predicate_fixtures(self) -> None:
+        runtime = self.runtime()
+        source = (
+            "import unittest\n"
+            "from puzzle import Puzzle\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.puzzle = Puzzle()\n\n"
+            "    def test_initial_state_is_not_solved(self):\n"
+            "        initial_state = [1, 2, 0, 3]\n"
+            "        self.assertFalse(self.puzzle.is_solved(initial_state))\n\n"
+            "    def test_goal_state_is_solved(self):\n"
+            "        goal_state = [1, 2, 3, 0]\n"
+            "        self.assertTrue(self.puzzle.is_solved(goal_state))\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message="Pythonでパズルを実装してunittestで検証してください。",
+            test_sources=[("tests/test_puzzle.py", source)],
+        )
+
+        self.assertNotIn(
+            "contradictory predicate expectations",
+            "\n".join(issues),
+        )
+
+    def test_test_contract_rejects_contradictory_call_result_expectations(self) -> None:
+        runtime = self.runtime()
+        source = (
+            "import unittest\n"
+            "from puzzle import Puzzle\n\n"
+            "class TestPuzzle(unittest.TestCase):\n"
+            "    def setUp(self):\n"
+            "        self.puzzle = Puzzle()\n\n"
+            "    def test_solve_returns_solution(self):\n"
+            "        initial_state = [1, 2, 3, 0]\n"
+            "        solution = self.puzzle.solve(initial_state)\n"
+            "        self.assertIsNotNone(solution)\n\n"
+            "    def test_solve_returns_none_for_impossible_state(self):\n"
+            "        impossible_state = [1, 2, 3, 0]\n"
+            "        solution = self.puzzle.solve(impossible_state)\n"
+            "        self.assertIsNone(solution)\n"
+        )
+
+        issues = runtime._test_source_contract_issues(
+            user_message="Pythonでパズルを実装してunittestで検証してください。",
+            test_sources=[("tests/test_puzzle.py", source)],
+        )
+
+        issue_text = "\n".join(issues)
+        self.assertIn("contradictory call-result expectations", issue_text)
+        self.assertIn("solve", issue_text)
+        self.assertIn("None and not None", issue_text)
+
+        issue = runtime._python_artifact_contract_issue(
+            user_message="Pythonでパズルを実装してunittestで検証してください。",
+            tool_name="write_file",
+            tool_args={
+                "path": "tests/test_puzzle.py",
+                "content": source,
+            },
+        )
+
+        self.assertIsNotNone(issue)
+        assert issue is not None
+        self.assertEqual(issue["reason_code"], "test_artifact_contract_incomplete")
+        self.assertIn("solvable fixtureとno-solution fixture", issue["suggested_fix"])
+
+    def test_japanese_incomplete_algorithm_comment_counts_as_placeholder(self) -> None:
+        runtime = self.runtime()
+        source = (
+            "def solve(initial_state):\n"
+            "    # ここに実際の解法アルゴリズムを実装する\n"
+            "    # 今回は簡単なテスト用の実装\n"
+            "    return None\n"
+        )
+
+        markers = runtime._python_source_placeholder_markers(source)
+
+        self.assertIn("incomplete-comment", markers)
+
+    def test_state_space_plan_enables_progress_gate_even_without_unittest_word(self) -> None:
+        runtime = self.runtime()
+        user_message = "１５パズルのプログラムを作り、それを実行して自分でクリアしてみて"
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+
+        manual_ui_source = (
+            "class FifteenPuzzle:\n"
+            "    def __init__(self):\n"
+            "        self.board = list(range(1, 16)) + [None]\n"
+            "        self.empty_index = 15\n"
+            "    def get_neighbors(self, index):\n"
+            "        return [index - 1] if index > 0 else [index + 1]\n"
+            "    def move(self, number):\n"
+            "        return number in self.board\n"
+            "    def is_solved(self):\n"
+            "        return self.board == list(range(1, 16)) + [None]\n"
+            "    def play(self):\n"
+            "        while not self.is_solved():\n"
+            "            input('move: ')\n"
+        )
+        steps = [tool_step("write_file", "fifteen_puzzle.py", content=manual_ui_source)]
+        state = runtime._implementation_task_progress_state(
+            user_message=user_message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["applicable"])
+        self.assertIn("unittest_run", state["contract"])
+        self.assertEqual(state["phase"], "implementation_present_needs_semantic_review")
+        self.assertTrue(
+            runtime._plan_run_test_should_wait_for_progress(
+                pending_task={"work_type": "run_test"},
+                progress_state=state,
+            )
+        )
+
+    def test_plan_work_unit_blocks_nested_decomposition_without_returning_child(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。"
+        runtime.frame_manager.create_root_frame(user_message)
+        plan = self.state_space_plan(runtime, user_message)
+        result = runtime._handle_create_plan(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=1,
+            tool_args={"plan": plan},
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+        self.assertTrue(result["ok"], result.get("error"))
+        active_before = runtime.frame_manager.current_frame()
+        self.assertIsNotNone(active_before)
+        assert active_before is not None
+        self.assertEqual(active_before.depth, 1)
+
+        blocked = runtime._handle_decompose_tasks(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=2,
+            tool_args={
+                "tasks": [
+                    {
+                        "goal": "rewrite this WorkUnit into another implementation task",
+                        "work_type": "edit",
+                        "first_action": {"tool": "write_file", "args": {"path": "puzzle.py", "content": "print('bad')\n"}},
+                        "success_evidence": "nested task completed",
+                        "why_not_direct_action": "nested split",
+                    }
+                ]
+            },
+            turn_workspace=runtime.execution_root,
+            user_message=user_message,
+            current_model="test-model",
+        )
+
+        self.assertFalse(blocked["ok"])
+        event = blocked["event"]
+        self.assertEqual(event["details"]["failure_type"], "plan_work_unit_decomposition_blocked")
+        self.assertEqual(event["details"]["blocked_by"], "frame_contract")
+        self.assertTrue(event["details"]["plan_work_unit"])
+        self.assertIn("直接", event["details"]["suggested_fix"])
+        active_after = runtime.frame_manager.current_frame()
+        self.assertIsNotNone(active_after)
+        assert active_after is not None
+        self.assertEqual(active_after.frame_id, active_before.frame_id)
+        parent = runtime.frame_manager.parent_of(active_after)
+        self.assertIsNotNone(parent)
+        assert parent is not None
+        self.assertEqual(parent.working_memory.completed_child_tasks, [])
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        self.assertFalse(any(event.get("type") == "frame_returned" for event in events))
+
+    def test_planning_required_prompt_exposes_only_create_plan_surface(self) -> None:
+        runtime = self.runtime()
+        user_message = "4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。"
+        runtime.frame_manager.create_root_frame(user_message)
+
+        system_prompt = runtime._system_prompt(
+            suppress_frame_operations=False,
+            allowed_tool_names=["create_plan"],
+        )
+        action_prompt = runtime._build_prompt(
+            goal_text="",
+            recent_events=[],
+            steps=[],
+            current_phase="PLANNING_REQUIRED",
+            user_message=user_message,
+            suppress_frame_operations=False,
+        )
+
+        self.assertIn("- create_plan:", system_prompt)
+        self.assertNotIn("- write_file:", system_prompt)
+        self.assertNotIn("- decompose_tasks:", system_prompt)
+        self.assertNotIn("フレーム操作:", system_prompt)
+        self.assertNotIn("利用可能なフレーム操作", action_prompt)
+        self.assertNotIn("write_file と append_file の tool_args.content", action_prompt)
+        self.assertIn("PlanRecord には実装コード本文", action_prompt)
+        self.assertIn("first_action は list_files か read_file", action_prompt)
+
+    def test_plan_execution_prompt_uses_progress_action_surface(self) -> None:
+        runtime = self.runtime()
+        state = {
+            "applicable": True,
+            "contract_state": "incomplete",
+            "phase": "implementation_missing",
+            "allowed_next_actions": ["write_file puzzle_solver.py"],
+        }
+
+        allowed_tool_names = runtime._implementation_task_schema_tool_names(state)
+        system_prompt = runtime._system_prompt(
+            suppress_frame_operations=runtime._implementation_task_should_suppress_frame_operations(state),
+            allowed_tool_names=allowed_tool_names,
+        )
+
+        self.assertEqual(allowed_tool_names, ["write_file"])
+        self.assertIn("- write_file:", system_prompt)
+        self.assertNotIn("- create_plan:", system_prompt)
+        self.assertNotIn("- decompose_tasks:", system_prompt)
+
+    def test_state_space_request_can_plan_then_reach_unittest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_message = "15パズルのような状態、合法手、ゴール、探索方針を持つ未知タスクをPython実装し、tests/にunittestを追加して検証してください。"
+            impl = (
+                "from collections import deque\n\n"
+                "def solve_state_space(start, goal, legal_moves, *, max_nodes=10000):\n"
+                "    if start == goal:\n"
+                "        return []\n"
+                "    queue = deque([(start, [])])\n"
+                "    seen = {start}\n"
+                "    while queue and len(seen) <= max_nodes:\n"
+                "        state, path = queue.popleft()\n"
+                "        for action, next_state in legal_moves(state):\n"
+                "            if next_state in seen:\n"
+                "                continue\n"
+                "            next_path = path + [action]\n"
+                "            if next_state == goal:\n"
+                "                return next_path\n"
+                "            seen.add(next_state)\n"
+                "            queue.append((next_state, next_path))\n"
+                "    return None\n\n"
+                "def replay(start, moves, transition):\n"
+                "    state = start\n"
+                "    for move in moves:\n"
+                "        state = transition(state, move)\n"
+                "    return state\n"
+            )
+            test = (
+                "import unittest\nfrom puzzle_solver import replay, solve_state_space\n\n"
+                "SWAPS = {0: {'R': 1, 'D': 2}, 1: {'L': 0, 'D': 3}, 2: {'U': 0, 'R': 3}, 3: {'U': 1, 'L': 2}}\n\n"
+                "def transition(state, move):\n"
+                "    blank = state.index(0)\n"
+                "    target = SWAPS[blank][move]\n"
+                "    data = list(state)\n"
+                "    data[blank], data[target] = data[target], data[blank]\n"
+                "    return tuple(data)\n\n"
+                "def legal_moves(state):\n"
+                "    blank = state.index(0)\n"
+                "    for move in sorted(SWAPS[blank]):\n"
+                "        yield move, transition(state, move)\n\n"
+                "class TestPuzzleSolver(unittest.TestCase):\n"
+                "    def test_finds_and_replays_solution(self):\n"
+                "        start = (1, 0, 3, 2)\n"
+                "        goal = (1, 2, 3, 0)\n"
+                "        moves = solve_state_space(start, goal, legal_moves)\n"
+                "        self.assertIsNotNone(moves)\n"
+                "        self.assertEqual(replay(start, moves, transition), goal)\n\n"
+                "    def test_reports_none_when_bounded_search_exhausts(self):\n"
+                "        self.assertIsNone(solve_state_space((1, 0, 3, 2), (1, 2, 3, 0), legal_moves, max_nodes=0))\n"
+            )
+            bootstrap_workspace(root)
+            runtime = AgentRuntime(root, llm_backend=FakeBackend([]))
+            plan = self.state_space_plan(runtime, user_message)
+            plan["work_units"] = [
+                {
+                    "unit_id": "write-generic-state-space-solver",
+                    "goal": "Write the generic state-space search implementation.",
+                    "depends_on": [],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "puzzle_solver.py contains solve_state_space and replay.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "write-state-space-tests",
+                    "goal": "Write tests that call the final verifier by replaying each legal action to the goal.",
+                    "depends_on": ["write-generic-state-space-solver"],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "tests/test_puzzle_solver.py asserts that legal action replay reaches the goal.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "run-state-space-tests",
+                    "goal": "Run tests that verify legal action replay reaches the goal.",
+                    "depends_on": ["write-state-space-tests"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "final_verifier replay validates legal actions and unittest exits successfully.",
+                    "should_open_child_frame": True,
+                },
+            ]
+            responses = [
+                json.dumps({
+                    "assistant_message": "create generic state-space PlanRecord",
+                    "tool_name": "create_plan",
+                    "tool_args": {"plan": plan},
+                }),
+                json.dumps({
+                    "assistant_message": "write implementation after plan first observation",
+                    "tool_name": "write_file",
+                    "tool_args": {"path": "puzzle_solver.py", "content": impl},
+                }),
+                json.dumps({
+                    "assistant_message": "write state-space tests",
+                    "tool_name": "write_file",
+                    "tool_args": {"path": "tests/test_puzzle_solver.py", "content": test},
+                }),
+                json.dumps({
+                    "assistant_message": "finish after planned unittest evidence",
+                    "tool_name": "finish",
+                    "tool_args": {"final_answer": "implementation, tests, and verifier run completed"},
+                }),
+            ]
+            runtime = AgentRuntime(root, llm_backend=FakeBackend(responses))
+            runtime.config.setdefault("runtime", {})["max_steps_per_message"] = 4
+
+            result = runtime.send_message(user_message, run_immediately=True)
+
+            self.assertTrue(result["ok"], result.get("error"))
+            events = read_jsonl(root / "state" / "sessions" / "main" / "events.jsonl")
+            self.assertTrue(any(event.get("type") == "plan_record" for event in events))
+            self.assertTrue(any(event.get("type") == "task_plan" for event in events))
+            self.assertTrue(any(event.get("type") == "tool_result" and event.get("tool_name") == "run_command" for event in events))
+            self.assertTrue(any(event.get("type") == "finish" for event in events))
+            self.assertTrue(any((root / "workspaces").glob("**/puzzle_solver.py")))
+            self.assertTrue(any((root / "workspaces").glob("**/tests/test_puzzle_solver.py")))
+
+    def test_edit_work_unit_returns_after_successful_edit_and_continues_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_message = "状態、合法手、ゴール、探索方針を持つ未知タスクをPython実装してください。"
+            bootstrap_workspace(root)
+            seed_runtime = AgentRuntime(root, llm_backend=FakeBackend([]))
+            plan = self.state_space_plan(seed_runtime, user_message)
+            plan["work_units"] = [
+                {
+                    "unit_id": "write-state-tool",
+                    "goal": "Write the state-space tool implementation.",
+                    "depends_on": [],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "puzzle.py contains executable state-space code.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-replay",
+                    "goal": "Run final_verifier that replays each legal action and confirms it reaches the goal.",
+                    "depends_on": ["write-state-tool"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "final_verifier replays only legal actions from the start state and reaches the goal.",
+                    "should_open_child_frame": True,
+                },
+            ]
+            responses = [
+                json.dumps({"tool_name": "create_plan", "tool_args": {"plan": plan}}),
+                json.dumps({
+                    "tool_name": "write_file",
+                    "tool_args": {
+                        "path": "puzzle.py",
+                        "content": "print('final_verifier replays legal actions and reaches the goal')\n",
+                    },
+                }),
+                json.dumps({
+                    "tool_name": "read_file",
+                    "tool_args": {"path": "puzzle.py"},
+                }),
+            ]
+            runtime = AgentRuntime(root, llm_backend=FakeBackend(responses))
+            runtime.config.setdefault("runtime", {})["max_steps_per_message"] = 3
+            runtime.config.setdefault("runtime", {})["verified_implementation_max_steps"] = 3
+            runtime.config.setdefault("runtime", {})["planned_implementation_max_steps"] = 3
+            runtime.runtime_config["verified_implementation_max_steps"] = 3
+            runtime.runtime_config["planned_implementation_max_steps"] = 3
+
+            result = runtime.send_message(user_message, run_immediately=True)
+
+            self.assertEqual(result["run"]["last_result"].get("error"), "step limit reached")
+            events = read_jsonl(root / "state" / "sessions" / "main" / "events.jsonl")
+            returns = [event for event in events if event.get("type") == "frame_returned"]
+            self.assertGreaterEqual(len(returns), 1)
+            self.assertTrue(any("write_file" in str(event.get("return_payload") or {}) for event in returns))
+            self.assertTrue(any(event.get("code") == "plan_execution_paused_for_progress" for event in events))
+            self.assertFalse(any(event.get("type") == "tool_result" and event.get("tool_name") == "run_command" for event in events))
+
+    def test_step_limit_final_gate_does_not_accept_with_pending_plan_work_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_message = "状態、合法手、ゴール、探索方針を持つ未知タスクをPython実装してください。"
+            bootstrap_workspace(root)
+            seed_runtime = AgentRuntime(root, llm_backend=FakeBackend([]))
+            plan = self.state_space_plan(seed_runtime, user_message)
+            plan["work_units"] = [
+                {
+                    "unit_id": "write-state-tool",
+                    "goal": "Write the state-space tool implementation.",
+                    "depends_on": [],
+                    "work_type": "edit",
+                    "first_action": {"tool": "list_files", "args": {"path": "."}},
+                    "success_evidence": "puzzle.py contains executable state-space code.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-replay-once",
+                    "goal": "Run final_verifier that replays each legal action and confirms it reaches the goal.",
+                    "depends_on": ["write-state-tool"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "final_verifier replays only legal actions from the start state and reaches the goal.",
+                    "should_open_child_frame": True,
+                },
+                {
+                    "unit_id": "verify-replay-again",
+                    "goal": "Run an independent final verifier that replays legal actions to the goal.",
+                    "depends_on": ["verify-replay-once"],
+                    "work_type": "run_test",
+                    "first_action": {"tool": "run_command", "args": {"command": "python3 -m unittest discover -s tests"}},
+                    "success_evidence": "independent final_verifier replay validates legal actions and reaches the goal.",
+                    "should_open_child_frame": True,
+                },
+            ]
+            responses = [
+                json.dumps({"tool_name": "create_plan", "tool_args": {"plan": plan}}),
+                json.dumps({
+                    "tool_name": "write_file",
+                    "tool_args": {
+                        "path": "puzzle.py",
+                        "content": "print('final_verifier replays legal actions and reaches the goal')\n",
+                    },
+                }),
+                json.dumps({
+                    "tool_name": "read_file",
+                    "tool_args": {"path": "puzzle.py"},
+                }),
+            ]
+            runtime = AgentRuntime(root, llm_backend=FakeBackend(responses))
+            runtime.config.setdefault("runtime", {})["max_steps_per_message"] = 3
+            runtime.config.setdefault("runtime", {})["verified_implementation_max_steps"] = 3
+            runtime.config.setdefault("runtime", {})["planned_implementation_max_steps"] = 3
+            runtime.runtime_config["verified_implementation_max_steps"] = 3
+            runtime.runtime_config["planned_implementation_max_steps"] = 3
+
+            result = runtime.send_message(user_message, run_immediately=True)
+
+            last_result = result["run"]["last_result"]
+            self.assertFalse(last_result["ok"])
+            self.assertEqual(last_result["error"], "step limit reached")
+            events = read_jsonl(root / "state" / "sessions" / "main" / "events.jsonl")
+            self.assertTrue(any(event.get("code") == "plan_execution_paused_for_progress" for event in events))
+            self.assertTrue(any(event.get("code") == "step_limit_reached" for event in events))
+            self.assertFalse(any(event.get("code") == "step_limit_final_gate" for event in events))
+            self.assertFalse(any(event.get("type") == "finish" and event.get("role") == "assistant" for event in events))
+
+    def test_continue_after_step_limit_reuses_workspace_and_event_sourced_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap_workspace(root)
+            backend = FakeBackend([
+                json.dumps({
+                    "tool_name": "write_file",
+                    "tool_args": {
+                        "path": "calc.py",
+                        "content": "def add(a, b):\n    return a + b\n",
+                    },
+                }),
+            ])
+            runtime = AgentRuntime(root, llm_backend=backend)
+            runtime.config.setdefault("runtime", {})["max_steps_per_message"] = 1
+            runtime.runtime_config["max_steps_per_message"] = 1
+            runtime.config.setdefault("runtime", {})["verified_implementation_max_steps"] = 1
+            runtime.runtime_config["verified_implementation_max_steps"] = 1
+            first = runtime.send_message(
+                "Pythonでadd関数を実装してunittestで検証してください。",
+                run_immediately=True,
+            )
+            self.assertEqual(first["run"]["last_result"]["error"], "step limit reached")
+            first_workspace = next((root / "workspaces" / "runs").iterdir())
+            self.assertTrue((first_workspace / "calc.py").exists())
+
+            backend.responses.append(json.dumps({
+                "tool_name": "write_file",
+                "tool_args": {
+                    "path": "tests/test_calc.py",
+                    "content": (
+                        "import unittest\n"
+                        "from calc import add\n\n"
+                        "class TestCalc(unittest.TestCase):\n"
+                        "    def test_add(self):\n"
+                        "        self.assertEqual(add(2, 3), 5)\n\n"
+                        "if __name__ == '__main__':\n"
+                        "    unittest.main()\n"
+                    ),
+                },
+            }))
+            second = runtime.send_message("続けてください。前回workspaceとeventsを正として未完タスクを進めてください。", run_immediately=True)
+
+            self.assertEqual(second["run"]["last_result"]["error"], "step limit reached")
+            workspaces = sorted((root / "workspaces" / "runs").iterdir())
+            self.assertEqual(workspaces, [first_workspace])
+            self.assertTrue((first_workspace / "tests" / "test_calc.py").exists())
+            events = read_jsonl(root / "state" / "sessions" / "main" / "events.jsonl")
+            resume_events = [event for event in events if event.get("code") == "workspace_resume"]
+            self.assertTrue(resume_events)
+            self.assertGreaterEqual(resume_events[-1]["details"]["resumed_step_count"], 1)
+            prompts = read_jsonl(root / "state" / "sessions" / "main" / "prompts.jsonl")
+            self.assertIn("tests/test_*.py", prompts[-1]["prompt"])
+            self.assertIn("実装タスク進行状態: tests_missing", prompts[-1]["prompt"])
+            self.assertIn("[current_steps]", prompts[-1]["prompt"])
+
+    def test_new_task_after_step_limit_starts_new_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap_workspace(root)
+            backend = FakeBackend([
+                json.dumps({
+                    "tool_name": "write_file",
+                    "tool_args": {
+                        "path": "first.py",
+                        "content": "def first():\n    return 1\n",
+                    },
+                }),
+                json.dumps({
+                    "tool_name": "write_file",
+                    "tool_args": {
+                        "path": "second.py",
+                        "content": "def second():\n    return 2\n",
+                    },
+                }),
+            ])
+            runtime = AgentRuntime(root, llm_backend=backend)
+            runtime.config.setdefault("runtime", {})["max_steps_per_message"] = 1
+            runtime.runtime_config["max_steps_per_message"] = 1
+            runtime.config.setdefault("runtime", {})["verified_implementation_max_steps"] = 1
+            runtime.runtime_config["verified_implementation_max_steps"] = 1
+
+            runtime.send_message("Pythonでfirst関数を実装してunittestで検証してください。", run_immediately=True)
+            runtime.send_message("別のPythonタスクとしてsecond関数を実装してunittestで検証してください。", run_immediately=True)
+
+            workspaces = sorted((root / "workspaces" / "runs").iterdir())
+            self.assertEqual(len(workspaces), 2)
+            self.assertTrue(any((workspace / "first.py").exists() for workspace in workspaces))
+            self.assertTrue(any((workspace / "second.py").exists() for workspace in workspaces))
+            events = read_jsonl(root / "state" / "sessions" / "main" / "events.jsonl")
+            self.assertFalse(any(event.get("code") == "workspace_resume" for event in events))
+
+    def test_unittest_timeout_triggers_plan_revision_phase(self) -> None:
+        runtime = self.runtime()
+        step = tool_step(
+            "run_command",
+            ok=False,
+            command="python3 -m unittest discover -s tests",
+            error="Timed out after 60 seconds",
+            failure_type="command_timeout",
+        )
+
+        phase = runtime._current_phase(
+            user_message="4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。",
+            steps=[step],
+            recent_events=[],
+        )
+
+        self.assertEqual(phase, "PLAN_REVISION")
+
+        blocked = runtime._planner_action_blocked_event(
+            session_id="main",
+            turn_id="turn",
+            queue_id="queue",
+            step_index=2,
+            turn_workspace=runtime.execution_root,
+            tool_name="write_file",
+            user_message="4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。",
+            current_phase=phase,
+            recent_events=[],
+            steps=[step],
+        )
+        self.assertIsNotNone(blocked)
+        events = read_jsonl(runtime.paths.session_events_path("main"))
+        revision_events = [event for event in events if event.get("type") == "plan_revision"]
+        self.assertTrue(revision_events)
+        self.assertIn("command_timeout", revision_events[-1]["details"]["revision_reasons"])
+
+    def test_invalid_work_package_after_plan_attempt_triggers_plan_revision_phase(self) -> None:
+        runtime = self.runtime()
+        event = {
+            "type": "system_note",
+            "role": "system",
+            "content": "decompose_tasks requires a concrete work_package",
+            "code": "work_package_invalid",
+            "reason_code": "missing_work_package_contract",
+            "details": {"failure_type": "work_package_invalid"},
+        }
+
+        phase = runtime._current_phase(
+            user_message="4x4 sliding puzzle を状態、合法手、ゴール、探索方針で解く実装を作ってください。",
+            steps=[],
+            recent_events=[event],
+        )
+
+        self.assertEqual(phase, "PLAN_REVISION")
+
     def test_finish_acceptance_prompt_is_not_filtered_out(self) -> None:
         runtime = self.runtime()
         event = {
@@ -2177,6 +6787,25 @@ class GenericRuntimeContractTests(unittest.TestCase):
         self.assertEqual(result["blocked_by"], "tool_safety_policy")
         self.assertIn("allowed_next_actions", result)
         self.assertIn("next_required_action", result)
+
+    def test_run_command_allows_separators_inside_quoted_process_argument(self) -> None:
+        runtime = self.runtime()
+
+        result = runtime.tools.execute("run_command", {"command": "python3 -c \"print('one'); print('two')\""})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["returncode"], 0)
+        self.assertIn("one", result["stdout"])
+        self.assertIn("two", result["stdout"])
+
+    def test_run_command_blocks_separator_outside_quotes(self) -> None:
+        runtime = self.runtime()
+
+        result = runtime.tools.execute("run_command", {"command": "python3 -c \"print('one')\" ; python3 -c \"print('two')\""})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_type"], "multi_command_denied")
+        self.assertIn("outside quotes", result["error"])
 
     def test_test_semantic_review_blocks_broad_replace_and_allows_write_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2286,8 +6915,14 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertEqual(state["phase"], "unittest_failed_needs_fix")
-        self.assertEqual(state["allowed_next_actions"], ["write_file math_tools.py"])
-        self.assertEqual(state["failed_unittest_no_match_write_only_paths"], ["math_tools.py"])
+        self.assertEqual(
+            set(state["allowed_next_actions"]),
+            {"write_file tests/test_math_tools.py", "write_file math_tools.py"},
+        )
+        self.assertEqual(
+            set(state["failed_unittest_no_match_write_only_paths"]),
+            {"tests/test_math_tools.py", "math_tools.py"},
+        )
 
         blocked = runtime._implementation_task_phase_action_block(
             user_message=message,
@@ -2325,6 +6960,303 @@ class GenericRuntimeContractTests(unittest.TestCase):
             turn_workspace=runtime.execution_root,
         )
         self.assertIsNone(broad_write)
+
+        test_write = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={
+                "path": "tests/test_math_tools.py",
+                "content": test.replace("self.assertEqual(add_one(1), 2)", "self.assertEqual(add_one(1), 1)"),
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(test_write)
+
+    def test_failed_unittest_repeated_noop_switches_to_alternate_target(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            f"  File \"{runtime.execution_root / 'math_tools.py'}\", line 2, in add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("read_file", "math_tools.py", content=impl),
+            {
+                "tool_name": "replace_text",
+                "tool_args": {
+                    "path": "tests/test_math_tools.py",
+                    "old_text": "        self.assertEqual(add_one(1), 2)",
+                    "new_text": "        self.assertEqual(add_one(1), 2)",
+                },
+                "tool_result": {
+                    "ok": False,
+                    "path": "tests/test_math_tools.py",
+                    "failure_type": "no_op_edit",
+                },
+            },
+            {
+                "tool_name": "write_file",
+                "tool_args": {"path": "tests/test_math_tools.py", "content": test},
+                "tool_result": {
+                    "ok": False,
+                    "path": "tests/test_math_tools.py",
+                    "failure_type": "no_op_edit",
+                },
+            },
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(state["phase"], "unittest_failed_needs_fix")
+        self.assertEqual(state["failed_unittest_repeated_noop_paths"], ["tests/test_math_tools.py"])
+        self.assertEqual(state["failed_unittest_noop_blocked_paths"], ["tests/test_math_tools.py"])
+        self.assertIn("math_tools.py", state["failed_unittest_noop_alternate_paths"])
+        self.assertIn("write_file math_tools.py", state["allowed_next_actions"])
+        self.assertNotIn("write_file tests/test_math_tools.py", state["allowed_next_actions"])
+        prompt = runtime._implementation_task_progress_prompt(state)
+        self.assertIn("no_op edit反復の修復契約", prompt)
+        self.assertIn("次に照合・修正すべき別対象", prompt)
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "tests/test_math_tools.py", "content": test},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(blocked["reason_code"], "implementation_task_failed_unittest_blocks_repeated_noop_target")
+
+        allowed_impl = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "math_tools.py", "content": "def add_one(value):\n    return value + 1\n"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_impl)
+
+    def test_failed_unittest_no_match_still_allows_unread_traceback_file_read(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            f"  File \"{runtime.execution_root / 'math_tools.py'}\", line 2, in add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "math_tools.py", content=impl),
+            {
+                "tool_name": "replace_text",
+                "tool_args": {
+                    "path": "math_tools.py",
+                    "old_text": "def add_one(value): return value",
+                    "new_text": "def add_one(value):\n    return value + 1\n",
+                },
+                "tool_result": {"ok": False, "path": "math_tools.py", "failure_type": "replace_text_no_match"},
+            },
+        ]
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            state["allowed_next_actions"],
+            ["read_file tests/test_math_tools.py once"],
+        )
+
+        allowed_read = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="read_file",
+            tool_args={"path": "tests/test_math_tools.py"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertIsNone(allowed_read)
+
+        blocked_replace = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="replace_text",
+            tool_args={
+                "path": "math_tools.py",
+                "old_text": "    return value",
+                "new_text": "    return value + 1",
+            },
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked_replace["reason_code"],
+            "implementation_task_failed_unittest_requires_recovery_read",
+        )
+
+    def test_failed_unittest_blocked_unmatched_replace_forces_write_file_next(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("read_file", "math_tools.py", content=impl),
+        ]
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                "content": "replace_text was blocked after no exact match",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "math_tools.py",
+                    "blocked_tool": "replace_text",
+                    "exact_old_text_matches": 0,
+                },
+            },
+        )
+        for index in range(300):
+            runtime._append_session_event(
+                "main",
+                {
+                    "type": "runtime_event",
+                    "event_name": "llm_stream_chunk",
+                    "content": f"chunk-{index}",
+                },
+            )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertEqual(
+            set(state["failed_unittest_no_match_write_only_paths"]),
+            {"tests/test_math_tools.py", "math_tools.py"},
+        )
+        self.assertEqual(
+            set(state["allowed_next_actions"]),
+            {"write_file tests/test_math_tools.py", "write_file math_tools.py"},
+        )
+
+    def test_repeated_unittest_no_match_does_not_reoffer_nonreducing_full_write(self) -> None:
+        runtime = self.runtime()
+        message = "Pythonで add_one(value) を実装し、tests/ にunittestを追加して検証してください。"
+        impl = "def add_one(value):\n    return value\n"
+        changed_but_wrong_impl = "def add_one(value):\n    return value - 1\n"
+        test = (
+            "import unittest\nfrom math_tools import add_one\n\n"
+            "class TestMathTools(unittest.TestCase):\n"
+            "    def test_add_one(self):\n"
+            "        self.assertEqual(add_one(1), 2)\n"
+        )
+        stderr = (
+            "FAIL: test_add_one (test_math_tools.TestMathTools.test_add_one)\n"
+            f"  File \"{runtime.execution_root / 'tests' / 'test_math_tools.py'}\", line 5, in test_add_one\n"
+            "AssertionError: 1 != 2\n"
+        )
+        steps = [
+            tool_step("write_file", "math_tools.py", content=impl),
+            tool_step("write_file", "tests/test_math_tools.py", content=test),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+            tool_step("read_file", "tests/test_math_tools.py", content=test),
+            tool_step("read_file", "math_tools.py", content=impl),
+            tool_step("write_file", "math_tools.py", content=changed_but_wrong_impl),
+            run_step("python3 -m unittest discover -s tests", ok=False, stderr=stderr),
+        ]
+        runtime._append_session_event(
+            "main",
+            {
+                "type": "system_note",
+                "code": "implementation_task_progress_blocked",
+                "reason_code": "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                "content": "replace_text was blocked after no exact match",
+                "details": {
+                    "reason_code": "implementation_task_failed_unittest_blocks_unmatched_replace_text",
+                    "phase": "unittest_failed_needs_fix",
+                    "path": "math_tools.py",
+                    "blocked_tool": "replace_text",
+                    "exact_old_text_matches": 0,
+                },
+            },
+        )
+
+        state = runtime._implementation_task_progress_state(
+            user_message=message,
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+
+        self.assertTrue(state["repeated_unittest_failure_signature"])
+        self.assertEqual(state["same_signature_nonreducing_edit_paths"], ["math_tools.py"])
+        self.assertNotIn("math_tools.py", state["failed_unittest_no_match_write_only_paths"])
+        self.assertIn("replace_text math_tools.py with a small unique old_text", state["allowed_next_actions"])
+        self.assertNotIn("write_file math_tools.py", state["allowed_next_actions"])
+
+        blocked = runtime._implementation_task_phase_action_block(
+            user_message=message,
+            tool_name="write_file",
+            tool_args={"path": "math_tools.py", "content": "def add_one(value):\n    return value + 1\n"},
+            steps=steps,
+            session_id="main",
+            turn_workspace=runtime.execution_root,
+        )
+        self.assertEqual(
+            blocked["reason_code"],
+            "implementation_task_failed_unittest_blocks_repeated_full_write_after_nonreducing_signature",
+        )
+        self.assertNotIn("write_file math_tools.py", blocked["allowed_next_actions"])
 
     def test_failed_unittest_blocks_unrelated_implementation_edit(self) -> None:
         runtime = self.runtime()

@@ -22,7 +22,35 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\bmkfs\b",
 ]
 
-MULTI_COMMAND_PATTERN = re.compile(r"(&&|\|\||;|\n)")
+def has_unquoted_command_separator(command: str) -> bool:
+    """Return True when a shell command chains processes outside quotes."""
+
+    quote: str | None = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            i += 1
+            continue
+        if char in {";", "\n", "|", "&"}:
+            return True
+        i += 1
+    return False
 
 
 class ToolExecutor:
@@ -43,6 +71,21 @@ class ToolExecutor:
                 "name": "run_command",
                 "args": {"command": "shell command", "timeout_seconds": "optional int", "shell": "optional: auto|zsh|bash|sh|powershell"},
                 "description": "Run a shell command inside the workspace.",
+            },
+            {
+                "name": "create_plan",
+                "args": {
+                    "plan": {
+                        "plan_id": "stable plan id",
+                        "profile": "ProblemProfile derived from the request",
+                        "strategy": "direct_implementation|task_decomposition|state_space_search|dynamic_programming|constraint_satisfaction|graph_shortest_path|classical_planning",
+                        "work_units": "ordered WorkUnit list with first_action and success_evidence",
+                        "verification_contract": "strategy-specific verification contract",
+                        "status": "proposed",
+                        "revision_count": 0,
+                    }
+                },
+                "description": "Create a structured PlanRecord before executing a complex task; accepted plans are converted into child-frame work packages.",
             },
             {
                 "name": "decompose_tasks",
@@ -265,6 +308,21 @@ class ToolExecutor:
         max_bytes = self.content_chunk_max_bytes
         hard_max_bytes = self._hard_content_max_bytes()
         rel_path = str(target.relative_to(self.root))
+        if target.exists() and target.read_text(encoding="utf-8") == content:
+            return {
+                "ok": False,
+                "tool": "write_file",
+                "path": rel_path,
+                "error": "write_file content is identical to the existing file; edit would not change the file",
+                "failure_type": "no_op_edit",
+                "blocked_by": "runtime_edit_validation",
+                "allowed_next_actions": [
+                    {"tool": "replace_text", "strategy": "change only the minimal text needed to reduce the failing signature"},
+                    {"tool": "write_file", "strategy": "rewrite the complete target file with real changes"},
+                ],
+                "suggested_fix": "contentが現行ファイルと同一です。失敗signatureを減らす具体的な差分を含む内容を返してください。",
+                "next_required_action": "submit changed file content that targets the reported failure",
+            }
         size_guidance = self._content_size_guidance(tool_name="write_file", path=rel_path, content=content)
         if size_guidance is not None and not bool(size_guidance.get("ok")):
             return size_guidance
@@ -489,6 +547,22 @@ class ToolExecutor:
         target = self._resolve_path(path)
         if not target.exists():
             raise ValueError(f"file does not exist: {path}")
+        if old_text == new_text:
+            rel_path = str(target.relative_to(self.root))
+            return {
+                "ok": False,
+                "tool": "replace_text",
+                "path": rel_path,
+                "error": "replace_text old_text and new_text are identical; edit would not change the file",
+                "failure_type": "no_op_edit",
+                "blocked_by": "runtime_edit_validation",
+                "allowed_next_actions": [
+                    {"tool": "replace_text", "strategy": "change only the minimal text needed to reduce the failing signature"},
+                    {"tool": "write_file", "strategy": "rewrite the complete valid file only if a targeted replacement cannot express the fix"},
+                ],
+                "suggested_fix": "old_textとnew_textが同一です。失敗signatureを減らす具体的な差分だけを返してください。",
+                "next_required_action": "submit a non-empty edit that changes the file and targets the reported failure",
+            }
         content = target.read_text(encoding="utf-8")
         count = content.count(old_text)
         normalized_whole_file_match = (
@@ -531,6 +605,21 @@ class ToolExecutor:
             }
         updated = content.replace(old_text, new_text, 1)
         rel_path = str(target.relative_to(self.root))
+        if updated == content:
+            return {
+                "ok": False,
+                "tool": "replace_text",
+                "path": rel_path,
+                "error": "replace_text produced no file change",
+                "failure_type": "no_op_edit",
+                "blocked_by": "runtime_edit_validation",
+                "allowed_next_actions": [
+                    {"tool": "replace_text", "strategy": "change only the minimal text needed to reduce the failing signature"},
+                    {"tool": "write_file", "strategy": "rewrite the complete valid file only if a targeted replacement cannot express the fix"},
+                ],
+                "suggested_fix": "replace_textが無変更になっています。失敗signatureを減らす具体的な差分だけを返してください。",
+                "next_required_action": "submit a non-empty edit that changes the file and targets the reported failure",
+            }
         syntax_error = self._source_syntax_error(path=rel_path, content=updated)
         if syntax_error:
             return self._syntax_validation_failed_result(
@@ -568,16 +657,16 @@ class ToolExecutor:
                 "suggested_fix": "run_command.command に実行する単一コマンドを入れてください。",
                 "next_required_action": "retry run_command with a non-empty command",
             }
-        if MULTI_COMMAND_PATTERN.search(clean):
+        if has_unquoted_command_separator(clean):
             return {
                 "ok": False,
                 "tool": "run_command",
                 "command": clean,
-                "error": "run_command accepts exactly one command per step; chaining multiple commands is not allowed",
+                "error": "run_command accepts exactly one shell command per step; chaining commands with separators outside quotes is not allowed",
                 "failure_type": "multi_command_denied",
                 "blocked_by": "tool_safety_policy",
-                "allowed_next_actions": [{"tool": "run_command", "strategy": "run exactly one command without &&, ||, semicolon, or newline"}],
-                "suggested_fix": "連結コマンドを分解し、次に必要な1コマンドだけを実行してください。",
+                "allowed_next_actions": [{"tool": "run_command", "strategy": "run one process only; separators such as ;, &&, ||, |, or newline are allowed only inside a quoted argument"}],
+                "suggested_fix": "シェル連結は分解し、次に必要な1プロセスだけを実行してください。python3 -c などの引用符内コードに含まれるセミコロンは許可されます。",
                 "next_required_action": "retry run_command with a single command",
             }
         for pattern in DANGEROUS_COMMAND_PATTERNS:

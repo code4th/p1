@@ -96,7 +96,7 @@ JSON contract は provider-native tool calling ではなくテキスト JSON で
 
 長いコード全文を `tool_args.content` に詰める運用は禁止する。新規ファイルは小さな `write_file` で開始し、`append_file` で 2000 bytes 以下の chunk を追加する。既存ファイル編集は `read_file` 後に `replace_text` で最小差分を適用する。`write_file` / `append_file` は大きすぎる chunk を拒否し、dashboard には LLM parse failure と stream metadata を表示する。
 
-単純な scaffold で確実に処理できる coding task は、LLM に長文コードを JSON で生成させず controller fast path を使ってよい。現在は「迷路プログラムを作成・実行・表示する」要求に対して、`maze_gen.py` を小さな既知 scaffold として `write_file` し、`python3 maze_gen.py` を実行する。fast path は `llm_attempt_count = 0` として記録し、LLM の自由生成と区別する。
+controller fast path は、ユーザーが明示したコマンドを即時実行する用途に限定する。benchmark 的な coding prompt に対して固定成果物を合成する scaffold fast path は、能力評価を汚染するため持たない。
 
 行動モデルに渡す文脈は、現在のユーザー依頼、直近の tool call/result、重要な system note、短い reflection に絞る。実況解説者の `observer_note`、古い別タスク、過去の失敗した長大な assistant output は action prompt に再投入しない。
 

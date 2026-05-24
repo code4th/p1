@@ -12,12 +12,14 @@ Use it when resuming work after context loss, switching projects, or starting P4
 - P1 canonical entry: [P1_MASTER.md](/Users/satojunichi/Documents/openclaw/handoff/P1_MASTER.md)
 - P2 canonical entry: [P2_INDEX.md](/Users/satojunichi/Documents/openclaw/handoff/P2_INDEX.md)
 - P3 canonical entry: [p3-canonical-mainline-2026-04-21.md](/Users/satojunichi/Documents/openclaw/handoff/p3-canonical-mainline-2026-04-21.md)
+- P4 canonical entry: [p4-canonical-mainline-2026-04-26.md](/Users/satojunichi/Documents/openclaw/handoff/p4-canonical-mainline-2026-04-26.md)
 
 ## Code Roots
 
 - P1 code: [p1-core](/Users/satojunichi/Documents/openclaw/p1-core)
 - P2 code: [p2-core](/Users/satojunichi/Documents/openclaw/p2-core)
 - P3 code: [p3-core](/Users/satojunichi/Documents/openclaw/p3-core)
+- P4 code: [p4-core](/Users/satojunichi/Documents/openclaw/p4-core)
 
 ## Resume Order
 
@@ -44,11 +46,23 @@ cd /Users/satojunichi/Documents/openclaw/p3-core
 python3 -m unittest discover -s tests
 ```
 
+```bash
+cd /Users/satojunichi/Documents/openclaw/p4-core
+python3 -m unittest discover -s tests
+```
+
 ## Latest Known Test State
 
 - P2: `68 tests OK`
 - P3: `35 tests OK`
+- P4: `93 tests`, judge/runtime layer fully clean. 5 dashboard test failures + 1 dashboard error are pre-existing (rendering layer drift unrelated to runtime/judge invariants).
 - P1: `76 tests`, with 5 known failures at the time of finalization
+
+P4 refinements after 0.4.0-mainline:
+
+- 2026-05-02: workspace bootstrap fallback (DEFAULT_CONFIG deep-merge)
+- 2026-05-03: judge verdict-first schema (`p4-judge-verdict-first-2026-05-03.md`)
+- 2026-05-03: follow-through recovery (やり切る invariant) (`p4-followthrough-recovery-2026-05-03.md`)
 
 P1 is committed as a mainline artifact, but it is not test-clean. Treat P1 test repair as the first P1-specific continuation task.
 

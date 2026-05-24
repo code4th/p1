@@ -30,7 +30,8 @@ def _chat_with_repair(
     retry_limit = int(self.runtime_config.get("json_retry_limit") or 0)
     thinking_only_repair_limit = int(self.runtime_config.get("thinking_only_repair_limit") if self.runtime_config.get("thinking_only_repair_limit") is not None else 1)
     max_stream_chars = int(self.runtime_config.get("max_machine_control_stream_chars") or 24000)
-    if str(current_phase or "").startswith("IMPLEMENTATION_TASK_PROGRESS"):
+    phase_name = str(current_phase or "")
+    if phase_name.startswith("IMPLEMENTATION_TASK_PROGRESS") or phase_name == "PLAN_EXECUTION":
         implementation_stream_chars = int(
             self.runtime_config.get("implementation_task_machine_control_stream_chars") or 10000
         )
@@ -154,6 +155,7 @@ def _chat_with_repair(
                         thinking_text=last_thinking,
                         max_stream_chars=max_stream_chars,
                         schema=active_tool_action_schema,
+                        current_phase=current_phase,
                     )
                     if stop_reason:
                         stream_metadata["client_abort_reason"] = stop_reason
@@ -644,6 +646,16 @@ def _json_repair_prompt(
             "Do not continue that repeated text. Return one smaller complete tool JSON object that directly performs "
             "the next allowed action, preferably a minimal meaningful artifact or targeted edit. "
         )
+    elif client_abort_reason == "plan_record_embedded_edit_stream":
+        length_note = (
+            "The previous create_plan response was stopped because a PlanRecord WorkUnit first_action tried to use "
+            "write_file, append_file, or replace_text. This is not a length problem. Do not put implementation edits "
+            "inside create_plan. Return a concise PlanRecord only, and make every WorkUnit first_action use one of "
+            "list_files, read_file, search_code, or run_command. Implementation code must be emitted later during "
+            "PLAN_EXECUTION after the child frame opens. For any edit WorkUnit, use exactly "
+            '{"first_action":{"tool":"list_files","args":{"path":"."}}} or another inspect-only first_action; '
+            "never use write_file as an edit WorkUnit first_action. "
+        )
     schema_note = ""
     clean_errors = [str(item).strip() for item in schema_errors or [] if str(item).strip()]
     clean_tools = [str(item).strip() for item in allowed_tool_names or [] if str(item).strip()]
@@ -702,9 +714,9 @@ def _parse_issue_should_exit_repair_loop(
     del current_phase
     issue = str(parse_issue or "")
     client_abort_reason = str((stream_metadata or {}).get("client_abort_reason") or "")
-    if issue in {"stream_char_limit", "repetitive_output"}:
+    if issue in {"stream_char_limit", "repetitive_output", "plan_record_embedded_edit_stream"}:
         return True
-    if client_abort_reason in {"stream_char_limit", "repetitive_output"}:
+    if client_abort_reason in {"stream_char_limit", "repetitive_output", "plan_record_embedded_edit_stream"}:
         return True
     return False
 
@@ -735,11 +747,14 @@ def _machine_control_stream_stop_reason(
     thinking_text: str,
     max_stream_chars: int,
     schema: dict[str, Any] | None = None,
+    current_phase: str | None = None,
 ) -> str:
     del thinking_text
     content = str(content_text or "")
     if not content:
         return ""
+    if self._looks_like_plan_record_embedded_edit_stream(content, current_phase=current_phase):
+        return "plan_record_embedded_edit_stream"
     candidate = self._extract_json_object(content.strip())
     if candidate is not None:
         envelope = self._parse_envelope(content)
@@ -757,6 +772,20 @@ def _machine_control_stream_stop_reason(
     if self._looks_like_in_progress_write_file_content_stream(content):
         return ""
     return ""
+
+
+def _looks_like_plan_record_embedded_edit_stream(self, text: str, *, current_phase: str | None = None) -> bool:
+    phase = str(current_phase or "")
+    if phase not in {"PLANNING_REQUIRED", "PLAN_REVISION"}:
+        return False
+    content = str(text or "")
+    if '"create_plan"' not in content or '"work_units"' not in content or '"first_action"' not in content:
+        return False
+    first_action_index = content.rfind('"first_action"')
+    if first_action_index < 0:
+        return False
+    tail = content[first_action_index:first_action_index + 1600]
+    return bool(re.search(r'"tool"\s*:\s*"(write_file|append_file|replace_text)"', tail))
 
 
 def _looks_like_in_progress_write_file_content_stream(self, text: str) -> bool:
@@ -784,6 +813,8 @@ def _looks_like_in_progress_write_file_content_stream(self, text: str) -> bool:
 def _looks_like_repetitive_machine_control_output(self, text: str) -> bool:
     content = str(text or "")
     min_chars = int(self.runtime_config.get("machine_control_repetition_min_chars") or 3000)
+    if len(content) < min_chars and content.lstrip().startswith("{"):
+        return False
     tail_chars = int(self.runtime_config.get("machine_control_repetition_tail_chars") or 160)
     min_repeats = int(self.runtime_config.get("machine_control_repetition_min_repeats") or 5)
     if tail_chars <= 0 or min_repeats <= 1:
@@ -847,7 +878,7 @@ def _classify_llm_parse_issue(
 ) -> str:
     raw = str(raw_text or "")
     client_abort_reason = str((stream_metadata or {}).get("client_abort_reason") or "")
-    if client_abort_reason in {"repetitive_output", "stream_char_limit"}:
+    if client_abort_reason in {"repetitive_output", "stream_char_limit", "plan_record_embedded_edit_stream"}:
         return client_abort_reason
     if not raw.strip():
         if str(thinking_text or "").strip():

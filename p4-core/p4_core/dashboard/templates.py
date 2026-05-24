@@ -145,9 +145,10 @@ _DASHBOARD_TPL = """<!doctype html>
       <h2>Contract Progress</h2>
       <div id="contractProgressBody" style="margin-top:8px; padding:12px; background:#0f1316; border:1px solid #2d3944; border-radius:4px;">
         <div class="commentator-line"><strong>契約状態</strong> <span>__CONTRACT_STATE__</span></div>
+        <div class="commentator-line"><strong>必要契約</strong> <span>__CONTRACT_REQUIRED__</span></div>
         <div class="commentator-line"><strong>ファイル作成</strong> <span>__CONTRACT_ARTIFACT__</span></div>
         <div class="commentator-line"><strong>コマンド実行</strong> <span>__CONTRACT_COMMAND__</span></div>
-        <div class="commentator-line"><strong>標準出力</strong> <span>__CONTRACT_STDOUT__</span></div>
+        <div class="commentator-line"><strong>表示出力</strong> <span>__CONTRACT_STDOUT__</span></div>
         <div class="commentator-line"><strong>ユーザ応答</strong> <span>__CONTRACT_RESULT__</span></div>
       </div>
     </section>
@@ -240,6 +241,19 @@ _DASHBOARD_TPL = """<!doctype html>
       const session = snapshot.session || {};
       const summary = String(latest.summary || session.last_assistant_message || "").trim();
       return summary;
+    }
+
+    function contractRequiredText(progress) {
+      const required = Array.isArray(progress?.required_contract) ? progress.required_contract : [];
+      return required.length ? required.join(", ") : "未確定";
+    }
+
+    function contractMetricText(progress, key) {
+      const required = Array.isArray(progress?.required_contract) ? progress.required_contract : [];
+      const raw = String(progress?.[key] || "no");
+      if (required.length && !required.includes(key)) return "not required";
+      if (required.includes(key)) return raw === "yes" ? "satisfied" : "missing";
+      return raw;
     }
 
     function toggleOperation(opId) {
@@ -483,7 +497,7 @@ _DASHBOARD_TPL = """<!doctype html>
 
     function renderFlowItem(item, scrollId = "") {
       if (item.hidden) return "";
-      const labels = { observer_note: '解説者', system_note: 'システム', planning_note: '計画', task_plan: '子タスク計画', activity_update: 'システム状態', runtime_event: '実行イベント', assistant_message: 'LLM応答', user_message: 'ユーザー', tool_call: 'ツール呼び出し', tool_result: 'ツール結果', finish: '完了', frame_opened: 'フレーム開始', frame_returned: 'フレーム帰還', child_return: '子フレーム結果', live_stream: 'LLMライブ', llm: 'LLM', tool: 'ツール', frame: 'フレーム', decision: '判定', observation: '観測' };
+      const labels = { observer_note: '解説者', system_note: 'システム', planning_note: '計画', task_plan: '子タスク計画', problem_profile: '問題プロファイル', planner_decision: 'プランナー判定', plan_record: '計画契約', plan_revision: '計画改訂', activity_update: 'システム状態', runtime_event: '実行イベント', assistant_message: 'LLM応答', user_message: 'ユーザー', tool_call: 'ツール呼び出し', tool_result: 'ツール結果', finish: '完了', frame_opened: 'フレーム開始', frame_returned: 'フレーム帰還', child_return: '子フレーム結果', live_stream: 'LLMライブ', llm: 'LLM', tool: 'ツール', frame: 'フレーム', decision: '判定', observation: '観測' };
       const label = esc(labels[item.label] || item.label || "");
       let content = esc(item.content || "");
       const depth = Number(item.frame_depth || 0);
@@ -595,6 +609,8 @@ _DASHBOARD_TPL = """<!doctype html>
         content = renderLlmOutputRecovered(item);
       } else if (item.label === 'task_plan') {
         content = renderTaskPlan(item);
+      } else if (item.label === 'problem_profile' || item.label === 'planner_decision' || item.label === 'plan_record' || item.label === 'plan_revision') {
+        content = renderPlannerEvent(item);
       } else if (item.label === 'runtime_event') {
         content = renderRuntimeEvent(item);
       } else if (item.label === 'llm' || item.label === 'tool' || item.label === 'decision' || item.label === 'observation') {
@@ -640,6 +656,11 @@ _DASHBOARD_TPL = """<!doctype html>
         if (item.reason_code) rows.push(`<div class="flow-k">reason</div><pre>${esc(item.reason_code)}</pre>`);
         if (d.rationale) rows.push(`<div class="flow-k">rationale</div><pre>${esc(d.rationale)}</pre>`);
         if (d.tasks) rows.push(`<div class="flow-k">tasks</div><pre>${esc(JSON.stringify(d.tasks, null, 2))}</pre>`);
+        if (d.strategy) rows.push(`<div class="flow-k">strategy</div><pre>${esc(d.strategy)}</pre>`);
+        if (d.profile) rows.push(`<div class="flow-k">problem profile</div><pre>${esc(JSON.stringify(d.profile, null, 2))}</pre>`);
+        if (d.plan) rows.push(`<div class="flow-k">plan record</div><pre>${esc(JSON.stringify(d.plan, null, 2))}</pre>`);
+        if (d.work_units) rows.push(`<div class="flow-k">work units</div><pre>${esc(JSON.stringify(d.work_units, null, 2))}</pre>`);
+        if (d.verification_contract) rows.push(`<div class="flow-k">verification contract</div><pre>${esc(JSON.stringify(d.verification_contract, null, 2))}</pre>`);
         rows.push(`<div class="flow-k">message</div><pre>${esc(item.content || "")}</pre>`);
       } else if (item.label === 'observation') {
         if (item.code) rows.push(`<div class="flow-k">source</div><pre>${esc(item.code)}</pre>`);
@@ -726,6 +747,20 @@ LLM が複数手を一括予測しようとしたとき、最初の手だけ採�
       tasks.forEach((task, index) => {
         rows.push(`<div class="flow-k">task ${index + 1}</div><pre>${esc(JSON.stringify(task, null, 2))}</pre>`);
       });
+      return `<div class="flow-content">${rows.join("")}</div>`;
+    }
+
+    function renderPlannerEvent(item) {
+      const rows = [];
+      rows.push(`<div class="flow-k">summary</div><pre>${esc(item.content || "")}</pre>`);
+      if (item.strategy) rows.push(`<div class="flow-k">strategy</div><pre>${esc(item.strategy)}</pre>`);
+      if (item.profile && Object.keys(item.profile).length) rows.push(`<div class="flow-k">problem profile</div><pre>${esc(JSON.stringify(item.profile, null, 2))}</pre>`);
+      if (item.plan && Object.keys(item.plan).length) rows.push(`<div class="flow-k">plan record</div><pre>${esc(JSON.stringify(item.plan, null, 2))}</pre>`);
+      const workUnits = Array.isArray(item.work_units) ? item.work_units : [];
+      if (workUnits.length) rows.push(`<div class="flow-k">work units</div><pre>${esc(JSON.stringify(workUnits, null, 2))}</pre>`);
+      const vc = item.verification_contract || {};
+      if (Object.keys(vc).length) rows.push(`<div class="flow-k">verification contract</div><pre>${esc(JSON.stringify(vc, null, 2))}</pre>`);
+      if (item.details && Object.keys(item.details).length) rows.push(`<div class="flow-k">details</div><pre>${esc(JSON.stringify(item.details, null, 2))}</pre>`);
       return `<div class="flow-content">${rows.join("")}</div>`;
     }
 
@@ -987,6 +1022,19 @@ findings: ${esc(shortText(findings || "-", 320))}</pre></div>`;
         resultBody.textContent = shortText(detail, 4000);
       }
 
+      const contract = snapshot.contract_progress || {};
+      const contractBody = document.getElementById("contractProgressBody");
+      if (contractBody) {
+        contractBody.innerHTML = `
+          <div class="commentator-line"><strong>契約状態</strong> <span>${esc(contract.contract_state || "unknown")}</span></div>
+          <div class="commentator-line"><strong>必要契約</strong> <span>${esc(contractRequiredText(contract))}</span></div>
+          <div class="commentator-line"><strong>ファイル作成</strong> <span>${esc(contractMetricText(contract, "artifact_written"))}</span></div>
+          <div class="commentator-line"><strong>コマンド実行</strong> <span>${esc(contractMetricText(contract, "command_executed"))}</span></div>
+          <div class="commentator-line"><strong>表示出力</strong> <span>${esc(contractMetricText(contract, "stdout_displayed"))}</span></div>
+          <div class="commentator-line"><strong>ユーザ応答</strong> <span>${esc(contract.result_selected_for_user || "no")}</span></div>
+        `;
+      }
+
       if (Date.now() > suspendOperationsRenderUntil) {
          const panel = document.getElementById("operationsPanel");
          syncOperations(panel, ops);
@@ -1067,6 +1115,8 @@ def _phase_for_flow_step(step: dict[str, Any]) -> str:
         return "FINISH"
     if labels & {"frame_opened", "frame_returned", "child_return"}:
         return "FRAME"
+    if labels & {"problem_profile", "planner_decision", "plan_record", "plan_revision"}:
+        return "PLANNING"
     if "tool_call" in labels and "run_command" in tool_names:
         return "EXECUTE_MISSING_COMMANDS"
     if "tool_result" in labels and "run_command" in tool_names:
@@ -1323,6 +1373,10 @@ def _render_flow_item_html(item: dict[str, Any], *, scroll_id: str = "") -> str:
         "system_note": "システム",
         "planning_note": "計画",
         "task_plan": "子タスク計画",
+        "problem_profile": "問題プロファイル",
+        "planner_decision": "プランナー判定",
+        "plan_record": "計画契約",
+        "plan_revision": "計画改訂",
         "activity_update": "システム状態",
         "runtime_event": "実行イベント",
         "assistant_message": "LLM応答",
@@ -1489,6 +1543,13 @@ def _render_flow_item_html(item: dict[str, Any], *, scroll_id: str = "") -> str:
             f"{_attach_flow_scroll_id(_render_task_plan_html(item), scroll_id)}"
             "</div>"
         )
+    if str(item.get("label") or "") in {"problem_profile", "planner_decision", "plan_record", "plan_revision"}:
+        return (
+            f"<div class=\"flow-item {html.escape(str(item.get('label') or ''))}\" style=\"margin-left:{indent}px\">"
+            f"<div class=\"flow-label\">{depth_badge}{depth_meta}<span>{label}</span></div>"
+            f"{_attach_flow_scroll_id(_render_planner_event_html(item), scroll_id)}"
+            "</div>"
+        )
     if str(item.get("label") or "") == "runtime_event":
         return (
             f"<div class=\"flow-item runtime_event\" style=\"margin-left:{indent}px\">"
@@ -1636,6 +1697,21 @@ def _render_canonical_event_html(item: dict[str, Any]) -> str:
         tasks = (details or {}).get("tasks")
         if isinstance(tasks, list):
             parts.append(f"<div class=\"flow-k\">tasks</div><pre>{html.escape(json.dumps(tasks, ensure_ascii=False, indent=2))}</pre>")
+        strategy = str((details or {}).get("strategy") or "")
+        if strategy:
+            parts.append(f"<div class=\"flow-k\">strategy</div><pre>{html.escape(strategy)}</pre>")
+        profile = (details or {}).get("profile")
+        if isinstance(profile, dict) and profile:
+            parts.append(f"<div class=\"flow-k\">problem profile</div><pre>{html.escape(json.dumps(profile, ensure_ascii=False, indent=2))}</pre>")
+        plan = (details or {}).get("plan")
+        if isinstance(plan, dict) and plan:
+            parts.append(f"<div class=\"flow-k\">plan record</div><pre>{html.escape(json.dumps(plan, ensure_ascii=False, indent=2))}</pre>")
+        work_units = (details or {}).get("work_units")
+        if isinstance(work_units, list) and work_units:
+            parts.append(f"<div class=\"flow-k\">work units</div><pre>{html.escape(json.dumps(work_units, ensure_ascii=False, indent=2))}</pre>")
+        verification_contract = (details or {}).get("verification_contract")
+        if verification_contract:
+            parts.append(f"<div class=\"flow-k\">verification contract</div><pre>{html.escape(json.dumps(verification_contract, ensure_ascii=False, indent=2))}</pre>")
         parts.append(f"<div class=\"flow-k\">message</div><pre>{html.escape(str(item.get('content') or ''))}</pre>")
     elif label == "observation":
         source = str(item.get("code") or "")
@@ -1720,6 +1796,28 @@ def _render_task_plan_html(item: dict[str, Any]) -> str:
     tasks = item.get("tasks") if isinstance(item.get("tasks"), list) else []
     for index, task in enumerate(tasks, start=1):
         parts.append(f"<div class=\"flow-k\">task {index}</div><pre>{html.escape(json.dumps(task, ensure_ascii=False, indent=2))}</pre>")
+    return f"<div class=\"flow-content\">{''.join(parts)}</div>"
+
+def _render_planner_event_html(item: dict[str, Any]) -> str:
+    parts = [f"<div class=\"flow-k\">summary</div><pre>{html.escape(str(item.get('content') or ''))}</pre>"]
+    strategy = str(item.get("strategy") or "")
+    if strategy:
+        parts.append(f"<div class=\"flow-k\">strategy</div><pre>{html.escape(strategy)}</pre>")
+    profile = item.get("profile") if isinstance(item.get("profile"), dict) else {}
+    if profile:
+        parts.append(f"<div class=\"flow-k\">problem profile</div><pre>{html.escape(json.dumps(profile, ensure_ascii=False, indent=2))}</pre>")
+    plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
+    if plan:
+        parts.append(f"<div class=\"flow-k\">plan record</div><pre>{html.escape(json.dumps(plan, ensure_ascii=False, indent=2))}</pre>")
+    work_units = item.get("work_units") if isinstance(item.get("work_units"), list) else []
+    if work_units:
+        parts.append(f"<div class=\"flow-k\">work units</div><pre>{html.escape(json.dumps(work_units, ensure_ascii=False, indent=2))}</pre>")
+    verification_contract = item.get("verification_contract")
+    if verification_contract:
+        parts.append(f"<div class=\"flow-k\">verification contract</div><pre>{html.escape(json.dumps(verification_contract, ensure_ascii=False, indent=2))}</pre>")
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    if details:
+        parts.append(f"<div class=\"flow-k\">details</div><pre>{html.escape(json.dumps(details, ensure_ascii=False, indent=2))}</pre>")
     return f"<div class=\"flow-content\">{''.join(parts)}</div>"
 
 def _render_frame_flow_item_html(item: dict[str, Any]) -> str:
@@ -1894,6 +1992,22 @@ def _render_commentator_content_html(text: str) -> str:
     )
     return f"<div class=\"commentator-body\">{rows}</div>"
 
+def _contract_required_text(progress: dict[str, Any]) -> str:
+    required = progress.get("required_contract") if isinstance(progress, dict) else []
+    if isinstance(required, list) and required:
+        return ", ".join(str(item) for item in required)
+    return "未確定"
+
+def _contract_metric_text(progress: dict[str, Any], key: str) -> str:
+    required = progress.get("required_contract") if isinstance(progress, dict) else []
+    raw = str(progress.get(key) or "no") if isinstance(progress, dict) else "no"
+    if isinstance(required, list) and required:
+        required_set = {str(item) for item in required}
+        if key not in required_set:
+            return "not required"
+        return "satisfied" if raw == "yes" else "missing"
+    return raw
+
 def render_dashboard_html(snapshot: dict[str, Any]) -> str:
     runtime = snapshot.get("runtime") or {}
     model = snapshot.get("model") or "gemma4:26b"
@@ -1972,11 +2086,13 @@ def render_dashboard_html(snapshot: dict[str, Any]) -> str:
     )
     res = res.replace("__LATEST_RESULT__", esc(_short_text(_latest_result_text(snapshot), 4000)))
     
-    res = res.replace("__CONTRACT_STATE__", esc(str(snapshot.get("contract_progress", {}).get("contract_state", "unknown"))))
-    res = res.replace("__CONTRACT_ARTIFACT__", esc(str(snapshot.get("contract_progress", {}).get("artifact_written", "no"))))
-    res = res.replace("__CONTRACT_COMMAND__", esc(str(snapshot.get("contract_progress", {}).get("command_executed", "no"))))
-    res = res.replace("__CONTRACT_STDOUT__", esc(str(snapshot.get("contract_progress", {}).get("stdout_displayed", "no"))))
-    res = res.replace("__CONTRACT_RESULT__", esc(str(snapshot.get("contract_progress", {}).get("result_selected_for_user", "no"))))
+    contract_progress = snapshot.get("contract_progress", {}) if isinstance(snapshot.get("contract_progress"), dict) else {}
+    res = res.replace("__CONTRACT_STATE__", esc(str(contract_progress.get("contract_state", "unknown"))))
+    res = res.replace("__CONTRACT_REQUIRED__", esc(_contract_required_text(contract_progress)))
+    res = res.replace("__CONTRACT_ARTIFACT__", esc(_contract_metric_text(contract_progress, "artifact_written")))
+    res = res.replace("__CONTRACT_COMMAND__", esc(_contract_metric_text(contract_progress, "command_executed")))
+    res = res.replace("__CONTRACT_STDOUT__", esc(_contract_metric_text(contract_progress, "stdout_displayed")))
+    res = res.replace("__CONTRACT_RESULT__", esc(str(contract_progress.get("result_selected_for_user", "no"))))
     res = res.replace("__SNAPSHOT_JSON__", "null")
 
     return res

@@ -65,7 +65,7 @@ Coding/tool turns run inside a dedicated LLM workspace at `workspaces/runs/<turn
 
 For file edits, avoid putting long source code in one JSON argument. Use `write_file` only for small starter content, `append_file` for chunks of 2000 bytes or less, and `replace_text` for exact small edits to existing files. Oversized `write_file` / `append_file` calls fail with guidance instead of silently accepting brittle payloads.
 
-For simple known coding scaffolds, the controller may bypass LLM code emission. The current built-in example is the maze request: P3 writes a small `maze_gen.py` scaffold and runs `python3 maze_gen.py`, recording both steps with `llm_attempt_count = 0`.
+The controller fast path is limited to executing commands that the user explicitly requested. It must not synthesize fixed coding artifacts for benchmark-like prompts; coding tasks should go through the normal LLM action loop.
 
 Finish is guarded by required-command checks, expected-artifact checks, and a grounding judge. The grounding judge asks for JSON verdicts and separates `ng` from judge failures such as `invalid_output`, `invalid_json`, `empty_output`, and `error`.
 
